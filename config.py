@@ -31,7 +31,7 @@ class Config:
     weight_decay: float = 1e-4
 
     # Constraints / labeling conventions
-    enforce_min_phase_zero: bool = False
+    enforce_min_phase_zero: bool = True
     enforce_positive_omega: bool = True
 
     # Loss function selection

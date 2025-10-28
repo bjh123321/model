@@ -7,8 +7,8 @@ from ..data.normalizer import Normalizer
 import matplotlib.pyplot as plt
 
 # ==== 配置区域 ====
-cur_dir = Path(__file__).parents[2]
-ckpt_path = cur_dir / "outputs_pzk/checkpoint_stage1_fold0_epoch20000.pth"
+cur_dir = Path(__file__).parents[1]
+ckpt_path = cur_dir / "outputs_pzk/checkpoint_stage1_fold0_epoch1000.pth"
 in_norm_path  = cur_dir / "outputs_pzk/Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / "outputs_pzk/Normalizer_Output_Sim.pth"
 
@@ -29,8 +29,6 @@ plt.yscale("log")
 plt.title("Training Loss History (Simulated Data)")
 plt.legend()
 plt.grid()
-plt.xlim(2500, len(loss_sim))
-plt.ylim(0, loss_sim[2500]*1.1)
 plt.show()
 
 cfg = Config()

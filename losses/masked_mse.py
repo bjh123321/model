@@ -45,16 +45,16 @@ class MaskedMSE(nn.Module):
         B2, K_tgt = mask.shape
         assert B1 == B2, f"presence loss batch mismatch: logits={logits.shape}, mask={mask.shape}"
         if cfg.use_hungarian_loss:
-            target = torch.zeros_like(mask)
+            target = torch.zeros_like(logits)
             for i, b in enumerate(assign_rows):
                 target[i, b] = 1.0
         else:
             target = mask.to(logits.dtype)
-        if K_out > K_tgt:
-            pad = target.new_zeros(B1, K_out - K_tgt)
-            target = torch.cat([target, pad], dim=1)
-        elif K_out < K_tgt:
-            target = target[:, :K_out]
+            if K_out > K_tgt:
+                pad = target.new_zeros(B1, K_out - K_tgt)
+                target = torch.cat([target, pad], dim=1)
+            elif K_out < K_tgt:
+                target = target[:, :K_out]
 
         # 3) BCEWithLogits
         bce = F.binary_cross_entropy_with_logits(

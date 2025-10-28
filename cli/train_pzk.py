@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--sim_txt', type=str, required=True)
     parser.add_argument('--real_txt', type=str, required=True)
-    parser.add_argument('--out_dir', type=str, default='./outputs_pzk')
+    parser.add_argument('--out_dir', type=str, default='./surrogate_model/outputs_pzk')
     parser.add_argument('--kfold', type=int, default=5)
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
     parser.add_argument('--embed_channel_dim', type=int, default=12)
