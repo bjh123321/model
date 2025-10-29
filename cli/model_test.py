@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 
 # ==== 配置区域 ====
 cur_dir = Path(__file__).parents[1]
-ckpt_path = cur_dir / "outputs_pzk/checkpoint_stage1_fold0_epoch7000.pth"
+ckpt_path = cur_dir / "outputs_pzk/checkpoint_stage1_fold0_epoch4000.pth"
 in_norm_path  = cur_dir / "outputs_pzk/Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / "outputs_pzk/Normalizer_Output_Sim.pth"
 

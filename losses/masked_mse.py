@@ -69,7 +69,15 @@ class MaskedMSE(nn.Module):
 
     def _sort_by_omega(self, alpha, omega, gain, zero, mask):
         freq = torch.sqrt(alpha**2 + omega**2) / (2 * math.pi)
-        big  = torch.full_like(freq, float('inf'))
+        if mask.shape[1] != freq.shape[1]:
+            B, K_pred = freq.shape
+            K_mask = mask.shape[1]
+            if K_mask < K_pred:
+                pad = mask.new_zeros(B, K_pred - K_mask)
+                mask = torch.cat([mask, pad], dim=1)
+            else:
+                mask = mask[:, :K_pred]
+        big  = torch.full_like(freq, float('inf')) if freq.dtype.is_floating_point else freq.new_full(freq.shape, float('inf'))
         freq_eff = torch.where(mask > 0.5, freq, big)
         idx = torch.argsort(freq_eff, dim=1)
         def re(t):
