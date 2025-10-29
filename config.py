@@ -10,8 +10,8 @@ class Config:
     embed_excitation_dim: int = 4
     embed_channel_dim: int = 12
 
-    low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 128, 128, 64])
-    lin_high_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 128, 64])
+    low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 256, 128, 64])
+    lin_high_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64])
 
     # Training
     batch_sim: int = 256
@@ -31,7 +31,7 @@ class Config:
     weight_decay: float = 1e-4
 
     # Constraints / labeling conventions
-    enforce_min_phase_zero: bool = True
+    enforce_min_phase_zero: bool = False
     enforce_positive_omega: bool = True
 
     # Loss function selection

@@ -8,12 +8,12 @@ import matplotlib.pyplot as plt
 
 # ==== 配置区域 ====
 cur_dir = Path(__file__).parents[1]
-ckpt_path = cur_dir / "outputs_pzk/checkpoint_stage1_fold0_epoch1000.pth"
+ckpt_path = cur_dir / "outputs_pzk/checkpoint_stage1_fold0_epoch7000.pth"
 in_norm_path  = cur_dir / "outputs_pzk/Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / "outputs_pzk/Normalizer_Output_Sim.pth"
 
-H, M = 5.5, 0.45
-exc_id, ch_id = 1, 20
+H, M = 11, 1.9
+exc_id, ch_id = 2, 5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==== 加载 ====

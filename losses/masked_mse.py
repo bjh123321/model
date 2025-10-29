@@ -123,8 +123,10 @@ class MaskedHungarianMSE(MaskedMSE):
 
             big = cost.new_full(cost.shape, 1e6)    # cost.new_full表示以cost的dtype、device作为模板，创建一个新张量，形状是cost.shape，所有元素值都是1e6
             cost = torch.where(valid_pair > 0.5, cost, big)    # torch.where(condition)表示返回非0元素的坐标，torch.where(condition, x, y)表示x if condition else y
+            cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)     # 去除异常值
 
         cost_cpu = cost.detach().cpu().numpy()
+        cost_cpu = np.nan_to_num(cost_cpu, nan=1e6, posinf=1e6, neginf=1e6)     # 去除异常值
         assign_cols, assign_rows, m_eff_list = [], [], []
         for b in range(B):
             cb = cost_cpu[b]       # (K_pred, K_tgt)
