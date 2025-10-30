@@ -142,6 +142,6 @@ def merge_file(
 if __name__ == "__main__":
     # 示例：按任意空白分隔读取，制表符写出
     # Windows 下记得用原始字符串 r"..." 或双反斜杠
-    in_path  = r"C:\Users\Leo\Desktop\MFDNN_datamake\sim_dataset.txt"
-    out_path = r"C:\Users\Leo\Desktop\MFDNN_datamake\sim_dataset_new.txt"
+    in_path  = r"C:\Users\Leo\Desktop\MFDNN_datamake\real_dataset.txt"
+    out_path = r"C:\Users\Leo\Desktop\MFDNN_datamake\real_dataset_new.txt"
     merge_file(in_path, out_path, sep_in=None, sep_out="\t", use_abs_imag=True)
