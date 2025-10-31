@@ -30,11 +30,15 @@ class ParsedRow:
     K_valid: int
     alpha: np.ndarray
     omega: np.ndarray
-    gain:  np.ndarray
-    zero:  np.ndarray
+    rho:  np.ndarray
+    sin_theta:  np.ndarray
+    cos_theta: np.ndarray
     mask:  np.ndarray
 
 def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
+    import math
+    Ts = 512
+    omegaN = math.pi / Ts
     K_list, ch_list, exc_list = [], [], []
     for r in rows:
         tail = r[4:]
@@ -57,36 +61,38 @@ def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
         
         valid_idx = []
         for k in range(K_all):
-            Kk   = float(tail[4*k + 0])
-            Rek  = float(tail[4*k + 1])
-            Imk  = float(tail[4*k + 2])
-            Zk   = float(tail[4*k + 3])
+            Rek   = float(tail[4*k + 0])
+            Imk  = float(tail[4*k + 1])
+            rk  = float(tail[4*k + 2])
+            thk   = float(tail[4*k + 3])
             # 判定该模态是否为“有效（非补位）”
-            if (abs(Kk) > eps) or (abs(Rek) > eps) or (abs(Imk) > eps) or (abs(Zk) > eps):
+            if (abs(Rek) > eps) or (abs(Imk) > eps) or (abs(rk) > eps) or (abs(thk) > eps):
                 valid_idx.append(k)
         K = len(valid_idx)
 
         alpha = np.zeros((K_max,), dtype=np.float32)
         omega = np.zeros((K_max,), dtype=np.float32)
-        gain  = np.zeros((K_max,), dtype=np.float32)
-        zero  = np.zeros((K_max,), dtype=np.float32)
+        rho  = np.zeros((K_max,), dtype=np.float32)
+        sin_theta = np.zeros((K_max,), dtype=np.float32)
+        cos_theta = np.zeros((K_max,), dtype=np.float32)
         mask  = np.zeros((K_max,), dtype=np.float32)
 
         for k in range(K):
             src = valid_idx[k]
             base = 4 * src
-            Kk  = float(tail[base + 0])
-            Re  = float(tail[base + 1])
-            Im  = float(tail[base + 2])
-            Z0  = float(tail[base + 3])
+            Re  = float(tail[base + 0])
+            Im  = float(tail[base + 1])
+            rh  = float(tail[base + 2])
+            th  = float(tail[base + 3])
 
-            gain[k]  = Kk
-            alpha[k] = Re
-            omega[k] = abs(Im)
-            zero[k]  = -abs(Z0)
+            alpha[k]  = -abs(Re)
+            omega[k] = abs(Im)/omegaN
+            rho[k] = np.log(rh)
+            sin_theta[k] = np.sin(th)
+            cos_theta[k] = np.cos(th)
             mask[k]  = 1.0
 
-        parsed.append(ParsedRow(H, M, exc_id, ch_id, K, alpha, omega, gain, zero, mask))
+        parsed.append(ParsedRow(H, M, exc_id, ch_id, K, alpha, omega, rho, sin_theta, cos_theta, mask))
     stats = {
         "K_max": K_max,
         "channel_num": channel_num,

@@ -18,20 +18,15 @@ def _cur_lr(optimizer):  # [Added]
     return optimizer.param_groups[0]['lr']
 
 def _mse_per_param_z(pred, yN, mask, mean, std, use_presence: bool):
-    """
-    统计四个参数在 z-score 空间的 MSE 分项；可选统计 presence BCE 与 cardinality。
-    返回 dict：{'alpha':..., 'omega':..., 'gain':..., 'zero':..., 'bce':..., 'card':...}
-    """
     # 取预测（物理域）-> z-score
     # pred['alpha'/'omega'/...] 形状：[B, K_max]
     eps = 1e-8
-    P = torch.stack([pred['alpha'], pred['omega'], pred['gain'], pred['zero']], dim=1)  # [B,4,K]
-    T = torch.stack([yN['alpha'], yN['omega'], yN['gain'], yN['zero']], dim=1)          # [B,4,K]
+    P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # [B,4,K]
+    P1 = torch.stack([pred['alpha'], pred['omega']], dim=1)
+    TN = torch.stack([yN['alpha'], yN['omega'], yN['rho'], yN['sin_theta'], yN['cos_theta']], dim=1)          # [B,4,K]
     # mean/std 形状：[4]，广播到 [B,4,K]
-    PN = (P - mean.view(1,4,1)) / (std.view(1,4,1).clamp_min(1e-8))
-    # TN = (T - mean.view(1,4,1)) / (std.view(1,4,1).clamp_min(1e-8))
-    # PN = P
-    TN = T
+    PN = (P - mean.view(1,3,1)) / (std.view(1,3,1).clamp_min(1e-8))
+    PN = torch.cat([PN, P1], dim=1)
 
     # mask: [B,K] -> [B,1,K] 参与四个通道
     m = (mask > 0.5).float().unsqueeze(1)  # [B,1,K]
@@ -123,8 +118,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     # w_s1_alpha, w_s1_omega, w_s1_gain, w_s1_zero = _make_weights(norm_sim.std)
     # w_s2_alpha, w_s2_omega, w_s2_gain, w_s2_zero = _make_weights(norm_real.std)
     # 替换 _make_weights 的使用结果为等权
-    w_s1_alpha = w_s1_omega = w_s1_gain = w_s1_zero = 1.0
-    w_s2_alpha = w_s2_omega = w_s2_gain = w_s2_zero = 1.0
+    w_s1_alpha = w_s1_omega = w_s1_rho = w_s1_sin_theta = w_s1_cos_theta = 1.0
+    w_s2_alpha = w_s2_omega = w_s2_rho = w_s2_sin_theta = w_s2_cos_theta = 1.0
 
     pres_w = cfg.presence_loss_weight
     card_w = cfg.cardinality_loss_weight
@@ -132,20 +127,20 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     if cfg.use_hungarian_loss:
         crit_s1 = MaskedHungarianMSE(mean=mean_sim, std=std_sim,
                                      w_alpha=w_s1_alpha, w_omega=w_s1_omega,
-                                     w_gain=w_s1_gain, w_zero=w_s1_zero,
+                                     w_rho=w_s1_rho, w_sin_theta=w_s1_sin_theta, w_cos_theta=w_s1_cos_theta,
                                      presence_weight=pres_w, cardinality_weight=card_w)
         crit_s2 = MaskedHungarianMSE(mean=mean_real, std=std_real,
                                      w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                                     w_gain=w_s2_gain, w_zero=w_s2_zero,
+                                     w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta, w_cos_theta=w_s2_cos_theta,
                                      presence_weight=pres_w, cardinality_weight=card_w)
     else:
         crit_s1 = MaskedMSE(mean=mean_sim, std=std_sim,
                             w_alpha=w_s1_alpha, w_omega=w_s1_omega,
-                            w_gain=w_s1_gain, w_zero=w_s1_zero,
+                            w_rho=w_s1_rho, w_sin_theta=w_s1_sin_theta, w_cos_theta=w_s1_cos_theta,
                             presence_weight=pres_w, cardinality_weight=card_w)
         crit_s2 = MaskedMSE(mean=mean_real, std=std_real,
                             w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                            w_gain=w_s2_gain, w_zero=w_s2_zero,
+                            w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta, w_cos_theta=w_s2_cos_theta,
                             presence_weight=pres_w, cardinality_weight=card_w)
 
     # ============ Stage 1 ============
@@ -249,10 +244,10 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         if is_main_process() and comp_count > 0:
             avg = {k: v/comp_count for k,v in comp_accum.items()}
             if cfg.use_presence_head:
-                print(f"    [S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, gain={avg['gain']:.4f}, zero={avg['zero']:.4f}; "
+                print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}; "
                     f"BCE={avg['bce']:.4f}, CARD={avg.get('card',0.0):.4f}", flush=True)
             else:
-                print(f"    [S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, gain={avg['gain']:.4f}, zero={avg['zero']:.4f}", flush=True)
+                print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}", flush=True)
 
 
 
@@ -429,11 +424,13 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     if cfg.use_hungarian_loss:
         crit_eval = MaskedHungarianMSE(mean=mean_real, std=std_real,
                                        w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                                       w_gain=w_s2_gain, w_zero=w_s2_zero)
+                                       w_rho=w_s2_rho, w_s2_sin_theta=w_s2_sin_theta,
+                                       w_cos_theta=w_s2_cos_theta)
     else:
         crit_eval = MaskedMSE(mean=mean_real, std=std_real,
                                w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                               w_gain=w_s2_gain, w_zero=w_s2_zero)
+                               w_rho=w_s2_rho, w_s2_sin_theta=w_s2_sin_theta,
+                               w_cos_theta=w_s2_cos_theta)
     with torch.no_grad():
         vsum, vcnt = 0.0, 0
         for H, M, e, c, mask, yN in val_dl:

@@ -58,18 +58,19 @@ def compute_input_normalizer_sim(sim_parsed: List[ParsedRow]) -> Normalizer:
     return Normalizer(mean=mean, std=std)
 
 def compute_output_normalizer_masked(parsed: List[ParsedRow]) -> Normalizer:
-    al, om, ga, z0 = [], [], [], []
+    al, om, rh = [], [], []
     for p in parsed:
         k = int(p.K_valid)
         if k <= 0:
             continue
-        al.append(p.alpha[:k]); om.append(p.omega[:k]); ga.append(p.gain[:k]); z0.append(p.zero[:k])
+        al.append(p.alpha[:k]); om.append(p.omega[:k]); rh.append(p.rho[:k])
     if len(al) == 0:
-        mean = np.zeros(4, dtype=np.float64)
-        std  = np.ones(4, dtype=np.float64)
+        mean = np.zeros(3, dtype=np.float64)
+        std  = np.ones(3, dtype=np.float64)
         return Normalizer(mean=mean, std=std)
-    al = np.concatenate(al); om = np.concatenate(om); ga = np.concatenate(ga); z0 = np.concatenate(z0)
-    mat = np.stack([al, om, ga, z0], axis=1)
+    al = np.concatenate(al); om = np.concatenate(om); rh = np.concatenate(rh)
+    mat = np.stack([al, om, rh], axis=1)
+
     mean = mat.mean(axis=0)
     std  = mat.std(axis=0)
     return Normalizer(mean=mean, std=std)

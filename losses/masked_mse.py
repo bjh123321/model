@@ -14,16 +14,16 @@ class MaskedMSE(nn.Module):
                  w_alpha=1.0, w_omega=0.5, w_gain=0.5, w_zero=0.5,
                  presence_weight: float = 0.0, cardinality_weight: float = 0.0):
         super().__init__()
-        self.register_buffer('mean', mean.view(4,1))
-        self.register_buffer('std',  std.view(4,1))
+        self.register_buffer('mean', mean.view(3,1))
+        self.register_buffer('std',  std.view(3,1))
         self.w_alpha, self.w_omega, self.w_gain, self.w_zero = w_alpha, w_omega, w_gain, w_zero
         self.pres_w = presence_weight
         self.card_w = cardinality_weight
 
     def norm_pred(self, pred: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        P = torch.stack([pred['alpha'], pred['omega'], pred['gain'], pred['zero']], dim=1)  # (B,4,K)
+        P = torch.stack(pred['alpha'], pred['omega'], pred['rho'], dim=1)  # (B,4,K)
         PN = (P - self.mean) / self.std.clamp_min(1e-8)
-        return {'alpha': PN[:,0,:], 'omega': PN[:,1,:], 'gain': PN[:,2,:], 'zero': PN[:,3,:]}
+        return {'alpha': PN[:,0,:], 'omega': PN[:,1,:], 'rho': PN[:,2,:]}
 
     def _presence_losses(self, pred, mask, assign_rows=None):
         cfg = Config()
@@ -86,12 +86,12 @@ class MaskedMSE(nn.Module):
 
     def forward(self, pred, tgt, mask):
         predN = self.norm_pred(pred)
-        aP, wP, gP, zP, _ = self._sort_by_omega(predN['alpha'], predN['omega'], predN['gain'], predN['zero'], mask)
-        aT, wT, gT, zT, mT = self._sort_by_omega(tgt['alpha'],  tgt['omega'],  tgt['gain'],  tgt['zero'],  mask)
+        aP, wP, rP, sP, cP, _ = self._sort_by_omega(predN['alpha'], predN['omega'], predN['rho'], predN['sin_theta'], predN['cos_theta'], mask)
+        aT, wT, rT, sT, cT, mT = self._sort_by_omega(tgt['alpha'],  tgt['omega'],  tgt['rho'],  tgt['sin_theta'], tgt['cos_theta'], mask)
         w = mT; num = w.sum().clamp_min(1.0)
-        l_alpha = (aP - aT).pow(2); l_omega = (wP - wT).pow(2); l_gain = (gP - gT).pow(2); l_zero = (zP - zT).pow(2)
-        loss_reg = (self.w_alpha*(w*l_alpha).sum() + self.w_omega*(w*l_omega).sum() +
-                    self.w_gain *(w*l_gain ).sum() + self.w_zero *(w*l_zero ).sum()) / num
+        l_alpha = (aP - aT).pow(2); l_omega = (wP - wT).pow(2); l_rho = (rP - rT).pow(2); l_sin_theta = (sP - sT).pow(2); l_cos_theta = (cP - cT).pow(2)
+        loss_reg = (self.w_alpha*(w*l_alpha).sum() + self.w_omega*(w*l_omega).sum() + self.w_rho *(w*l_rho).sum() +
+                    self.w_sin_theta *(w*l_sin_theta).sum() + self.w_cos_theta *(w*l_cos_theta).sum()) / num
         loss_cls = self._presence_losses(pred, mask)
         return loss_reg + loss_cls
 
@@ -106,22 +106,23 @@ class MaskedHungarianMSE(MaskedMSE):
         device = mask.device
         predN = self.norm_pred(pred)
         # predN = pred
-        PA, PO, PG, PZ = predN['alpha'], predN['omega'], predN['gain'], predN['zero']  # [B, K_pred]
+        PA, PO, PR, PS, PC = predN['alpha'], predN['omega'], predN['rho'], predN['sin_theta'], pred['cos_theta']  # [B, K_pred]
         B = PA.size(0)  # batch大小
         K_pred = PA.size(1) # 总模态数
         K_tgt  = mask.size(1)
 
         # === 标签标准化到 z-score 空间 ===
-        T  = torch.stack([tgt['alpha'], tgt['omega'], tgt['gain'], tgt['zero']], dim=1)  # [B,4,K_tgt]
-        TA, TO, TG, TZ = T[:,0,:], T[:,1,:], T[:,2,:], T[:,3,:]                       # [B, K_tgt]
+        T  = torch.stack([tgt['alpha'], tgt['omega'], tgt['rho'], tgt['sin_theta'], tgt['cos_theta']], dim=1)  # [B,4,K_tgt]
+        TA, TO, TR, TS, TC = T[:,0,:], T[:,1,:], T[:,2,:], T[:,3,:], T[:,4,:]                       # [B, K_tgt]
 
         # === 代价矩阵（no_grad）：[B, K_pred, K_tgt] ===
         with torch.no_grad():
             dA = (PA.unsqueeze(2) - TA.unsqueeze(1))**2
             dO = (PO.unsqueeze(2) - TO.unsqueeze(1))**2
-            dG = (PG.unsqueeze(2) - TG.unsqueeze(1))**2
-            dZ = (PZ.unsqueeze(2) - TZ.unsqueeze(1))**2
-            cost = self.w_alpha*dA + self.w_omega*dO + self.w_gain*dG + self.w_zero*dZ    # [B,K_pred,K_tgt]
+            dR = (PR.unsqueeze(2) - TR.unsqueeze(1))**2
+            dS = (PS.unsqueeze(2) - TS.unsqueeze(1))**2
+            dC = (PC.unsqueeze(2) - TC.unsqueeze(1))**2
+            cost = self.w_alpha*dA + self.w_omega*dO + self.w_rho*dR + self.w_sin_theta*dS + self.w_cos_theta*dC    # [B,K_pred,K_tgt]
             cost.masked_fill_(((mask > 0.5).unsqueeze(1) == 0), 1e6)
 
             # 合法配对掩码：预测侧全1，目标侧来自 mask
@@ -164,11 +165,12 @@ class MaskedHungarianMSE(MaskedMSE):
 
             da = PA[b, rows] - TA[b, cols]
             do = PO[b, rows] - TO[b, cols]
-            dg = PG[b, rows] - TG[b, cols]
-            dz = PZ[b, rows] - TZ[b, cols]
+            dr = PR[b, rows] - TR[b, cols]
+            ds = PS[b, rows] - TS[b, cols]
+            dc = PC[b, rows] - TC[b, cols]
 
             # 等权：也可改为 pair-weighted；此处每样本先均值，再跨样本均值
-            loss_b = (da.pow(2).mean() + do.pow(2).mean() + dg.pow(2).mean() + dz.pow(2).mean())
+            loss_b = (da.pow(2).mean() + do.pow(2).mean() + dr.pow(2).mean() + ds.pow(2).mean() + dc.pow(2).mean())
             loss_sum += loss_b
             pair_cnt += 1
 

@@ -22,10 +22,14 @@ class ModalDataset(Dataset):
         ch_id  = torch.tensor(p.ch_id, dtype=torch.long)
         alpha = torch.from_numpy(p.alpha.copy())
         omega = torch.from_numpy(p.omega.copy())
-        gain  = torch.from_numpy(p.gain.copy())
-        zero  = torch.from_numpy(p.zero.copy())
-        lab = torch.stack([alpha, omega, gain, zero], dim=0)  # (4, K) 
+        rho  = torch.from_numpy(p.rho.copy())
+        sin_theta = torch.from_numpy(p.sin_theta.copy())
+        cos_theta = torch.from_numpy(p.cos_theta.copy())
+        lab = torch.stack([alpha, omega, rho], dim=0)  # (4, K) 
         lab_norm = (lab - torch.as_tensor(self.out_norm.mean[:,None], dtype=lab.dtype)) / torch.as_tensor(self.out_norm.std[:,None], dtype=lab.dtype).clamp_min(1e-8)
+        sin_theta = sin_theta.unsqueeze(0)  # (1, K)
+        cos_theta = cos_theta.unsqueeze(0)
+        lab_norm = torch.cat([lab_norm, sin_theta, cos_theta], dim=0)
         mask = torch.from_numpy(p.mask.copy())
         return Hn, Mn, exc_id, ch_id, mask, lab_norm
 
@@ -37,9 +41,10 @@ def collate_modal(batch):
     m  = torch.stack([b[4] for b in batch], dim=0)  # (B,K)
     yN = torch.stack([b[5] for b in batch], dim=0)  # (B,4,K)
     y_dict = {
-        'alpha': yN[:,0,:],
-        'omega': yN[:,1,:],
-        'gain':  yN[:,2,:],
-        'zero':  yN[:,3,:],
+        'alpha':     yN[:,0,:],
+        'omega':     yN[:,1,:],
+        'rho':       yN[:,2,:],
+        'sin_theta': yN[:,3,:],
+        'cos_theat': yN[:,4,:]
     }
     return H, M, e, c, m, y_dict
