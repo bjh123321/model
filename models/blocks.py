@@ -31,7 +31,7 @@ class LowFidelityHead(nn.Module):
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
         x = torch.cat([H, M, e_exc, e_chn], dim=-1)
-        out = self.mlp(x).view(-1, self.cfg.K_max, (5 if self.cfg.use_presence_head else 4))
+        out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
         u_alpha = out[...,0]; u_omega = out[...,1]; u_rho = out[...,2]; u_sin_theta = out[...,3]; u_cos_theta = out[...,4]
         if self.cfg.use_presence_head:
             u_pres  = out[...,5]
@@ -44,7 +44,7 @@ class LinearHFHead(nn.Module):
     def __init__(self, K_max: int, use_presence: bool):
         super().__init__()
         self.use_presence = use_presence
-        nout = 5 if use_presence else 4
+        nout = 6 if use_presence else 5
         self.A = nn.Parameter(torch.ones(1, K_max, nout))
         self.b = nn.Parameter(torch.zeros(1, K_max, nout))
     def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
@@ -54,8 +54,8 @@ class LinearHFHead(nn.Module):
             u = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)
         y = self.A * u + self.b
         if self.use_presence:
-            return y[...,0], y[...,1], y[...,2], y[...,3], y[...,4]
-        return y[...,0], y[...,1], y[...,2], y[...,3]
+            return y[...,0], y[...,1], y[...,2], y[...,3], y[...,4], y[...,5]
+        return y[...,0], y[...,1], y[...,2], y[...,3], y[...,4]
 
 class ResidualHFHead(nn.Module):
     def __init__(self, cfg: Config):
@@ -63,8 +63,8 @@ class ResidualHFHead(nn.Module):
         self.cfg = cfg
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
-        in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim + 4 + (1 if cfg.use_presence_head else 0)
-        out_dim = cfg.K_max * (5 if cfg.use_presence_head else 4)
+        in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim + 5 + (1 if cfg.use_presence_head else 0)
+        out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
         self.mlp = MLP(in_dim, out_dim=out_dim, hidden=cfg.lin_high_hidden)
     def forward(self, H, M, exc_id, ch_id, uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):
         uL_pool = torch.stack([uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta], dim=-1).mean(dim=1)
@@ -74,16 +74,14 @@ class ResidualHFHead(nn.Module):
             x = torch.cat([H, M, e_exc, e_chn, uL_pool, uL_pres.mean(dim=1, keepdim=True)], dim=-1)
         else:
             x = torch.cat([H, M, e_exc, e_chn, uL_pool], dim=-1)
-        out = self.mlp(x).view(-1, self.cfg.K_max, (5 if self.cfg.use_presence_head else 4))
+        out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
         if self.cfg.use_presence_head:
-            return out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
-        return out[...,0], out[...,1], out[...,2], out[...,3]
+            return out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
+        return out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
 
 class ParamPZK(nn.Module):
-    def __init__(self, enforce_min_phase_zero: bool=True, enforce_positive_omega: bool=True):
+    def __init__(self):
         super().__init__()
-        self.enforce_min_phase_zero = enforce_min_phase_zero
-        self.enforce_positive_omega = enforce_positive_omega
     def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta):
         alpha = -F.softplus(u_alpha)
         omega =  F.sigmoid(u_omega)
@@ -100,7 +98,7 @@ class MFDNN(nn.Module):
         self.low = LowFidelityHead(cfg)
         self.lin = LinearHFHead(cfg.K_max, use_presence=cfg.use_presence_head)
         self.res = ResidualHFHead(cfg)
-        self.param = ParamPZK(cfg.enforce_min_phase_zero, cfg.enforce_positive_omega)
+        self.param = ParamPZK()
 
     def forward_low(self, H, M, e, c):
         u = self.low(H, M, e, c)
@@ -114,7 +112,7 @@ class MFDNN(nn.Module):
     def forward_high(self, H, M, e, c, outL):
         if self.cfg.use_presence_head:
             uA, uW, uR, uS, uC, uP = self.lin(outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres'])
-            dA, dW, dR, dS, dC, dP = self.res(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_sin_theta'], outL['u_pres'])
+            dA, dW, dR, dS, dC, dP = self.res(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres'])
             uA, uW, uR, uS, uC, uP = uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(uA, uW, uR, uS, uC)
             p = torch.sigmoid(uP)

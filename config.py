@@ -30,10 +30,6 @@ class Config:
     lr_high_adam: float = 1e-3
     weight_decay: float = 1e-4
 
-    # Constraints / labeling conventions
-    enforce_min_phase_zero: bool = False
-    enforce_positive_omega: bool = True
-
     # Loss function selection
     use_hungarian_loss: bool = True
 

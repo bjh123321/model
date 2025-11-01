@@ -8,85 +8,104 @@ import torch.nn as nn
 import torch.distributed as dist
 from ..config import Config
 from ..models.blocks import MFDNN
-from ..losses.masked_mse import MaskedMSE, MaskedHungarianMSE  # [已含]
+from ..losses.masked_mse import MaskedMSE, MaskedHungarianMSE
 from ..utils.dist_utils import is_main_process, dist_mean_scalar
 from ..data.normalizer import Normalizer
 from .dataloaders import build_dataloaders
 
 
-def _cur_lr(optimizer):  # [Added]
+def _cur_lr(optimizer):
     return optimizer.param_groups[0]['lr']
 
 def _mse_per_param_z(pred, yN, mask, mean, std, use_presence: bool):
-    # 取预测（物理域）-> z-score
-    # pred['alpha'/'omega'/...] 形状：[B, K_max]
     eps = 1e-8
-    P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # [B,4,K]
-    P1 = torch.stack([pred['alpha'], pred['omega']], dim=1)
-    TN = torch.stack([yN['alpha'], yN['omega'], yN['rho'], yN['sin_theta'], yN['cos_theta']], dim=1)          # [B,4,K]
-    # mean/std 形状：[4]，广播到 [B,4,K]
+    P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # [B,3,K]
+    P1 = torch.stack([pred['sin_theta'], pred['cos_theta']], dim=1)      # [B,2,K]
+    TN = torch.stack([yN['alpha'], yN['omega'], yN['rho'], yN['sin_theta'], yN['cos_theta']], dim=1)  # [B,5,K]
+
     PN = (P - mean.view(1,3,1)) / (std.view(1,3,1).clamp_min(1e-8))
-    PN = torch.cat([PN, P1], dim=1)
+    PN = torch.cat([PN, P1], dim=1)  # [B,5,K]
 
-    # mask: [B,K] -> [B,1,K] 参与四个通道
-    m = (mask > 0.5).float().unsqueeze(1)  # [B,1,K]
-    denom = m.sum(dim=(0,2)).clamp_min(1.0)  # [1]每通道一样，用总数归一
+    m = (mask > 0.5).float().unsqueeze(1)
+    denom = m.sum(dim=(0,2)).clamp_min(1.0)
 
-    err = (PN - TN).pow(2) * m  # [B,4,K]
-    mse_ch = err.sum(dim=(0,2)) / denom  # [4] -> α,ω,gain,zero
+    err = (PN - TN).pow(2) * m
+    mse_ch = err.sum(dim=(0,2)) / denom  # [5]
 
     out = {
         'alpha': mse_ch[0].item(),
         'omega': mse_ch[1].item(),
-        'gain' : mse_ch[2].item(),
-        'zero' : mse_ch[3].item(),
+        'rho'  : mse_ch[2].item(),
+        'sin_theta': mse_ch[3].item(),
+        'cos_theta': mse_ch[4].item()
     }
 
     if use_presence:
-        # BCE: 用 u_pres 做 logits（若没提供 u_pres，就退化用 p_exist 的 logit 近似）
         if 'u_pres' in pred:
-            logits = pred['u_pres']              # [B,K]
+            logits = pred['u_pres']
             target = (mask > 0.5).float()
-            bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                logits, target, reduction='none'
-            )
-            bce = bce.mean().item()
+            bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, reduction='none').mean().item()
         else:
-            # 退化：p_exist∈(0,1)，避免数值问题
             p = pred.get('p_exist', torch.sigmoid(torch.zeros_like(mask)))
             p = p.clamp(1e-6, 1-1e-6)
             target = (mask > 0.5).float()
             bce = -(target*torch.log(p) + (1-target)*torch.log(1-p)).mean().item()
-        # Cardinality：预测个数 vs 目标个数（用 MSE）
-        pred_cnt = (torch.sigmoid(pred['u_pres']) if 'u_pres' in pred else pred.get('p_exist', 0.0)).sum(dim=1)  # [B]
-        true_cnt = (mask > 0.5).float().sum(dim=1)  # [B]
-        card = (pred_cnt - true_cnt).pow(2).mean().item()
 
+        pred_cnt = (torch.sigmoid(pred['u_pres']) if 'u_pres' in pred else pred.get('p_exist', 0.0)).sum(dim=1)
+        true_cnt = (mask > 0.5).float().sum(dim=1)
+        card = (pred_cnt - true_cnt).pow(2).mean().item()
         out['bce'] = bce
         out['card'] = card
 
     return out
 
-
 def _accum_stat(stat_accum: dict, new_stat: dict):
     for k, v in new_stat.items():
         stat_accum[k] = stat_accum.get(k, 0.0) + float(v)
-
-
-
 
 def _make_weights(std_np: np.ndarray):
     eps = 1e-8
     w = 1.0 / ((np.asarray(std_np, dtype=np.float64) ** 2) + eps)
     w = w / (w.mean() + eps)
-    return float(w[0]), float(w[1]), float(w[2]), float(w[3])
+    return float(w[0]), float(w[1]), float(w[2]), float(w[3])  # 未使用，保留接口
+
+def _load_stage1_low_from_fold0(model_core: nn.Module, ckpt_dir: Path) -> bool:
+    """
+    从 fold0 的最佳/收敛 checkpoint 加载 low.* 权重。全部 rank 都应调用，保证 DDP 同步。
+    返回是否加载成功。
+    """
+    # [Added] 尝试候选文件（按优先级）
+    candidates = [
+        ckpt_dir / 'best_stage1_fold0.pth',
+        ckpt_dir / 'checkpoint_stage1_fold0_earlystop_epoch10000.pth',  # 可能存在的文件名
+    ]
+    # 兜底：扫描目录中任何以 best_stage1_fold0 开头或 checkpoint_stage1_fold0 开头的文件
+    for p in list(candidates) + sorted(ckpt_dir.glob('best_stage1_fold0*.pth')) + sorted(ckpt_dir.glob('checkpoint_stage1_fold0*.pth')):
+        if p.exists():
+            try:
+                state = torch.load(p, map_location='cpu').get('model_state_dict', None)
+                if state is None:
+                    continue
+                # 仅抽取 low.* 参数
+                low_state = {k: v for k, v in state.items() if k.startswith('low.')}
+                missing, unexpected = model_core.load_state_dict(low_state, strict=False)
+                # 允许 high 层未加载；只要 low.* 正常覆盖即可
+                if is_main_process():
+                    print(f"  [S1] Reuse fold0 low.* from: {p.name} (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
+                return True
+            except Exception as ex:
+                if is_main_process():
+                    print(f"  [S1] Failed loading {p.name}: {ex}", flush=True)
+    if is_main_process():
+        print("  [S1] No fold0 checkpoint found for reuse; will train Stage-1 on this fold.", flush=True)
+    return False
 
 def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     device = torch.device('cuda', local_rank) if torch.cuda.is_available() else torch.device('cpu')
 
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True) # parents=True表示如果上级目录不存在，会自动一并创建，exist_ok=True表示如果目录已存在，不会报错
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     sim_dl, real_dl, val_dl, N_sim, N_real = build_dataloaders(
         sim_parsed, real_parsed, cfg, args.kfold, fold, device, out_dir
@@ -115,9 +134,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     mean_real = torch.tensor(norm_real.mean, dtype=torch.float32, device=device)
     std_real  = torch.tensor(norm_real.std,  dtype=torch.float32, device=device)
 
-    # w_s1_alpha, w_s1_omega, w_s1_gain, w_s1_zero = _make_weights(norm_sim.std)
-    # w_s2_alpha, w_s2_omega, w_s2_gain, w_s2_zero = _make_weights(norm_real.std)
-    # 替换 _make_weights 的使用结果为等权
+    # 等权
     w_s1_alpha = w_s1_omega = w_s1_rho = w_s1_sin_theta = w_s1_cos_theta = 1.0
     w_s2_alpha = w_s2_omega = w_s2_rho = w_s2_sin_theta = w_s2_cos_theta = 1.0
 
@@ -143,130 +160,89 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                             w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta, w_cos_theta=w_s2_cos_theta,
                             presence_weight=pres_w, cardinality_weight=card_w)
 
-    # ============ Stage 1 ============
-    for p in model_core.lin.parameters(): p.requires_grad_(False)
-    for p in model_core.res.parameters(): p.requires_grad_(False)
+    # [Added] 是否复用 fold0 的 Stage-1（low.*）结果
+    stage1_once = bool(getattr(args, 'stage1_once', 0))  # 主程序已设置：1 表示 S1 只训练一次
+    reuse_stage1 = stage1_once and (fold > 0)
 
-    opt1 = torch.optim.Adam(model_core.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
-    use_cuda = (device.type == 'cuda')
-    scaler = torch.amp.GradScaler('cuda') if use_cuda else None
+    # ============ Stage 1 ============ #
+    # [Changed]：当 reuse_stage1=True 时，跳过训练并加载 fold0 的 low.* 权重
+    did_reuse = False
+    if reuse_stage1:
+        did_reuse = _load_stage1_low_from_fold0(model_core, out_dir)
 
-    pat1   = getattr(cfg, 'lr_patience_s1', 50)         # 连续多少个 epoch 无提升就降 LR
-    fac1   = getattr(cfg, 'lr_factor_s1', 0.5)         # 降低倍数（乘以该系数）
-    minlr1 = getattr(cfg, 'lr_min_s1', 1e-6)           # LR 下限
-    thr    = getattr(cfg, 'early_stop_min_delta', 0.0) # 认为“有提升”的阈值
-    sched1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    opt1, mode='min', factor=fac1, patience=pat1,
-    threshold=thr, threshold_mode='abs', cooldown=0,
-    min_lr=minlr1, eps=1e-12
-    )
+    if not did_reuse:
+        # 常规 S1 训练
+        for p in model_core.lin.parameters(): p.requires_grad_(False)
+        for p in model_core.res.parameters(): p.requires_grad_(False)
 
-    best_sim = float('inf'); no_improve = 0
-    loss_hist = []
-    lr_hist = []
+        opt1 = torch.optim.Adam(model_core.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
+        use_cuda = (device.type == 'cuda')
+        scaler = torch.amp.GradScaler('cuda') if use_cuda else None
 
-    for epoch in range(cfg.epochs_stage1):
-        model.train()
-        sim_dl.sampler.set_epoch(epoch)
-        sum_loss = 0.0; seen = 0
-        comp_accum = {}   # 新增：分项损失累加
-        comp_count = 0    # 新增：样本计数（以 batch 为单位或以样本为单位都可，这里用 batch 计数做均值）
+        pat1   = getattr(cfg, 'lr_patience_s1', 50)
+        fac1   = getattr(cfg, 'lr_factor_s1', 0.5)
+        minlr1 = getattr(cfg, 'lr_min_s1', 1e-6)
+        thr    = getattr(cfg, 'early_stop_min_delta', 0.0)
+        sched1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt1, mode='min', factor=fac1, patience=pat1,
+            threshold=thr, threshold_mode='abs', cooldown=0,
+            min_lr=minlr1, eps=1e-12
+        )
 
+        best_sim = float('inf'); no_improve = 0
+        loss_hist = []; lr_hist = []
 
-        for H, M, e, c, mask, yN in sim_dl:
-            H = H.to(device, non_blocking=True)
-            M = M.to(device, non_blocking=True)
-            e = e.to(device, non_blocking=True)
-            c = c.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-            for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
+        for epoch in range(cfg.epochs_stage1):
+            model.train()
+            sim_dl.sampler.set_epoch(epoch)
+            sum_loss = 0.0; seen = 0
+            comp_accum = {}; comp_count = 0
 
-            opt1.zero_grad(set_to_none=True)
-            if use_cuda:
-                with torch.amp.autocast(device_type='cuda'):
+            for H, M, e, c, mask, yN in sim_dl:
+                H = H.to(device, non_blocking=True)
+                M = M.to(device, non_blocking=True)
+                e = e.to(device, non_blocking=True)
+                c = c.to(device, non_blocking=True)
+                mask = mask.to(device, non_blocking=True)
+                for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
+
+                opt1.zero_grad(set_to_none=True)
+                if use_cuda:
+                    with torch.amp.autocast(device_type='cuda'):
+                        outL, _ = model(H, M, e, c)
+                        loss = crit_s1(outL, yN, mask)
+                    with torch.no_grad():
+                        stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
+                        _accum_stat(comp_accum, stat); comp_count += 1
+                    scaler.scale(loss).backward(); scaler.step(opt1); scaler.update()
+                else:
                     outL, _ = model(H, M, e, c)
                     loss = crit_s1(outL, yN, mask)
-                    # === 新增分项统计（S1，低保真） ===
-                with torch.no_grad():
-                    stat = _mse_per_param_z(
-                        pred=outL, yN=yN, mask=mask,
-                        mean=mean_sim, std=std_sim,
-                        use_presence=cfg.use_presence_head
-                    )
-                    _accum_stat(comp_accum, stat)
-                    comp_count += 1
-                scaler.scale(loss).backward()
-                scaler.step(opt1)
-                scaler.update()
-            else:
-                outL, _ = model(H, M, e, c)
-                loss = crit_s1(outL, yN, mask)
-                with torch.no_grad():
-                    stat = _mse_per_param_z(
-                        pred=outL, yN=yN, mask=mask,
-                        mean=mean_sim, std=std_sim,
-                        use_presence=cfg.use_presence_head
-                    )
-                    _accum_stat(comp_accum, stat)
-                    comp_count += 1
-                loss.backward()
-                opt1.step()
+                    with torch.no_grad():
+                        stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
+                        _accum_stat(comp_accum, stat); comp_count += 1
+                    loss.backward(); opt1.step()
 
-            bs = H.size(0)
-            sum_loss += loss.item() * bs; seen += bs
+                bs = H.size(0)
+                sum_loss += loss.item() * bs; seen += bs
 
-        epoch_loss = sum_loss / max(1, seen)
-        epoch_loss_w = dist_mean_scalar(epoch_loss, device)
-        loss_hist.append(float(epoch_loss_w))
-        lr_hist.append(_cur_lr(opt1))
+            epoch_loss = sum_loss / max(1, seen)
+            epoch_loss_w = dist_mean_scalar(epoch_loss, device)
+            loss_hist.append(float(epoch_loss_w))
+            lr_hist.append(_cur_lr(opt1))
 
-        if is_main_process():
-            prev_lr = _cur_lr(opt1)
-        sched1.step(epoch_loss_w)
-        if is_main_process():
-            now_lr = _cur_lr(opt1)
-            if now_lr < prev_lr:
-                print(f"  [S1] LR reduced: {prev_lr:.3e} -> {now_lr:.3e}")
-
-        if is_main_process():
-            print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
-                  f'sim_loss={epoch_loss_w:.6f} lr={_cur_lr(opt1):.3e}', flush=True)
-            if (epoch + 1) % 1000 == 0:
-                torch.save({
-                    'fold': fold, 'stage': 1, 'epoch': epoch + 1,
-                    'model_state_dict': model_core.state_dict(),
-                    'optimizer_state_dict': opt1.state_dict(),
-                    'loss': float(epoch_loss_w),
-                    'loss_history': loss_hist,
-                    'lr_history': lr_hist,
-                }, out_dir / f'checkpoint_stage1_fold{fold}_epoch{epoch+1}.pth')
-
-        if is_main_process() and comp_count > 0:
-            avg = {k: v/comp_count for k,v in comp_accum.items()}
-            if cfg.use_presence_head:
-                print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}; "
-                    f"BCE={avg['bce']:.4f}, CARD={avg.get('card',0.0):.4f}", flush=True)
-            else:
-                print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}", flush=True)
-
-
-
-        if epoch_loss_w < best_sim - cfg.early_stop_min_delta:
-            best_sim = epoch_loss_w; no_improve = 0
             if is_main_process():
-                torch.save({
-                    'fold': fold, 'stage': 1, 'epoch': epoch + 1,
-                    'model_state_dict': model_core.state_dict(),
-                    'optimizer_state_dict': opt1.state_dict(),
-                    'loss': float(epoch_loss_w),
-                    'loss_history': loss_hist,
-                    'lr_history': lr_hist,
-                }, out_dir / f'best_stage1_fold{fold}.pth')
-        else:
-            no_improve += 1
-            if no_improve >= cfg.early_stop_patience_s1:
-                if is_main_process():
-                    print('  Early stop Stage1')
+                prev_lr = _cur_lr(opt1)
+            sched1.step(epoch_loss_w)
+            if is_main_process():
+                now_lr = _cur_lr(opt1)
+                if now_lr < prev_lr:
+                    print(f"  [S1] LR reduced: {prev_lr:.3e} -> {now_lr:.3e}")
+
+            if is_main_process():
+                print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
+                      f'sim_loss={epoch_loss_w:.6f} lr={_cur_lr(opt1):.3e}', flush=True)
+                if (epoch + 1) % 1000 == 0:
                     torch.save({
                         'fold': fold, 'stage': 1, 'epoch': epoch + 1,
                         'model_state_dict': model_core.state_dict(),
@@ -274,10 +250,51 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                         'loss': float(epoch_loss_w),
                         'loss_history': loss_hist,
                         'lr_history': lr_hist,
-                    }, out_dir / f'checkpoint_stage1_fold{fold}_earlystop_epoch{epoch+1}.pth')
-                break
+                    }, out_dir / f'checkpoint_stage1_fold{fold}_epoch{epoch+1}.pth')
 
-    # ============ Stage 2 ============
+            if is_main_process() and comp_count > 0:
+                avg = {k: v/comp_count for k,v in comp_accum.items()}
+                if cfg.use_presence_head:
+                    print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, "
+                          f"sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}; "
+                          f"BCE={avg['bce']:.4f}, CARD={avg.get('card',0.0):.4f}", flush=True)
+                else:
+                    print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, "
+                          f"sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}", flush=True)
+
+            if epoch_loss_w < best_sim - cfg.early_stop_min_delta:
+                best_sim = epoch_loss_w; no_improve = 0
+                if is_main_process():
+                    torch.save({
+                        'fold': fold, 'stage': 1, 'epoch': epoch + 1,
+                        'model_state_dict': model_core.state_dict(),
+                        'optimizer_state_dict': opt1.state_dict(),
+                        'loss': float(epoch_loss_w),
+                        'loss_history': loss_hist,
+                        'lr_history': lr_hist,
+                    }, out_dir / f'best_stage1_fold{fold}.pth')
+            else:
+                no_improve += 1
+                if no_improve >= cfg.early_stop_patience_s1:
+                    if is_main_process():
+                        print('  Early stop Stage1')
+                        torch.save({
+                            'fold': fold, 'stage': 1, 'epoch': epoch + 1,
+                            'model_state_dict': model_core.state_dict(),
+                            'optimizer_state_dict': opt1.state_dict(),
+                            'loss': float(epoch_loss_w),
+                            'loss_history': loss_hist,
+                            'lr_history': lr_hist,
+                        }, out_dir / f'checkpoint_stage1_fold{fold}_earlystop_epoch{epoch+1}.pth')
+                    break
+    else:
+        # 复用时依然需要把 high 层在 S1 期间禁用梯度（保持与常规路径一致），然后在 S2 再开启
+        for p in model_core.lin.parameters(): p.requires_grad_(False)
+        for p in model_core.res.parameters(): p.requires_grad_(False)
+        if is_main_process():
+            print(f"[Fold {fold+1}] S1 skipped (reuse fold0).", flush=True)
+
+    # ============ Stage 2 ============ #
     for p in model_core.lin.parameters(): p.requires_grad_(True)
     for p in model_core.res.parameters(): p.requires_grad_(True)
     opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam, weight_decay=cfg.weight_decay)
@@ -285,6 +302,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     pat2   = getattr(cfg, 'lr_patience_s2', 50)
     fac2   = getattr(cfg, 'lr_factor_s2', 0.5)
     minlr2 = getattr(cfg, 'lr_min_s2', 1e-6)
+    thr    = getattr(cfg, 'early_stop_min_delta', 0.0)
     sched2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt2, mode='min', factor=fac2, patience=pat2,
         threshold=thr, threshold_mode='abs', cooldown=0,
@@ -296,6 +314,9 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     sim_iter = None
     total_hist, sim_hist, real_hist = [], [], []
     lr_hist_s2 = []
+
+    use_cuda = (device.type == 'cuda')
+    scaler2 = torch.amp.GradScaler('cuda') if use_cuda else None  # [Added] 给 S2 也用 AMP（与 S1 对齐）
 
     for epoch in range(cfg.epochs_stage2):
         model.train()
@@ -327,7 +348,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     outL_s, _ = model(H_s, M_s, e_s, c_s)
                     loss_sim = crit_s1(outL_s, yNs, mask_s)
                     loss = w_real*loss_real + w_sim*loss_sim
-                scaler.scale(loss).backward(); scaler.step(opt2); scaler.update()
+                scaler2.scale(loss).backward(); scaler2.step(opt2); scaler2.update()
             else:
                 _, outH_r = model(H_r, M_r, e_r, c_r)
                 loss_real = crit_s2(outH_r, yNr, mask_r)
@@ -366,7 +387,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         lr_hist_s2.append(_cur_lr(opt2))
 
         if is_main_process():
-            print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} ' 
+            print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
                   f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
                   f'lr={_cur_lr(opt2):.3e}', flush=True)
             if (epoch + 1) % 1000 == 0:
@@ -419,18 +440,18 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     }, out_dir / f'checkpoint_stage2_fold{fold}_earlystop_epoch{epoch+1}.pth')
                 break
 
-    # ============ Validation ============
+    # ============ Validation ============ #
     model.eval()
     if cfg.use_hungarian_loss:
         crit_eval = MaskedHungarianMSE(mean=mean_real, std=std_real,
                                        w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                                       w_rho=w_s2_rho, w_s2_sin_theta=w_s2_sin_theta,
+                                       w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
                                        w_cos_theta=w_s2_cos_theta)
     else:
         crit_eval = MaskedMSE(mean=mean_real, std=std_real,
-                               w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                               w_rho=w_s2_rho, w_s2_sin_theta=w_s2_sin_theta,
-                               w_cos_theta=w_s2_cos_theta)
+                              w_alpha=w_s2_alpha, w_omega=w_s2_omega,
+                              w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
+                              w_cos_theta=w_s2_cos_theta)
     with torch.no_grad():
         vsum, vcnt = 0.0, 0
         for H, M, e, c, mask, yN in val_dl:

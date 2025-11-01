@@ -13,6 +13,10 @@ def main():
     parser.add_argument('--real_txt', type=str, required=True)
     parser.add_argument('--out_dir', type=str, default='./surrogate_model/outputs_pzk')
     parser.add_argument('--kfold', type=int, default=5)
+    parser.add_argument('--stage1_kfold', type=int, default=0, choices=[0, 1],
+                        help='Set to 1 to train stage 1 on every fold, 0 to train once and reuse')
+    parser.add_argument('--stage2_kfold', type=int, default=1, choices=[0, 1],
+                        help='Set to 1 to train stage 2 on every fold, 0 to train once')
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
     parser.add_argument('--embed_channel_dim', type=int, default=12)
     parser.add_argument('--epochs_s1', type=int, default=10000)
@@ -21,8 +25,6 @@ def main():
     parser.add_argument('--batch_real', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--prefetch', type=int, default=4)
-    parser.add_argument('--enforce_min_phase_zero', type=int, default=0, choices=[0,1])
-    parser.add_argument('--enforce_positive_omega', type=int, default=1, choices=[0,1])
     args = parser.parse_args()
 
     # DDP init
@@ -47,6 +49,9 @@ def main():
     sim_rows  = read_variable_txt(Path(args.sim_txt))
     real_rows = read_variable_txt(Path(args.real_txt))
 
+    sim_parsed, sim_stats   = parse_rows_to_struct(sim_rows)
+    real_parsed, real_stats = parse_rows_to_struct(real_rows)
+
     cfg = Config()
     cfg.embed_excitation_dim = args.embed_excitation_dim
     cfg.embed_channel_dim = args.embed_channel_dim
@@ -56,20 +61,16 @@ def main():
     cfg.batch_real = args.batch_real
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
-    cfg.enforce_min_phase_zero = bool(args.enforce_min_phase_zero)
-    cfg.enforce_positive_omega = bool(args.enforce_positive_omega)
-
-    sim_parsed, sim_stats   = parse_rows_to_struct(sim_rows)
-    real_parsed, real_stats = parse_rows_to_struct(real_rows)
-
     cfg.K_max          = max(sim_stats["K_max"], real_stats["K_max"])
     cfg.embed_channel_num = max(sim_stats["channel_num"], real_stats["channel_num"])
     cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
 
+    num_folds = args.kfold if bool(args.stage2_kfold) else 1 # 如果开fold训练则为stage2_kfold，否则为1
+    setattr(args, 'stage1_once', int(not bool(args.stage1_kfold)))
 
-    for fold in range(args.kfold):
+    for fold in range(num_folds):
         if (not dist.is_initialized()) or (dist.get_rank() == 0):
-            print(f'========== Fold {fold+1}/{args.kfold} ==========', flush=True)
+            print(f'========== Fold {fold+1}/{num_folds} ==========', flush=True)
         train_one_fold(fold, cfg, sim_parsed, real_parsed, args)
         if dist.is_initialized():
             torch.cuda.empty_cache()

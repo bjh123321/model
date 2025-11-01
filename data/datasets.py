@@ -45,6 +45,6 @@ def collate_modal(batch):
         'omega':     yN[:,1,:],
         'rho':       yN[:,2,:],
         'sin_theta': yN[:,3,:],
-        'cos_theat': yN[:,4,:]
+        'cos_theta': yN[:,4,:]
     }
     return H, M, e, c, m, y_dict
