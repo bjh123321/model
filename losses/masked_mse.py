@@ -11,19 +11,36 @@ from ..config import Config
 
 class MaskedMSE(nn.Module):
     def __init__(self, mean: torch.Tensor, std: torch.Tensor,
-                 w_alpha=1.0, w_omega=0.5, w_gain=0.5, w_zero=0.5,
+                 w_alpha: float = 1.0, w_omega: float = 1.0,
+                 w_rho: float = 1.0, w_sin_theta: float = 1.0,
+                 w_cos_theta: float = 1.0,
                  presence_weight: float = 0.0, cardinality_weight: float = 0.0):
         super().__init__()
-        self.register_buffer('mean', mean.view(3,1))
-        self.register_buffer('std',  std.view(3,1))
-        self.w_alpha, self.w_omega, self.w_gain, self.w_zero = w_alpha, w_omega, w_gain, w_zero
+        # Store mean/std for normalising the first three parameters
+        self.register_buffer('mean', mean.view(3))
+        self.register_buffer('std', std.view(3))
+        # Regression weights for each parameter
+        self.w_alpha = w_alpha
+        self.w_omega = w_omega
+        self.w_rho = w_rho
+        self.w_sin_theta = w_sin_theta
+        self.w_cos_theta = w_cos_theta
+        # Classification weights
         self.pres_w = presence_weight
         self.card_w = cardinality_weight
 
     def norm_pred(self, pred: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        P = torch.stack(pred['alpha'], pred['omega'], pred['rho'], dim=1)  # (B,4,K)
-        PN = (P - self.mean) / self.std.clamp_min(1e-8)
-        return {'alpha': PN[:,0,:], 'omega': PN[:,1,:], 'rho': PN[:,2,:]}
+        P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # (B, 3, K)
+        mean = self.mean.view(3, 1)
+        std = self.std.view(3, 1).clamp_min(1e-8)
+        PN = (P - mean) / std
+        return {
+            'alpha': PN[:, 0, :],
+            'omega': PN[:, 1, :],
+            'rho': PN[:, 2, :],
+            'sin_theta': pred['sin_theta'],
+            'cos_theta': pred['cos_theta'],
+        }
 
     def _presence_losses(self, pred, mask, assign_rows=None):
         cfg = Config()
@@ -97,9 +114,13 @@ class MaskedMSE(nn.Module):
 
 class MaskedHungarianMSE(MaskedMSE):
     def __init__(self, mean: torch.Tensor, std: torch.Tensor,
-                 w_alpha=1.0, w_omega=0.5, w_gain=0.5, w_zero=0.5,
+                 w_alpha: float = 1.0, w_omega: float = 1.0,
+                 w_rho: float = 1.0, w_sin_theta: float = 1.0,
+                 w_cos_theta: float = 1.0,
                  presence_weight: float = 0.0, cardinality_weight: float = 0.0):
-        super().__init__(mean, std, w_alpha=w_alpha, w_omega=w_omega, w_gain=w_gain, w_zero=w_zero,
+        super().__init__(mean, std,
+                         w_alpha=w_alpha, w_omega=w_omega,
+                         w_rho=w_rho, w_sin_theta=w_sin_theta, w_cos_theta=w_cos_theta,
                          presence_weight=presence_weight, cardinality_weight=cardinality_weight)
     
     def forward(self, pred, tgt, mask):
