@@ -64,16 +64,18 @@ with torch.no_grad():
     out = outL  # stage1 输出
     alpha = out["alpha"][0].cpu().numpy()
     omega = out["omega"][0].cpu().numpy()
-    gain  = out["gain"][0].cpu().numpy()
-    zero  = out["zero"][0].cpu().numpy()
+    rho   = out["rho"][0].cpu().numpy()
+    sin_theta = out["sin_theta"][0].cpu().numpy()
+    cos_theta = out["cos_theta"][0].cpu().numpy()
     p_exist = out["p_exist"][0].cpu().numpy()
 
 print("\n--- 网络输出 (物理域) ---")
 print("p_exist:", np.array2string(p_exist, precision=6))
 print("alpha  :", np.array2string(alpha, precision=6))
 print("omega  :", np.array2string(omega, precision=6))
-print("gain   :", np.array2string(gain,  precision=6))
-print("zero   :", np.array2string(zero,  precision=6))
+print("rho   :", np.array2string(rho,  precision=6))
+print("sin_theta   :", np.array2string(sin_theta,  precision=6))
+print("cos_theta   :", np.array2string(cos_theta,  precision=6))
 print("----------------------------")
 
 # ==== 验证归一化关系 ====
@@ -96,5 +98,4 @@ print("\n--- 归一化参数 ---")
 print(f"对应 mean/std = {mean[0].item():.6f} ± {std[0].item():.6f}")
 print(f"对应 mean/std = {mean[1].item():.6f} ± {std[1].item():.6f}")
 print(f"对应 mean/std = {mean[2].item():.6f} ± {std[2].item():.6f}")
-print(f"对应 mean/std = {mean[3].item():.6f} ± {std[3].item():.6f}")
 print("-------------------")

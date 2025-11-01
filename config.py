@@ -26,12 +26,12 @@ class Config:
     early_stop_min_delta: float = 1e-6
 
     # Optim
-    lr_low_adam: float = 1e-3
-    lr_high_adam: float = 1e-3
+    lr_low_adam: float = 1e-2
+    lr_high_adam: float = 1e-2
     weight_decay: float = 1e-4
 
     # Loss function selection
-    use_hungarian_loss: bool = True
+    use_hungarian_loss: bool = False
 
     # ===== Presence head & losses =====
     use_presence_head: bool = True

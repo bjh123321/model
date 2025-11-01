@@ -84,7 +84,7 @@ class MaskedMSE(nn.Module):
 
         return self.pres_w * bce + self.card_w * card
 
-    def _sort_by_omega(self, alpha, omega, gain, zero, mask):
+    def _sort_by_omega(self, alpha, omega, rho, sin_theta, cos_theta, mask):
         freq = torch.sqrt(alpha**2 + omega**2) / (2 * math.pi)
         if mask.shape[1] != freq.shape[1]:
             B, K_pred = freq.shape
@@ -99,7 +99,7 @@ class MaskedMSE(nn.Module):
         idx = torch.argsort(freq_eff, dim=1)
         def re(t):
             return torch.gather(t, 1, idx)
-        return re(alpha), re(omega), re(gain), re(zero), re(mask)
+        return re(alpha), re(omega), re(rho), re(sin_theta), re(cos_theta),  re(mask)
 
     def forward(self, pred, tgt, mask):
         predN = self.norm_pred(pred)
