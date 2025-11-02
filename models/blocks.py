@@ -18,6 +18,31 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+class ModulationHead(nn.Module):
+    """
+    调制头：根据离散激励/通道信息生成调制向量，对低保真预测进行条件调制。
+    """
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        # 独立的离散嵌入
+        self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
+        self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
+        in_dim = cfg.embed_excitation_dim + cfg.embed_channel_dim
+        # 使用配置中的 mod_hidden 作为隐藏层
+        out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
+        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.mod_hidden)
+
+    def forward(self, exc_id: torch.Tensor, ch_id: torch.Tensor) -> torch.Tensor:
+        e_exc = self.emb_exc(exc_id)
+        e_chn = self.emb_chn(ch_id)
+        x = torch.cat([e_exc, e_chn], dim=-1)
+        # 使用 Sigmoid 将输出约束在 (0,1)，作为调制因子
+        mod = torch.sigmoid(self.mlp(x))
+        # 形状调整为 (batch, K_max, out_per_mode)
+        return mod.view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
+
+
 class LowFidelityHead(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
@@ -27,11 +52,14 @@ class LowFidelityHead(nn.Module):
         in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim
         out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)   # 如果输出存在头乘6
         self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.low_hidden)
+        self.modulation = ModulationHead(cfg)
     def forward(self, H, M, exc_id, ch_id):
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
         x = torch.cat([H, M, e_exc, e_chn], dim=-1)
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
+        mod = self.modulation(exc_id, ch_id)
+        out = out * mod
         u_alpha = out[...,0]; u_omega = out[...,1]; u_rho = out[...,2]; u_sin_theta = out[...,3]; u_cos_theta = out[...,4]
         if self.cfg.use_presence_head:
             u_pres  = out[...,5]
@@ -57,20 +85,29 @@ class LinearHFHead(nn.Module):
             return y[...,0], y[...,1], y[...,2], y[...,3], y[...,4], y[...,5]
         return y[...,0], y[...,1], y[...,2], y[...,3], y[...,4]
 
-class ResidualHFHead(nn.Module):
+class AdaptationHead(nn.Module):
+    """
+    适配头：在高保真分支中对低保真预测结果进行非线性修正。
+    输入包含高保真特征 H、M、离散嵌入 e_exc、e_chn，以及低保真预测值。
+    """
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
+        # 输入维度：2 + 嵌入维度 + 平均池化后的低保真预估特征 +（可选存在头）
         in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim + 5 + (1 if cfg.use_presence_head else 0)
         out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
-        self.mlp = MLP(in_dim, out_dim=out_dim, hidden=cfg.lin_high_hidden)
-    def forward(self, H, M, exc_id, ch_id, uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):
+        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.adapt_hidden)
+
+    def forward(self, H, M, exc_id, ch_id,
+                uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):
+        # 平均池化低保真输出作为全局特征
         uL_pool = torch.stack([uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta], dim=-1).mean(dim=1)
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
         if self.cfg.use_presence_head:
+            # 将存在头平均加入特征
             x = torch.cat([H, M, e_exc, e_chn, uL_pool, uL_pres.mean(dim=1, keepdim=True)], dim=-1)
         else:
             x = torch.cat([H, M, e_exc, e_chn, uL_pool], dim=-1)
@@ -78,6 +115,7 @@ class ResidualHFHead(nn.Module):
         if self.cfg.use_presence_head:
             return out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
         return out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
+
 
 class ParamPZK(nn.Module):
     def __init__(self):
@@ -91,13 +129,14 @@ class ParamPZK(nn.Module):
         cos_theta = u_cos_theta / norm
         return alpha, omega, rho, sin_theta, cos_theta
 
+
 class MFDNN(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
         self.low = LowFidelityHead(cfg)
         self.lin = LinearHFHead(cfg.K_max, use_presence=cfg.use_presence_head)
-        self.res = ResidualHFHead(cfg)
+        self.adaptation = AdaptationHead(cfg)
         self.param = ParamPZK()
 
     def forward_low(self, H, M, e, c):
@@ -112,7 +151,7 @@ class MFDNN(nn.Module):
     def forward_high(self, H, M, e, c, outL):
         if self.cfg.use_presence_head:
             uA, uW, uR, uS, uC, uP = self.lin(outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres'])
-            dA, dW, dR, dS, dC, dP = self.res(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres'])
+            dA, dW, dR, dS, dC, dP = self.adaptation(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres'])
             uA, uW, uR, uS, uC, uP = uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(uA, uW, uR, uS, uC)
             p = torch.sigmoid(uP)
@@ -121,7 +160,7 @@ class MFDNN(nn.Module):
                     'p_exist': p, 'u_pres': uP}
         else:
             uA, uW, uR, uS, uC = self.lin(outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'])
-            dA, dW, dR, dS, dC = self.res(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'])
+            dA, dW, dR, dS, dC = self.adaptation(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'])
             uA, uW, uR, uS, uC = uA+dA, uW+dW, uR+dR, uS+dS, uC+dC
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(uA, uW, uR, uS, uC)
             return {'alpha': alpha, 'omega': omega, 'rho': rho, 'sin_theta': sin_theta, 'cos_theta': cos_theta,
