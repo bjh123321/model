@@ -121,7 +121,7 @@ class MFDNN(nn.Module):
                     'p_exist': p, 'u_pres': uP}
         else:
             uA, uW, uR, uS, uC = self.lin(outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'])
-            dA, dW, dR, dS, dC = self.res(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_sin_theta'])
+            dA, dW, dR, dS, dC = self.res(H, M, e, c, outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'])
             uA, uW, uR, uS, uC = uA+dA, uW+dW, uR+dR, uS+dS, uC+dC
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(uA, uW, uR, uS, uC)
             return {'alpha': alpha, 'omega': omega, 'rho': rho, 'sin_theta': sin_theta, 'cos_theta': cos_theta,

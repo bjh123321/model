@@ -37,8 +37,8 @@ class ParsedRow:
 
 def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
     import math
-    Ts = 512
-    omegaN = math.pi / Ts
+    fs = 512
+    omegaN = math.pi * fs
     K_list, ch_list, exc_list = [], [], []
     for r in rows:
         tail = r[4:]

@@ -179,7 +179,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         use_cuda = (device.type == 'cuda')
         scaler = torch.amp.GradScaler('cuda') if use_cuda else None
 
-        pat1   = getattr(cfg, 'lr_patience_s1', 50)
+        pat1   = getattr(cfg, 'lr_patience_s1', 20)
         fac1   = getattr(cfg, 'lr_factor_s1', 0.5)
         minlr1 = getattr(cfg, 'lr_min_s1', 1e-6)
         thr    = getattr(cfg, 'early_stop_min_delta', 0.0)
@@ -299,7 +299,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     for p in model_core.res.parameters(): p.requires_grad_(True)
     opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam, weight_decay=cfg.weight_decay)
 
-    pat2   = getattr(cfg, 'lr_patience_s2', 50)
+    pat2   = getattr(cfg, 'lr_patience_s2', 20)
     fac2   = getattr(cfg, 'lr_factor_s2', 0.5)
     minlr2 = getattr(cfg, 'lr_min_s2', 1e-6)
     thr    = getattr(cfg, 'early_stop_min_delta', 0.0)

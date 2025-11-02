@@ -31,7 +31,7 @@ class Config:
     weight_decay: float = 1e-4
 
     # Loss function selection
-    use_hungarian_loss: bool = False
+    use_hungarian_loss: bool = True
 
     # ===== Presence head & losses =====
     use_presence_head: bool = True
