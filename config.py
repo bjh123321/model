@@ -36,6 +36,6 @@ class Config:
 
     # ===== Presence head & losses =====
     use_presence_head: bool = True
-    presence_loss_weight: float = 1.0
-    cardinality_loss_weight: float = 0.5
+    presence_loss_weight: float = 0.1
+    cardinality_loss_weight: float = 0.05
     presence_threshold: float = 0.5
