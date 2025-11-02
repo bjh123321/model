@@ -173,7 +173,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     if not did_reuse:
         # 常规 S1 训练
         for p in model_core.lin.parameters(): p.requires_grad_(False)
-        for p in model_core.res.parameters(): p.requires_grad_(False)
+        for p in model_core.adaptation.parameters(): p.requires_grad_(False)
 
         opt1 = torch.optim.Adam(model_core.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
         use_cuda = (device.type == 'cuda')
