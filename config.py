@@ -15,7 +15,7 @@ class Config:
     adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 64]) # 适配头
 
     # Training
-    batch_sim: int = 256
+    batch_sim: int = 512
     batch_real: int = 64
     num_workers: int = 8
     prefetch: int = 4
@@ -29,12 +29,13 @@ class Config:
     # Optim
     lr_low_adam: float = 1e-2
     lr_high_adam: float = 1e-2
-    weight_decay: float = 1e-4
+    weight_decay: float = 5e-5
 
-    # Loss function selection
+    # 网络与损失
+    use_modulation: bool = False
     use_hungarian_loss: bool = True
 
-    # ===== Presence head & losses =====
+    # 存在头
     use_presence_head: bool = True
     presence_loss_weight: float = 0.1
     cardinality_loss_weight: float = 0.05

@@ -52,14 +52,16 @@ class LowFidelityHead(nn.Module):
         in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim
         out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)   # 如果输出存在头乘6
         self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.low_hidden)
-        self.modulation = ModulationHead(cfg)
+        if cfg.use_modulation:
+            self.modulation = ModulationHead(cfg)
     def forward(self, H, M, exc_id, ch_id):
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
         x = torch.cat([H, M, e_exc, e_chn], dim=-1)
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
-        mod = self.modulation(exc_id, ch_id)
-        out = out * mod
+        if self.cfg.use_modulation:
+            mod = self.modulation(exc_id, ch_id)
+            out = out * mod
         u_alpha = out[...,0]; u_omega = out[...,1]; u_rho = out[...,2]; u_sin_theta = out[...,3]; u_cos_theta = out[...,4]
         if self.cfg.use_presence_head:
             u_pres  = out[...,5]

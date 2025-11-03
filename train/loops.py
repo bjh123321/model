@@ -175,7 +175,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         for p in model_core.lin.parameters(): p.requires_grad_(False)
         for p in model_core.adaptation.parameters(): p.requires_grad_(False)
 
-        opt1 = torch.optim.Adam(model_core.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
+        opt1 = torch.optim.AdamW(model_core.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
         use_cuda = (device.type == 'cuda')
         scaler = torch.amp.GradScaler('cuda') if use_cuda else None
 
