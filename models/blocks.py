@@ -6,12 +6,14 @@ import torch.nn.functional as F
 from ..config import Config
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden: list):
+    def __init__(self, in_dim: int, out_dim: int, hidden: list, dropout: float=0.0):
         super().__init__()
         h: List[nn.Module] = []
         last = in_dim
         for layer in hidden:
             h += [nn.Linear(last, layer), nn.SiLU()]
+            if dropout > 0.0:
+                h += [nn.Dropout(dropout)]
             last = layer
         h += [nn.Linear(last, out_dim)]
         self.net = nn.Sequential(*h)
@@ -31,15 +33,20 @@ class ModulationHead(nn.Module):
         in_dim = cfg.embed_excitation_dim + cfg.embed_channel_dim
         # 使用配置中的 mod_hidden 作为隐藏层
         out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
-        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.mod_hidden)
+        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.mod_hidden, dropout=cfg.dropout_prob)
+        with torch.no_grad():
+            last_linear = self.mlp.net[-1]
+            nn.init.zeros_(last_linear.weight)
+            nn.init.zeros_(last_linear.bias)
+        # 调制系数幅度
+        self.gamma = getattr(cfg, 'mod_gamma', 0.2)
 
     def forward(self, exc_id: torch.Tensor, ch_id: torch.Tensor) -> torch.Tensor:
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
         x = torch.cat([e_exc, e_chn], dim=-1)
-        # 使用 Sigmoid 将输出约束在 (0,1)，作为调制因子
-        mod = torch.sigmoid(self.mlp(x))
-        # 形状调整为 (batch, K_max, out_per_mode)
+        h = self.mlp(x)
+        mod = 1.0 + self.gamma * torch.tanh(h)
         return mod.view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
 
 
@@ -51,7 +58,7 @@ class LowFidelityHead(nn.Module):
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
         in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim
         out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)   # 如果输出存在头乘6
-        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.low_hidden)
+        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.low_hidden, dropout=cfg.dropout_prob)
         if cfg.use_modulation:
             self.modulation = ModulationHead(cfg)
     def forward(self, H, M, exc_id, ch_id):
@@ -88,10 +95,6 @@ class LinearHFHead(nn.Module):
         return y[...,0], y[...,1], y[...,2], y[...,3], y[...,4]
 
 class AdaptationHead(nn.Module):
-    """
-    适配头：在高保真分支中对低保真预测结果进行非线性修正。
-    输入包含高保真特征 H、M、离散嵌入 e_exc、e_chn，以及低保真预测值。
-    """
     def __init__(self, cfg: Config):
         super().__init__()
         self.cfg = cfg
@@ -100,7 +103,11 @@ class AdaptationHead(nn.Module):
         # 输入维度：2 + 嵌入维度 + 平均池化后的低保真预估特征 +（可选存在头）
         in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim + 5 + (1 if cfg.use_presence_head else 0)
         out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
-        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.adapt_hidden)
+        self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.adapt_hidden, dropout=cfg.dropout_prob)
+        with torch.no_grad():
+            last_linear = self.mlp.net[-1]
+            nn.init.zeros_(last_linear.weight)
+            nn.init.zeros_(last_linear.bias)
 
     def forward(self, H, M, exc_id, ch_id,
                 uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):

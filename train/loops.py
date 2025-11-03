@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.nn.utils
 from ..config import Config
 from ..models.blocks import MFDNN
 from ..losses.masked_mse import MaskedMSE, MaskedHungarianMSE
@@ -214,13 +215,17 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     with torch.no_grad():
                         stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
                         _accum_stat(comp_accum, stat); comp_count += 1
-                    scaler.scale(loss).backward(); scaler.step(opt1); scaler.update()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt1)
+                    torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
+                    scaler.step(opt1); scaler.update()
                 else:
                     outL, _ = model(H, M, e, c)
                     loss = crit_s1(outL, yN, mask)
                     with torch.no_grad():
                         stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
                         _accum_stat(comp_accum, stat); comp_count += 1
+                    torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
                     loss.backward(); opt1.step()
 
                 bs = H.size(0)
@@ -348,14 +353,19 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     outL_s, _ = model(H_s, M_s, e_s, c_s)
                     loss_sim = crit_s1(outL_s, yNs, mask_s)
                     loss = w_real*loss_real + w_sim*loss_sim
-                scaler2.scale(loss).backward(); scaler2.step(opt2); scaler2.update()
+                scaler2.scale(loss).backward()
+                scaler2.unscale_(opt2)
+                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
+                scaler2.step(opt2); scaler2.update()
             else:
                 _, outH_r = model(H_r, M_r, e_r, c_r)
                 loss_real = crit_s2(outH_r, yNr, mask_r)
                 outL_s, _ = model(H_s, M_s, e_s, c_s)
                 loss_sim = crit_s1(outL_s, yNs, mask_s)
                 loss = w_real*loss_real + w_sim*loss_sim
-                loss.backward(); opt2.step()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
+                opt2.step()
 
             bs_r = H_r.size(0); bs_s = H_s.size(0)
             sum_real += loss_real.item() * bs_r; cnt_real += bs_r
