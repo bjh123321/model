@@ -290,13 +290,13 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     else:
         # 复用时依然需要把 high 层在 S1 期间禁用梯度（保持与常规路径一致），然后在 S2 再开启
         for p in model_core.lin.parameters(): p.requires_grad_(False)
-        for p in model_core.res.parameters(): p.requires_grad_(False)
+        for p in model_core.adaptation.parameters(): p.requires_grad_(False)
         if is_main_process():
             print(f"[Fold {fold+1}] S1 skipped (reuse fold0).", flush=True)
 
     # ============ Stage 2 ============ #
     for p in model_core.lin.parameters(): p.requires_grad_(True)
-    for p in model_core.res.parameters(): p.requires_grad_(True)
+    for p in model_core.adaptation.parameters(): p.requires_grad_(True)
     opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam, weight_decay=cfg.weight_decay)
 
     pat2   = getattr(cfg, 'lr_patience_s2', 20)
