@@ -3,11 +3,11 @@ import argparse, torch, torch.nn as nn
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from surrogate_model.config import Config
-from surrogate_model.blocks import MFDNN, LoRALinear
-from surrogate_model.dataloaders import build_datasets_for_paths  # 你可用自己现有的构建函数
-from surrogate_model.masked_mse import MaskedMSE  # 你的损失
-from surrogate_model.normalizer import Normalizer  # 如需
+from ..config import Config
+from ..models.blocks import MFDNN, LoRALinear
+from ..train.dataloaders import build_datasets_for_paths  # 你可用自己现有的构建函数
+from ..losses.masked_mse import MaskedMSE  # 你的损失
+from ..data.normalizer import Normalizer  # 如需
 
 @torch.no_grad()
 def freeze_backbone_open_lora(model: MFDNN):

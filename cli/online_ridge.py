@@ -2,8 +2,8 @@
 import argparse, csv, torch
 from pathlib import Path
 
-from surrogate_model.config import Config
-from surrogate_model.blocks import MFDNN  # 你的模型主类，含 ridge_recalibrate_linear / flatten_u
+from ..config import Config
+from ..models.blocks import MFDNN  # 你的模型主类，含 ridge_recalibrate_linear / flatten_u
 # 注：ParamPZK.from_physical 要求你在 blocks/ParamPZK 里提供一个“反函数”；
 # 如果你还没写，我在下面提供了一个“直写 u*”的备选（见注释）。
 
