@@ -29,8 +29,8 @@ class Config:
     early_stop_min_delta: float = 1e-6
 
     # Optim
-    lr_low_adam: float = 1e-2
-    lr_high_adam: float = 1e-2
+    lr_low_adam: float = 1e-3
+    lr_high_adam: float = 1e-3
     weight_decay: float = 5e-5
 
     # 网络与损失
