@@ -34,7 +34,7 @@ class Config:
     weight_decay: float = 5e-5
 
     # 网络与损失
-    use_modulation: bool = False
+    use_modulation: bool = True
     use_hungarian_loss: bool = True
 
     # 存在头
