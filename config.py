@@ -10,9 +10,9 @@ class Config:
     embed_excitation_dim: int = 4
     embed_channel_dim: int = 12
 
-    low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64])
-    mod_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 64])   # 调制头
-    adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 64]) # 适配头
+    low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 256, 128, 64])
+    mod_hidden: List[int] = field(default_factory=lambda: [32, 64])            # 调制头
+    adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64]) # 适配头
     dropout_prob: float = 0.1
     mod_gamma: float = 0.2
 
