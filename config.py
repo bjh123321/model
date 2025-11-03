@@ -15,7 +15,9 @@ class Config:
     adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64]) # 适配头
     dropout_prob: float = 0
     mod_gamma: float = 0.2
-
+    use_lora: bool = True
+    lora_rank: int = 4
+    
     # Training
     batch_sim: int = 512
     batch_real: int = 64

@@ -210,7 +210,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 opt1.zero_grad(set_to_none=True)
                 if use_cuda:
                     with torch.amp.autocast(device_type='cuda'):
-                        outL, _ = model(H, M, e, c)
+                        _out = model(H, M, e, c)
+                        outL = _out['low']
                         loss = crit_s1(outL, yN, mask)
                     with torch.no_grad():
                         stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
@@ -220,7 +221,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
                     scaler.step(opt1); scaler.update()
                 else:
-                    outL, _ = model(H, M, e, c)
+                    _out = model(H, M, e, c)
+                    outL = _out['low']
                     loss = crit_s1(outL, yN, mask)
                     with torch.no_grad():
                         stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
@@ -348,9 +350,11 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             opt2.zero_grad(set_to_none=True)
             if use_cuda:
                 with torch.amp.autocast(device_type='cuda'):
-                    _, outH_r = model(H_r, M_r, e_r, c_r)
+                    _out_r = model(H_r, M_r, e_r, c_r)
+                    outH_r = _out_r['high']
                     loss_real = crit_s2(outH_r, yNr, mask_r)
-                    outL_s, _ = model(H_s, M_s, e_s, c_s)
+                    _out_s = model(H_s, M_s, e_s, c_s)
+                    outL_s = _out_s['low']
                     loss_sim = crit_s1(outL_s, yNs, mask_s)
                     loss = w_real*loss_real + w_sim*loss_sim
                 scaler2.scale(loss).backward()
@@ -358,9 +362,11 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
                 scaler2.step(opt2); scaler2.update()
             else:
-                _, outH_r = model(H_r, M_r, e_r, c_r)
+                _out_r = model(H_r, M_r, e_r, c_r)
+                outH_r = _out_r['high'] 
                 loss_real = crit_s2(outH_r, yNr, mask_r)
-                outL_s, _ = model(H_s, M_s, e_s, c_s)
+                _out_s = model(H_s, M_s, e_s, c_s)
+                outL_s = _out_s['low']
                 loss_sim = crit_s1(outL_s, yNs, mask_s)
                 loss = w_real*loss_real + w_sim*loss_sim
                 loss.backward()
@@ -471,7 +477,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             c = c.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
-            outL, outH = model(H, M, e, c)
+            _out = model(H, M, e, c) 
+            outH = _out['high']
             loss = crit_eval(outH, yN, mask)
             bs = H.size(0)
             vsum += loss.item() * bs; vcnt += bs
