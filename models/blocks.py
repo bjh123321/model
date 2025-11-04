@@ -80,51 +80,66 @@ class LowFidelityHead(nn.Module):
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
 
         in_dim  = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim
-        out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
+        nout    = 6 if cfg.use_presence_head else 5
+        out_dim = cfg.K_max * nout
 
+        # === 一定要无条件创建 layers，再无条件创建 self.mlp ===
         layers: List[nn.Module] = []
         last = in_dim
-        for h in cfg.low_hidden:
-            if cfg.use_lora:
-                layers.append(LoRALinear(last, h, rank=cfg.lora_rank))     # [Modified]
+        # 允许 cfg.low_hidden 为空
+        for h in (getattr(cfg, "low_hidden", []) or []):
+            if getattr(cfg, "use_lora", False):
+                layers.append(LoRALinear(last, h, rank=cfg.lora_rank))
             else:
-                layers.append(nn.Linear(last, h))                           # [Modified]
+                layers.append(nn.Linear(last, h))
             layers.append(nn.SiLU())
-            if cfg.dropout_prob > 0:
+            if getattr(cfg, "dropout_prob", 0.0) > 0:
                 layers.append(nn.Dropout(cfg.dropout_prob))
             last = h
-        # 输出层
-        if cfg.use_lora:
-            layers.append(LoRALinear(last, out_dim, rank=cfg.lora_rank))    # [Modified]
+
+        # 输出层（无条件添加）
+        if getattr(cfg, "use_lora", False):
+            layers.append(LoRALinear(last, out_dim, rank=cfg.lora_rank))
         else:
-            layers.append(nn.Linear(last, out_dim))                         # [Modified]
+            layers.append(nn.Linear(last, out_dim))
+
         self.mlp = nn.Sequential(*layers)
 
-        # FiLM 调制头（保留你已有实现）
+        # FiLM 调制头：可选开启
         if getattr(cfg, "use_modulation", False):
-            self.modulation = ModulationHead(cfg)                           # [Kept]
+            self.modulation = ModulationHead(cfg)
+
+        # 防合并/缩进错误：开局断言一次，训练期若缺失能及早发现
+        assert hasattr(self, "mlp"), "LowFidelityHead: self.mlp was not created"
 
     def forward(self, H, M, exc_id, ch_id):
+        # H, M: (B,1) float; exc_id, ch_id: (B,) long
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
-        x = torch.cat([H, M, e_exc, e_chn], dim=-1)
+        x = torch.cat([H, M, e_exc, e_chn], dim=-1)                  # (B, 2+emb_e+emb_c)
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
-        if getattr(self.cfg, "use_modulation", False):
-            mod = self.modulation(exc_id, ch_id)
-            out = out * mod  # FiLM 调制在 LF 输出上  [Kept]
 
-        # 拆分 u 空间分量
+        # FiLM 调制在 LF 输出上（若开启）
+        if getattr(self.cfg, "use_modulation", False):
+            mod = self.modulation(exc_id, ch_id)                     # 形状应能广播到 (B,K,nout)
+            out = out * mod
+
+        # 拆分 u 空间分量并按是否开启存在头返回
         u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta = out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
         if self.cfg.use_presence_head:
             u_pres = out[...,5]
             p_exist = torch.sigmoid(u_pres)
             return {
-                'u_alpha':u_alpha,'u_omega':u_omega,'u_rho':u_rho,'u_sin_theta':u_sin_theta,'u_cos_theta':u_cos_theta,
-                'u_pres':u_pres,'p_exist':p_exist
+                'u_alpha':u_alpha, 'u_omega':u_omega, 'u_rho':u_rho,
+                'u_sin_theta':u_sin_theta, 'u_cos_theta':u_cos_theta,
+                'u_pres':u_pres, 'p_exist':p_exist
             }
-        return {
-            'u_alpha':u_alpha,'u_omega':u_omega,'u_rho':u_rho,'u_sin_theta':u_sin_theta,'u_cos_theta':u_cos_theta
-        }
+        else:
+            return {
+                'u_alpha':u_alpha, 'u_omega':u_omega, 'u_rho':u_rho,
+                'u_sin_theta':u_sin_theta, 'u_cos_theta':u_cos_theta
+            }
+
 
 
 class LinearHFHead(nn.Module):
@@ -132,10 +147,10 @@ class LinearHFHead(nn.Module):
         super().__init__()
         self.use_presence = use_presence
         nout = 6 if use_presence else 5
-        self.linear = nn.Linear(K_max * nout, K_max * nout)                 # [Added]
+        self.linear = nn.Linear(K_max * nout, K_max * nout)
         with torch.no_grad():
-            nn.init.eye_(self.linear.weight)                                # [Added] 近似恒等
-            nn.init.zeros_(self.linear.bias)                                 # [Added]
+            nn.init.eye_(self.linear.weight)              # 近似恒等
+            nn.init.zeros_(self.linear.bias)
 
     def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
         if self.use_presence:
@@ -164,26 +179,33 @@ class AdaptationHead(nn.Module):
         last = in_dim
         for h in cfg.adapt_hidden:
             if cfg.use_lora:
-                layers.append(LoRALinear(last, h, rank=cfg.lora_rank))      # [Modified]
+                layers.append(LoRALinear(last, h, rank=cfg.lora_rank))
             else:
-                layers.append(nn.Linear(last, h))                            # [Modified]
+                layers.append(nn.Linear(last, h))
             layers.append(nn.SiLU())
             if cfg.dropout_prob > 0:
                 layers.append(nn.Dropout(cfg.dropout_prob))
             last = h
         if cfg.use_lora:
-            layers.append(LoRALinear(last, out_dim, rank=cfg.lora_rank))     # [Modified]
+            layers.append(LoRALinear(last, out_dim, rank=cfg.lora_rank))
         else:
-            layers.append(nn.Linear(last, out_dim))                          # [Modified]
+            layers.append(nn.Linear(last, out_dim))
         self.mlp = nn.Sequential(*layers)
 
         # 以“δ=0”起步更稳
         with torch.no_grad():
-            nn.init.zeros_(self.mlp[-1].weight)
-            nn.init.zeros_(self.mlp[-1].bias)
+            last_layer = self.mlp[-1]
+        # LoRALinear 没有 weight/bias 属性，真实权重在 base 里
+        if isinstance(last_layer, LoRALinear):
+            nn.init.zeros_(last_layer.base.weight)
+            nn.init.zeros_(last_layer.base.bias)
+        else:
+            nn.init.zeros_(last_layer.weight)
+            nn.init.zeros_(last_layer.bias)
 
         # NHF 的 FiLM（使用你已有 ModulationHead）
-        self.mod = ModulationHead(cfg)                                       # [Added]
+        self.mod = ModulationHead(cfg)
+
 
     def forward(self, H, M, exc_id, ch_id,
                 uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):
@@ -193,14 +215,22 @@ class AdaptationHead(nn.Module):
         x = torch.cat([H, M, e_exc, e_chn, uL_pool], dim=-1)
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
         # FiLM 调制只作用于残差 δ
-        out = out * self.mod(exc_id, ch_id)                                 # [Added]
+        out = out * self.mod(exc_id, ch_id)
         # p_exist 门控减少不确定槽位的残差影响
-        if self.cfg.use_presence_head and (uL_pres is not None):
-            gate = torch.sigmoid(uL_pres).unsqueeze(-1)
-            out = out * gate                                                # [Added]
         if self.cfg.use_presence_head:
-            return out[...,0],out[...,1],out[...,2],out[...,3],out[...,4],out[...,5]
-        return out[...,0],out[...,1],out[...,2],out[...,3],out[...,4]
+            u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres = (
+                out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
+            )
+            p_exist = torch.sigmoid(u_pres)
+            # 注意：这里返回“张量组”，保持和 forward_high 里那句
+            #   dA,dW,dR,dS,dC,dP = self.adaptation(...)
+            # 的接口一致，避免再改 forward_high
+            return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres
+        else:
+            u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta = (
+                out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
+            )
+            return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta
 
 
 
@@ -226,7 +256,7 @@ class MFDNN(nn.Module):
         self.adaptation = AdaptationHead(cfg)
         self.param = ParamPZK()                                              # [Kept]
         nout = 6 if cfg.use_presence_head else 5
-        self.register_buffer('online_offset', torch.zeros(1, cfg.K_max, nout))# [Added]
+        self.register_buffer('online_offset', torch.zeros(1, cfg.K_max, nout))
 
     # [Added] 低保真前向（保持原样，供外部显式调用）
     def forward_low(self, H, M, exc_id, ch_id):
@@ -295,7 +325,7 @@ class MFDNN(nn.Module):
         """
         outL = self.forward_low(H, M, exc_id, ch_id)
         outH = self.forward_high(H, M, exc_id, ch_id, outL)
-        return {'low': outL, 'high': outH}
+        return outL, outH
 
     # ===== 在线快修：偏置/仿射（简化为偏置） =====
     @torch.no_grad()
