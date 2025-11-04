@@ -112,6 +112,7 @@ class LowFidelityHead(nn.Module):
         # 防合并/缩进错误：开局断言一次，训练期若缺失能及早发现
         assert hasattr(self, "mlp"), "LowFidelityHead: self.mlp was not created"
 
+
     def forward(self, H, M, exc_id, ch_id):
         # H, M: (B,1) float; exc_id, ch_id: (B,) long
         e_exc = self.emb_exc(exc_id)

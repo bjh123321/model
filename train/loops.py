@@ -471,8 +471,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             c = c.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
             for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
-            _out = model(H, M, e, c) 
-            outH = _out['high']
+            _, outH = model(H, M, e, c) 
             loss = crit_eval(outH, yN, mask)
             bs = H.size(0)
             vsum += loss.item() * bs; vcnt += bs
