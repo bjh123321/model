@@ -2,8 +2,6 @@ import torch
 from pathlib import Path
 import numpy as np
 import sys
-project_root = Path(r"D:\BaiduSyncdisk\Code\Python")
-sys.path.append(str(project_root))
 from surrogate_model.config import Config
 from surrogate_model.models.blocks import MFDNN
 from surrogate_model.data.normalizer import Normalizer
@@ -31,7 +29,7 @@ plt.rcParams.update({
 
 # ==== 配置区域 ====
 mode = '留数'               # 预测方法
-data_sourse = '真实'        # 数据源
+data_sourse = '仿真'        # 数据源
 
 
 if data_sourse == '仿真':
