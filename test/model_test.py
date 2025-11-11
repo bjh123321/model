@@ -37,10 +37,10 @@ if data_sourse == '仿真':
 else:
     data_file = Path(r"C:\Users\Leo\Desktop\试飞数据35A\H11\M1.3\H11_M1.3_方向舵对称_幅值0.75.txt")
 
-H = 11          # 高度
-M = 0.95        # 马赫数
+H = 3          # 高度
+M = 0.9        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 10     # 响应通道
+ch_id  = 15     # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
@@ -67,7 +67,7 @@ if mode == '零点':
 else:
     omegaN = np.pi * fs
     checkpoint_dir = "outputs_pzk"
-    checkpoint_file = "checkpoint_stage2_fold0_epoch9000.pth"
+    checkpoint_file = "checkpoint_stage1_fold0_epoch9000.pth"
 
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path  = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
@@ -75,9 +75,9 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Output_Sim.pth"
 
 # ==== 加载 ====
 print("==> Loading ckpt...")
-ckpt = torch.load(ckpt_path, map_location="cpu")
+ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-loss = ckpt.get("loss_history_real", None)
+# loss = ckpt.get("loss_history", None)
 
 
 # 自动推断 embed 维度
@@ -127,7 +127,7 @@ if mode == '零点':
 else:
     with torch.no_grad():
         outL, outH = model(Hn, Mn, exc, ch)
-        out = outH  # stage2 输出
+        out = outL  
         alpha = out["alpha"][0].cpu().numpy()
         omega = out["omega"][0].cpu().numpy()
         rho   = out["rho"][0].cpu().numpy()
@@ -158,15 +158,15 @@ with open(save_path, "w", encoding="utf-8") as f:
 y_hat = lfilter(B, A, u)
 
 
-plt.figure()
-plt.plot(loss, label="Loss Sim")
+# plt.figure()
+# plt.plot(loss, label="Loss Sim")
 # plt.xlim(0, 2000)
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.yscale("log")
-plt.title("Training Loss History")
-plt.legend()
-plt.grid()
+# plt.xlabel("Epochs")
+# plt.ylabel("Loss")
+# plt.yscale("log")
+# plt.title("Training Loss History")
+# plt.legend()
+# plt.grid()
 
 plt.figure()
 plt.subplot(2, 2, 1)
