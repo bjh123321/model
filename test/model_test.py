@@ -27,17 +27,19 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.80\1_H11_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
-# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.8\H11_M0.8_方向舵对称_幅值0.6.txt")
-cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-# cur_dir = Path(__file__).parents[2] / "surrogate_model"
-checkpoint_dir = "outputs_pzk_from_dev"
-checkpoint_file = "checkpoint_stage1_fold0_epoch20000.pth"
+real = True  # 是否使用真实响应网络
+# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.80\1_H11_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M1.3\H11_M1.3_方向舵对称_幅值0.75.txt")
+# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+cur_dir = Path(__file__).parents[2] / "surrogate_model"
+checkpoint_dir = "outputs_pzk"
+checkpoint_file = "checkpoint_stage2_fold0_epoch10000.pth"
+
 
 H = 11          # 高度
-M = 0.8        # 马赫数
+M = 1.3        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 15     # 响应通道
+ch_id  = 23     # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
@@ -93,7 +95,10 @@ omegaN = np.pi * fs
 # ==== 推理 ====
 with torch.no_grad():
     outL, outH = model(Hn, Mn, exc, ch)
-    out = outL
+    if real:
+        out = outH
+    else:
+        out = outL
     alpha = out["alpha"][0].cpu().numpy()
     omega = out["omega"][0].cpu().numpy()
     rho   = out["rho"][0].cpu().numpy()
