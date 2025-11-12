@@ -1,7 +1,6 @@
 import torch
 from pathlib import Path
 import numpy as np
-import sys
 from surrogate_model.config import Config
 from surrogate_model.models.blocks import MFDNN
 from surrogate_model.data.normalizer import Normalizer
@@ -28,17 +27,15 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-mode = '留数'               # 预测方法
-data_sourse = '仿真'        # 数据源
+data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.80\1_H11_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
+# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.8\H11_M0.8_方向舵对称_幅值0.6.txt")
+cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+# cur_dir = Path(__file__).parents[2] / "surrogate_model"
+checkpoint_dir = "outputs_pzk_from_dev"
+checkpoint_file = "checkpoint_stage1_fold0_epoch20000.pth"
 
-
-if data_sourse == '仿真':
-    data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250813标准\H3\M0.90\1_H3_M0.90_方向舵对称_0-50Hz_幅值0.6.txt")
-else:
-    data_file = Path(r"C:\Users\Leo\Desktop\试飞数据35A\H11\M1.3\H11_M1.3_方向舵对称_幅值0.75.txt")
-
-H = 3          # 高度
-M = 0.9        # 马赫数
+H = 11          # 高度
+M = 0.8        # 马赫数
 exc_id = 0      # 激励方式
 ch_id  = 15     # 响应通道
 col_u = 0      # 激励
@@ -49,37 +46,24 @@ Ts = 1.0 / fs
 df = pd.read_table(data_file, sep=r"[,\t ]+", engine="python")
 Y = df.to_numpy(dtype=np.float64)
 Y = Y - Y.mean(axis=0, keepdims=True)
-u = Y[:, col_u]      # 第1列
-y = Y[:, col_y]     # 第19列
+u = Y[:, col_u]
+y = Y[:, col_y]
 t = np.arange(len(u)) / fs
 
 
 cfg = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-cur_dir = Path(__file__).parents[2] / "surrogate_model"
-
-if mode == '零点':
-    checkpoint_dir = "outputs_pzk_from_main"
-    checkpoint_file = "checkpoint_stage1_fold0_earlystop_epoch12916.pth"
-else:
-    omegaN = np.pi * fs
-    checkpoint_dir = "outputs_pzk"
-    checkpoint_file = "checkpoint_stage1_fold0_epoch9000.pth"
-
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path  = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
-out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Output_Sim.pth"
+out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 
 # ==== 加载 ====
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-# loss = ckpt.get("loss_history", None)
+# loss = ckpt.get("loss_history_real", None)
 
-
+# region
 # 自动推断 embed 维度
 if "low.emb_exc.weight" in state:
     cfg.embed_excitation_num = state["low.emb_exc.weight"].shape[0]
@@ -96,6 +80,7 @@ model = MFDNN(cfg).to(device)
 model.load_state_dict(state, strict=False)
 model.eval()
 
+# endregion
 # ==== 输入归一化 ====
 in_norm = Normalizer.load(in_norm_path)
 x = torch.tensor([[H, M]], dtype=torch.float32, device=device)
@@ -104,48 +89,29 @@ Hn, Mn = x_norm[:, :1], x_norm[:, 1:]
 
 exc = torch.tensor([exc_id], dtype=torch.long, device=device)
 ch  = torch.tensor([ch_id], dtype=torch.long, device=device)
-
+omegaN = np.pi * fs
 # ==== 推理 ====
-if mode == '零点':
-    with torch.no_grad():
-        outL, outH = model(Hn, Mn, exc, ch)
-        out = outL  # stage1 输出
-        alpha = out["alpha"][0].cpu().numpy()
-        omega = out["omega"][0].cpu().numpy()
-        gain  = out["gain"][0].cpu().numpy()
-        zero  = out["zero"][0].cpu().numpy()
-        p_exist = out["p_exist"][0].cpu().numpy()
-    print("\n--- 网络输出 (物理域) ---")
-    print("p_exist:", np.array2string(p_exist, precision=6))
-    print("alpha  :", np.array2string(alpha, precision=6))
-    print("omega  :", np.array2string(omega, precision=6))
-    print("gain   :", np.array2string(gain, precision=6))
-    print("zero   :", np.array2string(zero, precision=6))
-    print("----------------------------")
-    data_to_save = [p_exist, alpha, omega, gain, zero]
-    B, A = build_BA_from_zeros(alpha, omega, gain, zero, Ts)
-else:
-    with torch.no_grad():
-        outL, outH = model(Hn, Mn, exc, ch)
-        out = outL  
-        alpha = out["alpha"][0].cpu().numpy()
-        omega = out["omega"][0].cpu().numpy()
-        rho   = out["rho"][0].cpu().numpy()
-        sin_theta = out["sin_theta"][0].cpu().numpy()
-        cos_theta = out["cos_theta"][0].cpu().numpy()
-        p_exist = out["p_exist"][0].cpu().numpy()
-        omega = omega*omegaN
-        rho = np.exp(rho)
-        theta = np.atan2(sin_theta, cos_theta)
-    print("\n--- 网络输出 (物理域) ---")
-    print("p_exist:", np.array2string(p_exist, precision=6))
-    print("alpha  :", np.array2string(alpha, precision=6))
-    print("omega  :", np.array2string(omega, precision=6))
-    print("rho   :", np.array2string(rho, precision=6))
-    print("theta   :", np.array2string(theta, precision=6))
-    print("----------------------------")
-    data_to_save = [p_exist, alpha, omega, rho, theta]
-    B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exist_thresh=0.5)
+with torch.no_grad():
+    outL, outH = model(Hn, Mn, exc, ch)
+    out = outL
+    alpha = out["alpha"][0].cpu().numpy()
+    omega = out["omega"][0].cpu().numpy()
+    rho   = out["rho"][0].cpu().numpy()
+    sin_theta = out["sin_theta"][0].cpu().numpy()
+    cos_theta = out["cos_theta"][0].cpu().numpy()
+    p_exist = out["p_exist"][0].cpu().numpy()
+    omega = omega*omegaN
+    rho = np.exp(rho)
+    theta = np.atan2(sin_theta, cos_theta)
+print("\n--- 网络输出 (物理域) ---")
+print("p_exist:", np.array2string(p_exist, precision=6))
+print("alpha  :", np.array2string(alpha, precision=6))
+print("omega  :", np.array2string(omega, precision=6))
+print("rho   :", np.array2string(rho, precision=6))
+print("theta   :", np.array2string(theta, precision=6))
+print("----------------------------")
+data_to_save = [p_exist, alpha, omega, rho, theta]
+B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exist_thresh=0.5)
 
 
 # ==== 保存结果到 txt 文件 ====
