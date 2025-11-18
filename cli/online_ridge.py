@@ -1,48 +1,48 @@
-# surrogate_model/cli/online_ridge.py
 import argparse, csv, torch
 from pathlib import Path
 
 from ..config import Config
-from ..models.blocks import MFDNN  # 你的模型主类，含 ridge_recalibrate_linear / flatten_u
-# 注：ParamPZK.from_physical 要求你在 blocks/ParamPZK 里提供一个“反函数”；
-# 如果你还没写，我在下面提供了一个“直写 u*”的备选（见注释）。
+from ..models.blocks import MFDNN
 
-def from_physical_to_u(param, alpha, omega, rho, sin_t, cos_t):
+
+def from_physical_to_u(alpha, omega, rho, sin_t, cos_t):
     """
-    把物理量反算回 u-空间（与 ParamPZK.to_physical 完全对应）。
-    如果你已有 param.from_physical，就直接用那个；否则按你 to_physical 的实现自己写。
-    这里示范：假设 to_physical 就是恒等（仅示意），你请替换为你自己的反函数。
+    将物理量 (alpha, omega, rho, sinθ, cosθ)
+    反算回网络的 u-空间 (u_alpha, u_omega, u_rho, u_sinθ, u_cosθ)
+    与 ParamPZK.to_physical 完全对应。
     """
-    # !!! 请按你的 ParamPZK.to_physical 精确写反函数 !!!
-    # 例如：alpha = -softplus(u_alpha) => u_alpha = softplus^{-1}(-alpha)
-    #       omega = omega_max * sigmoid(u_omega) => u_omega = logit(omega/omega_max)
-    #       rho   = exp(u_rho) => u_rho = log(rho)
-    #       sin/cos 若用了 tanh => u = atanh(sin/cos)
-    u_alpha    = torch.as_tensor(alpha).float()
-    u_omega    = torch.as_tensor(omega).float()
-    u_rho      = torch.as_tensor(rho).float()
-    u_sin_theta= torch.as_tensor(sin_t).float()
-    u_cos_theta= torch.as_tensor(cos_t).float()
+    neg_alpha = -alpha
+    u_alpha = torch.log(torch.exp(neg_alpha) - 1 + 1e-12)
+    omega = omega.clamp(1e-6, 1 - 1e-6)
+    u_omega = torch.log(omega / (1 - omega))
+    u_rho = rho
+    u_sin_theta = sin_t
+    u_cos_theta = cos_t
+
     return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, required=True, help="原始模型 ckpt 路径")
     ap.add_argument("--calib_csv", type=str, required=True, help="在线校准数据 CSV")
-    ap.add_argument("--save_ckpt", type=str, default="", help="保存的新 ckpt 路径（默认自动加 _ridge）")
+    ap.add_argument("--save_ckpt", type=str, default="", help="保存的新 ckpt 路径（默认按 mode 加后缀）")
     ap.add_argument("--lambda_ridge", type=float, default=1e-2, help="岭回归正则 λ")
+    ap.add_argument("--mode", type=str, choices=["lhf", "bias", "affine"], default="lhf",
+                    help="lhf: 重标定线性高保真; bias: 仅在线偏置; affine: 在线仿射")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = Config()
     model = MFDNN(cfg).to(device)
+
     # 载入 ckpt
     ckpt = torch.load(args.ckpt, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=False)
     model.eval()
 
-    # 读取 CSV，收集批量
+    # 读取 CSV
     Hs, Ms, Es, Cs = [], [], [], []
     A_star, W_star, R_star, S_star, C_star = [], [], [], [], []
     with open(args.calib_csv, "r", newline="") as f:
@@ -57,38 +57,113 @@ def main():
             C_star.append(float(row["cos_theta_star"]))
 
     N = len(Hs)
+    if N == 0:
+        raise RuntimeError("calib_csv 为空，没有可用于在线标定的数据")
+
     H = torch.tensor(Hs, dtype=torch.float32, device=device).unsqueeze(-1)
     M = torch.tensor(Ms, dtype=torch.float32, device=device).unsqueeze(-1)
     E = torch.tensor(Es, dtype=torch.long,    device=device)
     C = torch.tensor(Cs, dtype=torch.long,    device=device)
 
     with torch.no_grad():
-        # 1) 跑 LF，拿 X=(N,D)
-        outL = model.forward_low(H, M, E, C)
-        X = model.flatten_u(outL['u_alpha'], outL['u_omega'], outL['u_rho'],
-                            outL['u_sin_theta'], outL['u_cos_theta'], outL.get('u_pres', None))
-
-        # 2) 目标物理量 → u*（与你的 ParamPZK.to_physical 对偶）
-        uA, uW, uR, uS, uC = from_physical_to_u(model.param, A_star, W_star, R_star, S_star, C_star)
-        # 展平成 (N,D)。注意这里需要按槽位维度复制或填充 u*：
-        # 实际工程中，通常你会把每个样本目标按匈牙利匹配好的槽位顺序填到 (K_max, nout)；
-        # 这里示例用“全槽位同一目标”的简单占位（你按实际替换！）
+        # 目标物理量 → u*（与你的 ParamPZK.to_physical 对偶）
+        uA, uW, uR, uS, uC = from_physical_to_u(
+            A_star, W_star, R_star, S_star, C_star, device=device
+        )
         K = cfg.K_max
-        uA = uA.view(N,1).repeat(1,K); uW = uW.view(N,1).repeat(1,K); uR = uR.view(N,1).repeat(1,K)
-        uS = uS.view(N,1).repeat(1,K); uC = uC.view(N,1).repeat(1,K)
-        if cfg.use_presence_head:
-            uP = torch.full((N,K), 10.0, device=device)  # 目标“确定存在”的 logit，按需调整
-            Y = torch.cat([uA,uW,uR,uS,uC,uP], dim=-1)
-        else:
-            Y = torch.cat([uA,uW,uR,uS,uC], dim=-1)
 
-        # 3) 岭回归：更新 LHF 的 W,b
-        model.ridge_recalibrate_linear(X, Y, reg=args.lambda_ridge)
+        if cfg.use_presence_head:
+            # 目标“存在”logit，可以给一个较大的常数
+            uP = torch.full((N, 1), 10.0, device=device)
+        else:
+            uP = None
+
+        # 不同 mode 对 X 和 Y 的定义不同
+        if args.mode == "lhf":
+            # ========== 模式 1：重标定 LHF ==========
+            outL = model.forward_low(H, M, E, C)
+            X = model.flatten_u(
+                outL['u_alpha'], outL['u_omega'], outL['u_rho'],
+                outL['u_sin_theta'], outL['u_cos_theta'], outL.get('u_pres', None)
+            )   # (N, D)
+
+            # 把目标 u* 复制到 K 个槽位，展平成 (N,D)
+            uA_ = uA.view(N, 1).repeat(1, K)
+            uW_ = uW.view(N, 1).repeat(1, K)
+            uR_ = uR.view(N, 1).repeat(1, K)
+            uS_ = uS.view(N, 1).repeat(1, K)
+            uC_ = uC.view(N, 1).repeat(1, K)
+            if cfg.use_presence_head:
+                uP_ = uP.view(N, 1).repeat(1, K)
+                Y = torch.cat([uA_, uW_, uR_, uS_, uC_, uP_], dim=-1)
+            else:
+                Y = torch.cat([uA_, uW_, uR_, uS_, uC_], dim=-1)
+
+            model.ridge_recalibrate_linear(X, Y, reg=args.lambda_ridge)
+
+        else:
+            # ========== 模式 2/3：在最终输出上 quick_fix ==========
+            outL = model.forward_low(H, M, E, C)
+            outH = model.forward_high(H, M, E, C, outL)
+
+            Z = model.flatten_u(
+                outH['u_alpha'], outH['u_omega'], outH['u_rho'],
+                outH['u_sin_theta'], outH['u_cos_theta'], outH.get('u_pres', None)
+            )   # (N, D)
+
+            # 同样构造 Y = 目标 u* 的展平
+            uA_ = uA.view(N, 1).repeat(1, K)
+            uW_ = uW.view(N, 1).repeat(1, K)
+            uR_ = uR.view(N, 1).repeat(1, K)
+            uS_ = uS.view(N, 1).repeat(1, K)
+            uC_ = uC.view(N, 1).repeat(1, K)
+            if cfg.use_presence_head:
+                uP_ = uP.view(N, 1).repeat(1, K)
+                Y = torch.cat([uA_, uW_, uR_, uS_, uC_, uP_], dim=-1)
+            else:
+                Y = torch.cat([uA_, uW_, uR_, uS_, uC_], dim=-1)
+
+            if args.mode == "bias":
+                # ----- 仅偏置：delta = argmin ||(Z + delta) - Y||^2 + λ||delta||^2 -----
+                # 闭式解：delta = (Σ_i (Y_i - Z_i)) / (N + λ)
+                delta_vec = (Y - Z).sum(dim=0) / (N + args.lambda_ridge)
+                D = Z.shape[1]
+                nout = D // K
+                delta = delta_vec.view(1, K, nout)
+                model.quick_fix_biasgain({"delta": delta})
+
+            elif args.mode == "affine":
+                # ----- 仿射：对每一维做 y ≈ a*z + b 的 1D 岭回归 -----
+                N_, D = Z.shape
+                a = torch.empty(D, device=device)
+                b = torch.empty(D, device=device)
+                lam = args.lambda_ridge
+
+                for d in range(D):
+                    z = Z[:, d]  # (N,)
+                    y = Y[:, d]  # (N,)
+                    Xmat = torch.stack([z, torch.ones_like(z)], dim=1)  # (N,2)
+                    G = Xmat.T @ Xmat                                  # (2,2)
+                    Lambda = torch.zeros_like(G)
+                    Lambda[0, 0] = lam  # 只正则化 a，不正则化 b
+                    theta = torch.linalg.solve(G + Lambda, Xmat.T @ y)  # (2,)
+                    a[d] = theta[0]
+                    b[d] = theta[1]
+
+                nout = D // K
+                a_3d = a.view(1, K, nout)
+                b_3d = b.view(1, K, nout)
+                model.quick_fix_biasgain({"a": a_3d, "b": b_3d})
+            else:
+                raise ValueError(f"未知 mode: {args.mode}")
 
     # 保存新 ckpt
-    save_path = args.save_ckpt or (str(Path(args.ckpt).with_suffix("")) + "_ridge.pth")
+    base = str(Path(args.ckpt).with_suffix(""))
+    suffix = {"lhf": "_ridge_lhf", "bias": "_ridge_bias", "affine": "_ridge_affine"}[args.mode]
+    save_path = args.save_ckpt or (base + suffix + ".pth")
     torch.save({"model_state_dict": model.state_dict()}, save_path)
-    print(f"[OK] Ridge recalibrated LHF saved to: {save_path}")
+    print(f"[OK] mode={args.mode} 已写回，保存到: {save_path}")
+
 
 if __name__ == "__main__":
     main()

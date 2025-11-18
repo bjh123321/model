@@ -203,29 +203,25 @@ class AdaptationHead(nn.Module):
         else:
             nn.init.zeros_(last_layer.weight)
             nn.init.zeros_(last_layer.bias)
-
-        # NHF 的 FiLM（使用你已有 ModulationHead）
+        # NHF的FiLM
         self.mod = ModulationHead(cfg)
 
 
     def forward(self, H, M, exc_id, ch_id,
                 uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):
-        # 跨槽位的 LF 全局池化（稳定尺度）
+        # 跨槽位的LF全局池化（稳定尺度）
         uL_pool = torch.stack([uL_alpha,uL_omega,uL_rho,uL_sin_theta,uL_cos_theta], dim=-1).mean(dim=1)  # (B,5)
         e_exc = self.emb_exc(exc_id); e_chn = self.emb_chn(ch_id)
         x = torch.cat([H, M, e_exc, e_chn, uL_pool], dim=-1)
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
-        # FiLM 调制只作用于残差 δ
+        # FiLM调制只作用于残差δ
         out = out * self.mod(exc_id, ch_id)
-        # p_exist 门控减少不确定槽位的残差影响
+        # p_exist门控减少不确定槽位的残差影响
         if self.cfg.use_presence_head:
             u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres = (
                 out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
             )
             p_exist = torch.sigmoid(u_pres)
-            # 注意：这里返回“张量组”，保持和 forward_high 里那句
-            #   dA,dW,dR,dS,dC,dP = self.adaptation(...)
-            # 的接口一致，避免再改 forward_high
             return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres
         else:
             u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta = (
@@ -255,11 +251,12 @@ class MFDNN(nn.Module):
         self.low  = LowFidelityHead(cfg)
         self.lin  = LinearHFHead(cfg.K_max, use_presence=cfg.use_presence_head)
         self.adaptation = AdaptationHead(cfg)
-        self.param = ParamPZK()                                              # [Kept]
+        self.param = ParamPZK()
         nout = 6 if cfg.use_presence_head else 5
-        self.register_buffer('online_offset', torch.zeros(1, cfg.K_max, nout))
+        self.register_buffer('online_gain', torch.ones(1, cfg.K_max, nout))
+        self.register_buffer('online_bias', torch.zeros(1, cfg.K_max, nout))
 
-    # [Added] 低保真前向（保持原样，供外部显式调用）
+
     def forward_low(self, H, M, exc_id, ch_id):
         outL = self.low(H, M, exc_id, ch_id)
         alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
@@ -274,7 +271,7 @@ class MFDNN(nn.Module):
             out['u_pres']  = outL['u_pres']
         return out
 
-    # [Modified] 高保真前向：presence 分支 + else 分支都补全
+
     def forward_high(self, H, M, exc_id, ch_id, outL: dict):
         if self.cfg.use_presence_head:
             uA,uW,uR,uS,uC,uP = self.lin(
@@ -287,7 +284,7 @@ class MFDNN(nn.Module):
             # 合成 (LHF + NHF)
             U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP], dim=-1)  # (B,K,6)
             # 在线快修偏置
-            U = U + self.online_offset
+            U = self.online_gain * U + self.online_bias
             # 物理域映射
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
                 U[...,0], U[...,1], U[...,2], U[...,3], U[...,4]
@@ -308,7 +305,7 @@ class MFDNN(nn.Module):
                 outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], None
             )
             U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC], dim=-1)        # (B,K,5)
-            U = U + self.online_offset                                          # 同样在线偏置
+            U = self.online_gain * U + self.online_bias                    # 同样在线仿射
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
                 U[...,0], U[...,1], U[...,2], U[...,3], U[...,4]
             )
@@ -332,18 +329,22 @@ class MFDNN(nn.Module):
     @torch.no_grad()
     def quick_fix_biasgain(self, delta_or_ab: dict):
         """
-        [Added] 在线快修入口：
-          - 传 {'delta': (1,K,nout)} 直接写入 online_offset
-          - 或 {'a':...,'b':...} 折算为等效偏置（建议外部按最近一批 U 的均值折算后传入 delta）
+        [MOD] 在线快修入口：
+        - {'delta': (1,K,nout)} : 只修偏置，等价于 a=1, b=delta
+        - {'a':..., 'b':...}    : 完整仿射 U_new = a ⊙ U_old + b
         """
         if 'delta' in delta_or_ab:
-            delta = delta_or_ab['delta'].to(self.online_offset.device).view_as(self.online_offset)
-            self.online_offset.copy_(delta)
+            delta = delta_or_ab['delta'].to(self.online_bias.device).view_as(self.online_bias)
+            self.online_bias.copy_(delta)
+            self.online_gain.fill_(1.0)
         elif ('a' in delta_or_ab) and ('b' in delta_or_ab):
-            b = delta_or_ab['b'].to(self.online_offset.device).view_as(self.online_offset)
-            self.online_offset.copy_(b)  # 简化实现：只用 b，若需 a 请外部折算成等效 delta 再传入
+            a = delta_or_ab['a'].to(self.online_gain.device).view_as(self.online_gain)
+            b = delta_or_ab['b'].to(self.online_bias.device).view_as(self.online_bias)
+            self.online_gain.copy_(a)
+            self.online_bias.copy_(b)
         else:
             raise ValueError("expect {'delta':...} or {'a':...,'b':...}")
+
 
     # ===== 岭回归重标定 LHF：直接更新 LinearHFHead 的 W,b =====
     @torch.no_grad()

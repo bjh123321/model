@@ -28,18 +28,18 @@ plt.rcParams.update({
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
-# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.80\1_H11_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M1.3\H11_M1.3_方向舵对称_幅值0.75.txt")
-# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-cur_dir = Path(__file__).parents[2] / "surrogate_model"
+# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H3\M0.862\H3_M0.862_方向舵对称_幅值0.8.txt")
+cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+# cur_dir = Path(__file__).parents[2] / "surrogate_model"
 checkpoint_dir = "outputs_pzk"
-checkpoint_file = "checkpoint_stage2_fold0_epoch10000.pth"
+checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 
 
 H = 11          # 高度
-M = 1.3        # 马赫数
+M = 1.6        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 23     # 响应通道
+ch_id  = 15    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
@@ -63,7 +63,7 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-# loss = ckpt.get("loss_history_real", None)
+# loss = ckpt.get("loss_real_history", None)
 
 # region
 # 自动推断 embed 维度
@@ -131,7 +131,7 @@ y_hat = lfilter(B, A, u)
 
 # plt.figure()
 # plt.plot(loss, label="Loss Sim")
-# plt.xlim(0, 2000)
+# # plt.xlim(0, 2000)
 # plt.xlabel("Epochs")
 # plt.ylabel("Loss")
 # plt.yscale("log")
@@ -144,10 +144,11 @@ plt.subplot(2, 2, 1)
 plt.plot(t, y)
 plt.title('origin')
 
+# plt.figure()
 plt.subplot(2, 2, 3)
 plt.plot(t, y_hat)
 plt.title('predict')
-plt.tight_layout
+
 
 signals = [y, y_hat]
 for i, signal in enumerate(signals):
@@ -158,9 +159,11 @@ for i, signal in enumerate(signals):
     f = np.fft.fftfreq(N, d=1/fs)
     signal_mag = 2.0  * np.abs(signal_fft[:N//2]) / N
     signal_freq = f[:N//2]
+    # plt.figure()
     plt.subplot(2,2,2*(i+1))
     plt.plot(signal_freq, signal_mag)
     plt.xlim(0, 60)
+plt.tight_layout()
 plt.show()
 # # ==== 验证归一化关系 ====
 # out_norm = Normalizer.load(out_norm_path)
