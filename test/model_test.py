@@ -29,20 +29,20 @@ plt.rcParams.update({
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
 # data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.6.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
 # cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
 cur_dir = Path(__file__).parents[2] / "surrogate_model"
 checkpoint_dir = "outputs_pzk"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000_affinefix.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
-checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
+checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 
 
-H = 11          # 高度
-M = 0.95        # 马赫数
+H = 5.5          # 高度
+M = 0.74        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 10    # 响应通道
+ch_id  = 11    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
