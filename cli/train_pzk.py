@@ -15,7 +15,7 @@ def main():
     parser.add_argument('--kfold', type=int, default=5)
     parser.add_argument('--stage1_kfold', type=int, default=0, choices=[0, 1],
                         help='Set to 1 to train stage 1 on every fold, 0 to train once and reuse')
-    parser.add_argument('--stage2_kfold', type=int, default=1, choices=[0, 1],
+    parser.add_argument('--stage2_kfold', type=int, default=0, choices=[0, 1],
                         help='Set to 1 to train stage 2 on every fold, 0 to train once')
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
     parser.add_argument('--embed_channel_dim', type=int, default=12)

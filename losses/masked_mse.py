@@ -28,6 +28,8 @@ class MaskedMSE(nn.Module):
         # Classification weights
         self.pres_w = presence_weight
         self.card_w = cardinality_weight
+        self.last_reg_stats = None
+        self.last_cls_stats = None
 
     def norm_pred(self, pred: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # (B, 3, K)
@@ -46,6 +48,7 @@ class MaskedMSE(nn.Module):
         cfg = Config()
         if self.pres_w <= 0 and self.card_w <= 0:
             # 权重都为0时直接返回0，避免不必要计算
+            self.last_cls_stats = {}
             return torch.zeros((), device=mask.device, dtype=mask.dtype)
             # 1) 取 logits（兼容两种命名）
         logits = pred.get('u_pres', None)
@@ -81,8 +84,14 @@ class MaskedMSE(nn.Module):
         # 4) 基数损失 (Cardinality)：预测存在数量 ≈ 真实数量
         p = torch.sigmoid(logits)
         card = F.mse_loss(p.sum(dim=1), target.sum(dim=1))
+        loss_cls = self.pres_w * bce + self.card_w * card
+        with torch.no_grad():
+            self.last_cls_stats = {
+                'bce':  float(bce.detach()),
+                'card': float(card.detach())
+            }
 
-        return self.pres_w * bce + self.card_w * card
+        return loss_cls
 
     def _sort_by_omega(self, alpha, omega, rho, sin_theta, cos_theta, mask):
         freq = torch.sqrt(alpha**2 + omega**2) / (2 * math.pi)
@@ -127,7 +136,7 @@ class MaskedHungarianMSE(MaskedMSE):
         device = mask.device
         predN = self.norm_pred(pred)
         # predN = pred
-        PA, PO, PR, PS, PC = predN['alpha'], predN['omega'], predN['rho'], predN['sin_theta'], pred['cos_theta']  # [B, K_pred]
+        PA, PO, PR, PS, PC = predN['alpha'], predN['omega'], predN['rho'], predN['sin_theta'], predN['cos_theta']  # [B, K_pred]
         B = PA.size(0)  # batch大小
         K_pred = PA.size(1) # 总模态数
         K_tgt  = mask.size(1)
@@ -177,6 +186,8 @@ class MaskedHungarianMSE(MaskedMSE):
         # === 在图里计算回归 MSE（z-score 空间），保留梯度 ===
         loss_sum = 0.0
         pair_cnt = 0
+        sum_da2 = sum_do2 = sum_dr2 = sum_ds2 = sum_dc2 = 0.0
+        total_pairs = 0
         for b in range(B):
             m_eff = m_eff_list[b]
             if m_eff == 0:
@@ -194,11 +205,36 @@ class MaskedHungarianMSE(MaskedMSE):
             loss_b = (da.pow(2).mean() + do.pow(2).mean() + dr.pow(2).mean() + ds.pow(2).mean() + dc.pow(2).mean())
             loss_sum += loss_b
             pair_cnt += 1
+            with torch.no_grad():
+                sum_da2 += float(da.pow(2).sum())
+                sum_do2 += float(do.pow(2).sum())
+                sum_dr2 += float(dr.pow(2).sum())
+                sum_ds2 += float(ds.pow(2).sum())
+                sum_dc2 += float(dc.pow(2).sum())
+                total_pairs += int(m_eff)
 
         loss_reg = (loss_sum / pair_cnt) if pair_cnt > 0 else PA.new_tensor(0.0, requires_grad=True)
 
         # === presence + cardinality（原样） ===
         loss_cls = self._presence_losses(pred, mask, assign_rows)
+        with torch.no_grad():
+            if total_pairs > 0:
+                denom = float(total_pairs)
+                self.last_reg_stats = {
+                    'alpha'    : sum_da2 / denom,
+                    'omega'    : sum_do2 / denom,
+                    'rho'      : sum_dr2 / denom,
+                    'sin_theta': sum_ds2 / denom,
+                    'cos_theta': sum_dc2 / denom,
+                }
+            else:
+                self.last_reg_stats = {
+                    'alpha'    : 0.0,
+                    'omega'    : 0.0,
+                    'rho'      : 0.0,
+                    'sin_theta': 0.0,
+                    'cos_theta': 0.0,
+                }
 
         return loss_reg + loss_cls
     

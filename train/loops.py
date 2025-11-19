@@ -213,8 +213,14 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                         outL, _ = model(H, M, e, c)
                         loss = crit_s1(outL, yN, mask)
                     with torch.no_grad():
-                        stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
-                        _accum_stat(comp_accum, stat); comp_count += 1
+                        stat = {}
+                        if getattr(crit_s1, "last_reg_stats", None):
+                            stat.update(crit_s1.last_reg_stats)
+                        if getattr(crit_s1, "last_cls_stats", None):
+                            stat.update(crit_s1.last_cls_stats)
+                        if stat:
+                            _accum_stat(comp_accum, stat)
+                            comp_count += 1
                     scaler.scale(loss).backward()
                     scaler.unscale_(opt1)
                     torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
@@ -258,14 +264,13 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     }, out_dir / f'checkpoint_stage1_fold{fold}_epoch{epoch+1}.pth')
 
             if is_main_process() and comp_count > 0:
-                avg = {k: v/comp_count for k,v in comp_accum.items()}
-                if cfg.use_presence_head:
-                    print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, "
-                          f"sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}; "
-                          f"BCE={avg['bce']:.4f}, CARD={avg.get('card',0.0):.4f}", flush=True)
-                else:
-                    print(f"[S1 z-MSE] alpha={avg['alpha']:.4f}, omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, "
-                          f"sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}", flush=True)
+                avg = {k: v/comp_count for k, v in comp_accum.items()}
+                print(
+                    f"[S1 z-MSE-H] alpha={avg['alpha']:.4f}, "
+                    f"omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, "
+                    f"sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}; "
+                    f"BCE={avg.get('bce', 0.0):.4f}, CARD={avg.get('card', 0.0):.4f}"
+                )
 
             if epoch_loss_w < best_sim - cfg.early_stop_min_delta:
                 best_sim = epoch_loss_w; no_improve = 0

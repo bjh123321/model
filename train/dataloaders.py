@@ -25,7 +25,7 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         out_norm_sim.save(out_dir / 'Normalizer_Output_Sim.pth')
 
     # === 如果 kfold == 1，直接使用全部数据，不分折 ===
-    if kfold <= 1:
+    if kfold == 0:
         real_train = real_parsed
         real_val   = []    # 或者 real_val = [] 根据你是否需要验证
     else:

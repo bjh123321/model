@@ -28,20 +28,20 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-real = True  # 是否使用真实响应网络
-# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
-cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-# cur_dir = Path(__file__).parents[2] / "surrogate_model"
+real = False  # 是否使用真实响应网络
+data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
+# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
+# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+cur_dir = Path(__file__).parents[2] / "surrogate_model"
 checkpoint_dir = "outputs_pzk"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000_affinefix.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
-checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
+checkpoint_file = "checkpoint_stage1_fold0_epoch3000.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 
 
-H = 5.5          # 高度
-M = 0.74        # 马赫数
+H = 11          # 高度
+M = 1.9        # 马赫数
 exc_id = 0      # 激励方式
 ch_id  = 13    # 响应通道
 col_u = 0      # 激励
@@ -66,7 +66,7 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-# loss = ckpt.get("loss_real_history", None)
+loss = ckpt.get("loss_history", None)
 
 # region
 # 自动推断 embed 维度
@@ -132,15 +132,15 @@ with open(save_path, "w", encoding="utf-8") as f:
 y_hat = lfilter(B, A, u)
 
 
-# plt.figure()
-# plt.plot(loss, label="Loss Sim")
-# # plt.xlim(0, 2000)
-# plt.xlabel("Epochs")
-# plt.ylabel("Loss")
-# plt.yscale("log")
-# plt.title("Training Loss History")
-# plt.legend()
-# plt.grid()
+plt.figure()
+plt.plot(loss, label="Loss Sim")
+# plt.xlim(0, 2000)
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.yscale("log")
+plt.title("Training Loss History")
+plt.legend()
+plt.grid()
 
 plt.figure()
 plt.subplot(2, 2, 1)
