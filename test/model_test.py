@@ -10,30 +10,6 @@ import pandas as pd
 from zero_pred import build_BA_from_zeros
 from residue_pred import build_BA_from_residues
 
-def inspect_ckpt(path):
-    print(f"\n========== Inspect {path} ==========")
-    ckpt = torch.load(path, map_location="cpu")
-
-    # 兼容两种保存方式：{'model_state_dict': ...} 或直接 state_dict
-    state = ckpt.get("model_state_dict", ckpt)
-
-    cfg = Config()
-    model = MFDNN(cfg)
-
-    missing, unexpected = model.load_state_dict(state, strict=False)
-
-    print("\n[Model structure]")
-    print(model)  # 这里就会把整个网络结构打印出来
-
-    print("\n[Missing keys]")
-    for k in missing:
-        print("  MISSING:", k)
-
-    print("\n[Unexpected keys]")
-    for k in unexpected:
-        print("  UNEXPECTED:", k)
-
-    print("\n[Total parameters]:", sum(p.numel() for p in model.parameters()))
 
 plt.rcParams.update({
     "font.family": "Times New Roman",  # 字体
@@ -86,7 +62,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path  = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
-inspect_ckpt(ckpt_path)
 # ==== 加载 ====
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
