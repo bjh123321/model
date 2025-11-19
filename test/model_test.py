@@ -28,7 +28,7 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-real = False  # 是否使用真实响应网络
+real = True  # 是否使用真实响应网络
 data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
 # cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
@@ -68,6 +68,7 @@ ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
 loss = ckpt.get("loss_history", None)
 
+
 # region
 # 自动推断 embed 维度
 if "low.emb_exc.weight" in state:
@@ -83,6 +84,38 @@ if "lin.A" in state:
 
 model = MFDNN(cfg).to(device)
 model.load_state_dict(state, strict=False)
+
+K, nout = cfg.K_max, (6 if cfg.use_presence_head else 5)
+D = K * nout
+
+W = model.lin.linear.weight.detach().cpu()  # (D, D)
+b = model.lin.linear.bias.detach().cpu()
+
+print('‖W - I‖:', (W - torch.eye(D)).norm())
+print('‖b‖:', b.norm())
+
+last = model.adaptation.mlp[-1]
+W_adapt = (last.base.weight if hasattr(last, "base") else last.weight).detach().cpu()
+b_adapt = (last.base.bias   if hasattr(last, "base") else last.bias).detach().cpu()
+
+print('max |W_adapt|:', W_adapt.abs().max())
+print('max |b_adapt|:', b_adapt.abs().max())
+print("enable_online_fix:", model.enable_online_fix)
+print("online_gain mean/std:", model.online_gain.mean(), model.online_gain.std())
+print("online_bias mean/std:", model.online_bias.mean(), model.online_bias.std())
+print("== AdaptationHead 全部层权重 ==")
+for i, layer in enumerate(model.adaptation.mlp):
+    if hasattr(layer, "base"):   # LoRALinear
+        W = layer.base.weight.detach().cpu()
+        b = layer.base.bias.detach().cpu()
+        print(f"Layer {i}: max|W|={W.abs().max():.3e}, max|b|={b.abs().max():.3e}")
+    elif hasattr(layer, "weight"):
+        W = layer.weight.detach().cpu()
+        b = layer.bias.detach().cpu()
+        print(f"Layer {i}: max|W|={W.abs().max():.3e}, max|b|={b.abs().max():.3e}")
+    else:
+        print(f"Layer {i}: Non-linear layer ({type(layer)})")
+
 model.eval()
 
 # endregion
@@ -95,6 +128,15 @@ Hn, Mn = x_norm[:, :1], x_norm[:, 1:]
 exc = torch.tensor([exc_id], dtype=torch.long, device=device)
 ch  = torch.tensor([ch_id], dtype=torch.long, device=device)
 omegaN = np.pi * fs
+
+with torch.no_grad():
+    outL, outH = model(Hn, Mn, exc, ch)
+
+for key in ["alpha", "omega", "rho", "sin_theta", "cos_theta", "p_exist"]:
+    diff = (outL[key] - outH[key]).abs().max().item()
+    print(f"{key} max |L-H| = {diff:.3e}")
+
+
 # ==== 推理 ====
 with torch.no_grad():
     outL, outH = model(Hn, Mn, exc, ch)
