@@ -24,13 +24,19 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     if is_main_process():
         out_norm_sim.save(out_dir / 'Normalizer_Output_Sim.pth')
 
-    kf = KFold(n_splits=kfold, shuffle=True, random_state=42)
-    indices = list(range(len(real_parsed)))
-    folds = list(kf.split(indices))
-    train_idx, val_idx = folds[fold_idx]
+    # === 如果 kfold == 1，直接使用全部数据，不分折 ===
+    if kfold <= 1:
+        real_train = real_parsed
+        real_val   = []    # 或者 real_val = [] 根据你是否需要验证
+    else:
+        # 正常 kfold 流程
+        kf = KFold(n_splits=kfold, shuffle=True, random_state=42)
+        indices = list(range(len(real_parsed)))
+        train_idx, val_idx = list(kf.split(indices))[fold_idx]
 
-    real_train = [real_parsed[i] for i in train_idx]
-    real_val   = [real_parsed[i] for i in val_idx]
+        real_train = [real_parsed[i] for i in train_idx]
+        real_val   = [real_parsed[i] for i in val_idx]
+
 
     out_norm_real = compute_output_normalizer_masked(real_train)
     if is_main_process():
