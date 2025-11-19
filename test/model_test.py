@@ -28,7 +28,7 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-real = True  # 是否使用真实响应网络
+real = False  # 是否使用真实响应网络
 data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
 # cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
