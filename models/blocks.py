@@ -255,7 +255,7 @@ class MFDNN(nn.Module):
         nout = 6 if cfg.use_presence_head else 5
         self.register_buffer('online_gain', torch.ones(1, cfg.K_max, nout))
         self.register_buffer('online_bias', torch.zeros(1, cfg.K_max, nout))
-
+        self.enable_online_fix = False
 
     def forward_low(self, H, M, exc_id, ch_id):
         outL = self.low(H, M, exc_id, ch_id)
@@ -284,7 +284,8 @@ class MFDNN(nn.Module):
             # 合成 (LHF + NHF)
             U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP], dim=-1)  # (B,K,6)
             # 在线快修偏置
-            U = self.online_gain * U + self.online_bias
+            if self.enable_online_fix:
+                U = self.online_gain * U + self.online_bias
             # 物理域映射
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
                 U[...,0], U[...,1], U[...,2], U[...,3], U[...,4]
@@ -305,7 +306,8 @@ class MFDNN(nn.Module):
                 outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], None
             )
             U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC], dim=-1)        # (B,K,5)
-            U = self.online_gain * U + self.online_bias                    # 同样在线仿射
+            if self.enable_online_fix:
+                U = self.online_gain * U + self.online_bias                    # 同样在线仿射
             alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
                 U[...,0], U[...,1], U[...,2], U[...,3], U[...,4]
             )
@@ -314,7 +316,7 @@ class MFDNN(nn.Module):
                 'u_alpha':U[...,0],'u_omega':U[...,1],'u_rho':U[...,2],'u_sin_theta':U[...,3],'u_cos_theta':U[...,4]
             }
 
-    # [Added] 顶层 forward：给出低保真 + 高保真输出
+    # 顶层 forward：给出低保真 + 高保真输出
     def forward(self, H, M, exc_id, ch_id):
         """
         返回一个 dict:
@@ -344,13 +346,23 @@ class MFDNN(nn.Module):
             self.online_bias.copy_(b)
         else:
             raise ValueError("expect {'delta':...} or {'a':...,'b':...}")
+        
+    @torch.no_grad()
+    def reset_quick_fix(self):
+        """清空快修：gain=1, bias=0，并关闭 quick_fix。"""
+        self.online_gain.fill_(1.0)
+        self.online_bias.zero_()
+        self.enable_online_fix = False
 
+    @torch.no_grad()
+    def enable_quick_fix(self, flag: bool = True):
+        """显式打开/关闭 quick_fix."""
+        self.enable_online_fix = flag
 
     # ===== 岭回归重标定 LHF：直接更新 LinearHFHead 的 W,b =====
     @torch.no_grad()
     def ridge_recalibrate_linear(self, X_low: torch.Tensor, Y_target_u: torch.Tensor, reg: float = 1e-2):
         """
-        [Added]
         X_low: (N, D) = 由 LF 的 u 输出(含 LF-FiLM)展平得到
         Y_target_u: (N, D) = 目标物理值反算回 u 空间后展平
         仅更新 self.lin.linear 的 weight/bias（无激活线性），其它网络不动。
