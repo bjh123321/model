@@ -10,6 +10,31 @@ import pandas as pd
 from zero_pred import build_BA_from_zeros
 from residue_pred import build_BA_from_residues
 
+def inspect_ckpt(path):
+    print(f"\n========== Inspect {path} ==========")
+    ckpt = torch.load(path, map_location="cpu")
+
+    # 兼容两种保存方式：{'model_state_dict': ...} 或直接 state_dict
+    state = ckpt.get("model_state_dict", ckpt)
+
+    cfg = Config()
+    model = MFDNN(cfg)
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    print("\n[Model structure]")
+    print(model)  # 这里就会把整个网络结构打印出来
+
+    print("\n[Missing keys]")
+    for k in missing:
+        print("  MISSING:", k)
+
+    print("\n[Unexpected keys]")
+    for k in unexpected:
+        print("  UNEXPECTED:", k)
+
+    print("\n[Total parameters]:", sum(p.numel() for p in model.parameters()))
+
 plt.rcParams.update({
     "font.family": "Times New Roman",  # 字体
     "font.size": 10,                   # 默认字体大小
@@ -30,8 +55,8 @@ plt.rcParams.update({
 real = True  # 是否使用真实响应网络
 # data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
 data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
-# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-cur_dir = Path(__file__).parents[2] / "surrogate_model"
+cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+# cur_dir = Path(__file__).parents[2] / "surrogate_model"
 checkpoint_dir = "outputs_pzk"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000_affinefix.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
@@ -42,7 +67,7 @@ checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 H = 5.5          # 高度
 M = 0.74        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 11    # 响应通道
+ch_id  = 13    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
@@ -61,7 +86,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path  = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
-
+inspect_ckpt(ckpt_path)
 # ==== 加载 ====
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)

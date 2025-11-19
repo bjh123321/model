@@ -107,7 +107,7 @@ class LowFidelityHead(nn.Module):
 
         # FiLM 调制头：可选开启
         if getattr(cfg, "use_modulation", False):
-            self.modulation = ModulationHead(cfg)
+            self.mod = ModulationHead(cfg)
 
         # 防合并/缩进错误：开局断言一次，训练期若缺失能及早发现
         assert hasattr(self, "mlp"), "LowFidelityHead: self.mlp was not created"
@@ -121,9 +121,8 @@ class LowFidelityHead(nn.Module):
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
 
         # FiLM 调制在 LF 输出上（若开启）
-        if getattr(self.cfg, "use_modulation", False):
-            mod = self.modulation(exc_id, ch_id)                     # 形状应能广播到 (B,K,nout)
-            out = out * mod
+        if getattr(self.cfg, "use_modulation", False):                     # 形状应能广播到 (B,K,nout)
+            out = out * self.mod(exc_id, ch_id)
 
         # 拆分 u 空间分量并按是否开启存在头返回
         u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta = out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
@@ -204,7 +203,8 @@ class AdaptationHead(nn.Module):
             nn.init.zeros_(last_layer.weight)
             nn.init.zeros_(last_layer.bias)
         # NHF的FiLM
-        self.mod = ModulationHead(cfg)
+        if getattr(self.cfg, "use_modulation_in_high", False):
+            self.mod = ModulationHead(cfg)
 
 
     def forward(self, H, M, exc_id, ch_id,
@@ -215,7 +215,8 @@ class AdaptationHead(nn.Module):
         x = torch.cat([H, M, e_exc, e_chn, uL_pool], dim=-1)
         out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
         # FiLM调制只作用于残差δ
-        out = out * self.mod(exc_id, ch_id)
+        if getattr(self.cfg, "use_modulation_in_high", False):
+            out = out * self.mod(exc_id, ch_id)
         # p_exist门控减少不确定槽位的残差影响
         if self.cfg.use_presence_head:
             u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres = (
@@ -358,6 +359,7 @@ class MFDNN(nn.Module):
     def enable_quick_fix(self, flag: bool = True):
         """显式打开/关闭 quick_fix."""
         self.enable_online_fix = flag
+
 
     # ===== 岭回归重标定 LHF：直接更新 LinearHFHead 的 W,b =====
     @torch.no_grad()

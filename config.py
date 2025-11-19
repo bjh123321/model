@@ -37,6 +37,7 @@ class Config:
 
     # 网络与损失
     use_modulation: bool = True
+    use_modulation_in_high: bool = False
     use_hungarian_loss: bool = True
 
     # 存在头
