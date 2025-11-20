@@ -71,16 +71,16 @@ loss = ckpt.get("loss_history", None)
 
 # region
 # 自动推断 embed 维度
-if "low.emb_exc.weight" in state:
-    cfg.embed_excitation_num = state["low.emb_exc.weight"].shape[0]
-    cfg.embed_excitation_dim = state["low.emb_exc.weight"].shape[1]
-if "low.emb_chn.weight" in state:
-    cfg.embed_channel_num = state["low.emb_chn.weight"].shape[0]
-    cfg.embed_channel_dim = state["low.emb_chn.weight"].shape[1]
+# if "low.emb_exc.weight" in state:
+#     cfg.embed_excitation_num = state["low.emb_exc.weight"].shape[0]
+#     cfg.embed_excitation_dim = state["low.emb_exc.weight"].shape[1]
+# if "low.emb_chn.weight" in state:
+#     cfg.embed_channel_num = state["low.emb_chn.weight"].shape[0]
+#     cfg.embed_channel_dim = state["low.emb_chn.weight"].shape[1]
 
 # K_max 同样自动推断
-if "lin.A" in state:
-    cfg.K_max = state["lin.A"].shape[1]
+# if "lin.A" in state:
+#     cfg.K_max = state["lin.A"].shape[1]
 
 model = MFDNN(cfg).to(device)
 missing, unexpected = model.load_state_dict(state, strict=False)

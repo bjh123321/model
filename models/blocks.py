@@ -199,6 +199,8 @@ class AdaptationHead(nn.Module):
         if isinstance(last_layer, LoRALinear):
             nn.init.zeros_(last_layer.base.weight)
             nn.init.zeros_(last_layer.base.bias)
+            nn.init.zeros_(last_layer.lora_A)
+            nn.init.zeros_(last_layer.lora_B)
         else:
             nn.init.zeros_(last_layer.weight)
             nn.init.zeros_(last_layer.bias)
