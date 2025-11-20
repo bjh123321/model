@@ -13,8 +13,8 @@ def main():
     parser.add_argument('--real_txt', type=str, required=True)
     parser.add_argument('--out_dir', type=str, default='./surrogate_model/outputs_pzk')
     parser.add_argument('--kfold', type=int, default=5)
-    parser.add_argument('--stage1_kfold', type=int, default=0, choices=[0, 1],
-                        help='Set to 1 to train stage 1 on every fold, 0 to train once and reuse')
+    # parser.add_argument('--stage1_kfold', type=int, default=0, choices=[0, 1],
+    #                     help='Set to 1 to train stage 1 on every fold, 0 to train once and reuse')
     parser.add_argument('--stage2_kfold', type=int, default=0, choices=[0, 1],
                         help='Set to 1 to train stage 2 on every fold, 0 to train once')
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
@@ -66,7 +66,7 @@ def main():
     cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
 
     num_folds = args.kfold if bool(args.stage2_kfold) else 1 # 如果开fold训练则为stage2_kfold，否则为1
-    setattr(args, 'stage1_once', int(not bool(args.stage1_kfold)))
+    setattr(args, 'stage1_once', 1)
 
     for fold in range(num_folds):
         if (not dist.is_initialized()) or (dist.get_rank() == 0):

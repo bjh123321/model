@@ -82,6 +82,8 @@ def _load_stage1_low_from_fold0(model_core: nn.Module, ckpt_dir: Path) -> bool:
     ]
     # 兜底：扫描目录中任何以 best_stage1_fold0 开头或 checkpoint_stage1_fold0 开头的文件
     for p in list(candidates) + sorted(ckpt_dir.glob('best_stage1_fold0*.pth')) + sorted(ckpt_dir.glob('checkpoint_stage1_fold0*.pth')):
+        if is_main_process():
+            print("[DEBUG] candidate:", p, "exists:", p.exists())
         if p.exists():
             try:
                 state = torch.load(p, map_location='cpu').get('model_state_dict', None)
@@ -162,8 +164,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                             presence_weight=pres_w, cardinality_weight=card_w)
 
     # [Added] 是否复用 fold0 的 Stage-1（low.*）结果
-    stage1_once = bool(getattr(args, 'stage1_once', 0))  # 主程序已设置：1 表示 S1 只训练一次
-    reuse_stage1 = stage1_once and (fold > 0)
+    stage1_once = bool(getattr(args, 'stage1_once', 1))  # 主程序已设置：1 表示 S1 只训练一次
+    reuse_stage1 = stage1_once
 
     # ============ Stage 1 ============ #
     # [Changed]：当 reuse_stage1=True 时，跳过训练并加载 fold0 的 low.* 权重
@@ -253,7 +255,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             if is_main_process():
                 print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
                       f'sim_loss={epoch_loss_w:.6f} lr={_cur_lr(opt1):.3e}', flush=True)
-                if (epoch + 1) % 1000 == 0:
+                if (epoch + 1) % 100 == 0:
                     torch.save({
                         'fold': fold, 'stage': 1, 'epoch': epoch + 1,
                         'model_state_dict': model_core.state_dict(),
