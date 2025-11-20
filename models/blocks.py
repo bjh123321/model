@@ -146,24 +146,30 @@ class LinearHFHead(nn.Module):
     def __init__(self, K_max: int, use_presence: bool):
         super().__init__()
         self.use_presence = use_presence
-        nout = 6 if use_presence else 5
-        self.linear = nn.Linear(K_max * nout, K_max * nout)
+        self.K_max = K_max
+        self.nout = 6 if use_presence else 5
+
+        # 一个 6×6（或 5×5）的线性变换，对每个槽位的参数向量做仿射变换
+        self.linear = nn.Linear(self.nout, self.nout)
         with torch.no_grad():
-            nn.init.eye_(self.linear.weight)              # 近似恒等
+            nn.init.eye_(self.linear.weight)   # 精确恒等
             nn.init.zeros_(self.linear.bias)
 
     def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
         if self.use_presence:
-            u_vec = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B, K*nout)
+            U = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B,K,6)
         else:
-            u_vec = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)          # (B, K*nout)
-        y_vec = self.linear(u_vec)  # (B, K*nout)
-        K = u_alpha.size(1); nout = 6 if self.use_presence else 5
-        Y = y_vec.view(-1, K, nout) # (B,K,nout)
+            U = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)         # (B,K,5)
+
+        B, K, nout = U.shape  # nout=5/6
+        # 在最后一维上做线性映射：先拉成 (B*K, nout)，linear 后再拉回 (B,K,nout)
+        Y = self.linear(U.view(-1, nout)).view(B, K, nout)
+
         if self.use_presence:
             return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
         else:
             return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4]
+
 
 
 class AdaptationHead(nn.Module):
