@@ -192,22 +192,45 @@ class AdaptationHead(nn.Module):
             layers.append(nn.Linear(last, out_dim))
         self.mlp = nn.Sequential(*layers)
 
-        # 以“δ=0”起步更稳
-        with torch.no_grad():
-            last_layer = self.mlp[-1]
-        # LoRALinear 没有 weight/bias 属性，真实权重在 base 里
-        if isinstance(last_layer, LoRALinear):
-            nn.init.zeros_(last_layer.base.weight)
-            nn.init.zeros_(last_layer.base.bias)
-            nn.init.zeros_(last_layer.lora_A)
-            nn.init.zeros_(last_layer.lora_B)
-        else:
-            nn.init.zeros_(last_layer.weight)
-            nn.init.zeros_(last_layer.bias)
-        # NHF的FiLM
+        # # 以“δ=0”起步更稳
+        # with torch.no_grad():
+        #     for m in self.mlp:
+        #         # LoRALinear 没有 weight/bias 属性，真实权重在 base 里
+        #         if isinstance(m, LoRALinear):
+        #             nn.init.zeros_(m.base.weight)
+        #             nn.init.zeros_(m.base.bias)
+        #             # 清零 LoRA 专用 A/B
+        #             nn.init.zeros_(m.lora_A)
+        #             nn.init.zeros_(m.lora_B)
+        #         else:
+        #             nn.init.zeros_(m.weight)
+        #             nn.init.zeros_(m.bias)
+        #     # NHF的FiLM
         if getattr(self.cfg, "use_modulation_in_high", False):
             self.mod = ModulationHead(cfg)
+        self.zero_all_adaptation_params()
 
+    def zero_all_adaptation_params(self):
+        """
+        将 AdaptationHead 的所有 Linear / LoRALinear 层全部置零。
+        Stage1 时就不会对 outL 产生任何残差。
+        """
+        with torch.no_grad():
+            for m in self.mlp:
+                if isinstance(m, LoRALinear):
+                    nn.init.zeros_(m.base.weight)
+                    nn.init.zeros_(m.base.bias)
+                    nn.init.zeros_(m.lora_A)
+                    nn.init.zeros_(m.lora_B)
+                elif isinstance(m, nn.Linear):
+                    nn.init.zeros_(m.weight)
+                    nn.init.zeros_(m.bias)
+
+            if hasattr(self, "mod"):
+                for m in self.mod.modules():
+                    if isinstance(m, nn.Linear):
+                        nn.init.zeros_(m.weight)
+                        nn.init.zeros_(m.bias)
 
     def forward(self, H, M, exc_id, ch_id,
                 uL_alpha, uL_omega, uL_rho, uL_sin_theta, uL_cos_theta, uL_pres=None):
