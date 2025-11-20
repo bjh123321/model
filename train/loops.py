@@ -78,7 +78,7 @@ def _load_stage1_low_from_fold0(model_core: nn.Module, ckpt_dir: Path) -> bool:
     # [Added] 尝试候选文件（按优先级）
     candidates = [
         ckpt_dir / 'best_stage1_fold0.pth',
-        ckpt_dir / 'checkpoint_stage1_fold0_earlystop_epoch10000.pth',  # 可能存在的文件名
+        ckpt_dir / 'checkpoint_stage1_fold0_epoch10000.pth',  # 可能存在的文件名
     ]
     # 兜底：扫描目录中任何以 best_stage1_fold0 开头或 checkpoint_stage1_fold0 开头的文件
     for p in list(candidates) + sorted(ckpt_dir.glob('best_stage1_fold0*.pth')) + sorted(ckpt_dir.glob('checkpoint_stage1_fold0*.pth')):
@@ -307,7 +307,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     # ============ Stage 2 ============ #
     for p in model_core.lin.parameters(): p.requires_grad_(True)
     for p in model_core.adaptation.parameters(): p.requires_grad_(True)
-    opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam, weight_decay=cfg.weight_decay)
+    opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam)
 
     pat2   = getattr(cfg, 'lr_patience_s2', 20)
     fac2   = getattr(cfg, 'lr_factor_s2', 0.5)
@@ -319,14 +319,14 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         min_lr=minlr2, eps=1e-12
     )
 
-    w_sim, w_real = 0.3, 1.0
+    # w_sim, w_real = 0.3, 1.0
     best_total = float('inf'); no_improve = 0
     sim_iter = None
     total_hist, sim_hist, real_hist = [], [], []
     lr_hist_s2 = []
 
     use_cuda = (device.type == 'cuda')
-    scaler2 = torch.amp.GradScaler('cuda') if use_cuda else None  # [Added] 给 S2 也用 AMP（与 S1 对齐）
+    scaler2 = torch.amp.GradScaler('cuda') if use_cuda else None
 
     for epoch in range(cfg.epochs_stage2):
         model.train()
@@ -357,7 +357,14 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     loss_real = crit_s2(outH_r, yNr, mask_r)
                     outL_s, _ = model(H_s, M_s, e_s, c_s)
                     loss_sim = crit_s1(outL_s, yNs, mask_s)
-                    loss = w_real*loss_real + w_sim*loss_sim
+                    log_sigma_sim  = model_core.log_sigma_sim
+                    log_sigma_real = model_core.log_sigma_real
+                    # Kendall 形式：L = L/(2σ^2) + log σ
+                    inv_var_sim  = torch.exp(-2.0 * log_sigma_sim)   # 1 / σ^2
+                    inv_var_real = torch.exp(-2.0 * log_sigma_real)  # 1 / σ^2
+                    loss = 0.5 * inv_var_sim  * loss_sim \
+                         + 0.5 * inv_var_real * loss_real \
+                         + log_sigma_sim + log_sigma_real
                 scaler2.scale(loss).backward()
                 scaler2.unscale_(opt2)
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
@@ -367,7 +374,14 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 loss_real = crit_s2(outH_r, yNr, mask_r)
                 outL_s, _ = model(H_s, M_s, e_s, c_s)
                 loss_sim = crit_s1(outL_s, yNs, mask_s)
-                loss = w_real*loss_real + w_sim*loss_sim
+                log_sigma_sim  = model_core.log_sigma_sim
+                log_sigma_real = model_core.log_sigma_real
+                inv_var_sim  = torch.exp(-2.0 * log_sigma_sim)
+                inv_var_real = torch.exp(-2.0 * log_sigma_real)
+
+                loss = 0.5 * inv_var_sim  * loss_sim \
+                     + 0.5 * inv_var_real * loss_real \
+                     + log_sigma_sim + log_sigma_real
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
                 opt2.step()
@@ -386,7 +400,16 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
         sim_epoch   = (t_sim  / t_cnt_s).item() if t_cnt_s.item() > 0 else 0.0
         real_epoch  = (t_real / t_cnt_r).item() if t_cnt_r.item() > 0 else 0.0
-        total_epoch = float(w_sim*sim_epoch + w_real*real_epoch)
+
+        # 从当前 log_sigma 反推等效权重（用于日志和 early stop，不参与反向）
+        with torch.no_grad():
+            log_sigma_sim  = model_core.log_sigma_sim
+            log_sigma_real = model_core.log_sigma_real
+            inv_var_sim  = torch.exp(-2.0 * log_sigma_sim)   # 1/σ^2
+            inv_var_real = torch.exp(-2.0 * log_sigma_real)
+            w_sim_eff  = (0.5 * inv_var_sim).item()
+            w_real_eff = (0.5 * inv_var_real).item()
+        total_epoch = float(w_sim_eff * sim_epoch + w_real_eff * real_epoch)
 
         if is_main_process():
             prev_lr2 = _cur_lr(opt2)

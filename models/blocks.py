@@ -257,6 +257,8 @@ class MFDNN(nn.Module):
         self.register_buffer('online_gain', torch.ones(1, cfg.K_max, nout))
         self.register_buffer('online_bias', torch.zeros(1, cfg.K_max, nout))
         self.enable_online_fix = False
+        self.log_sigma_sim  = nn.Parameter(torch.zeros(1))
+        self.log_sigma_real = nn.Parameter(torch.zeros(1))
 
     def forward_low(self, H, M, exc_id, ch_id):
         outL = self.low(H, M, exc_id, ch_id)
