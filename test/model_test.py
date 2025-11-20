@@ -103,6 +103,20 @@ omegaN = np.pi * fs
 # ==== 推理 ====
 with torch.no_grad():
     outL, outH = model(Hn, Mn, exc, ch)
+    dA, dW, dR, dS, dC, dP = model.adaptation(
+        Hn, Mn, exc, ch,
+        outL['u_alpha'], outL['u_omega'], outL['u_rho'],
+        outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
+    )
+
+    print("mean residual:", 
+        dA.abs().mean().item(),
+        dW.abs().mean().item(),
+        dR.abs().mean().item(),
+        dS.abs().mean().item(),
+        dC.abs().mean().item(),
+        dP.abs().mean().item()
+    )
     if real:
         out = outH
     else:
