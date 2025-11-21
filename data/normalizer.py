@@ -25,7 +25,7 @@ class Normalizer:
             d = _torch.load(path, map_location='cpu', weights_only=True)
         except Exception:
             # 兼容旧文件（含 numpy 对象）
-            d = _torch.load(path, map_location='cpu')
+            d = _torch.load(path, map_location='cpu', weights_only=True)
 
         mean = d.get('mean')
         std  = d.get('std')

@@ -54,7 +54,7 @@ class ModulationHead(nn.Module):
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
         in_dim = cfg.embed_excitation_dim + cfg.embed_channel_dim
         # 使用配置中的 mod_hidden 作为隐藏层
-        out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
+        out_dim = cfg.K_max * 6
         self.mlp = MLP(in_dim=in_dim, out_dim=out_dim, hidden=cfg.mod_hidden, dropout=cfg.dropout_prob)
         with torch.no_grad():
             last_linear = self.mlp.net[-1]
@@ -69,7 +69,7 @@ class ModulationHead(nn.Module):
         x = torch.cat([e_exc, e_chn], dim=-1)
         h = self.mlp(x)
         mod = 1.0 + self.gamma * torch.tanh(h)
-        return mod.view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
+        return mod.view(-1, self.cfg.K_max, 6)
 
 
 class LowFidelityHead(nn.Module):
@@ -80,7 +80,7 @@ class LowFidelityHead(nn.Module):
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
 
         in_dim  = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim
-        nout    = 6 if cfg.use_presence_head else 5
+        nout    = 6
         out_dim = cfg.K_max * nout
 
         # === 一定要无条件创建 layers，再无条件创建 self.mlp ===
@@ -118,36 +118,28 @@ class LowFidelityHead(nn.Module):
         e_exc = self.emb_exc(exc_id)
         e_chn = self.emb_chn(ch_id)
         x = torch.cat([H, M, e_exc, e_chn], dim=-1)                  # (B, 2+emb_e+emb_c)
-        out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
+        out = self.mlp(x).view(-1, self.cfg.K_max, 6)
 
         # FiLM 调制在 LF 输出上（若开启）
         if getattr(self.cfg, "use_modulation", False):                     # 形状应能广播到 (B,K,nout)
             out = out * self.mod(exc_id, ch_id)
 
         # 拆分 u 空间分量并按是否开启存在头返回
-        u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta = out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
-        if self.cfg.use_presence_head:
-            u_pres = out[...,5]
-            p_exist = torch.sigmoid(u_pres)
-            return {
-                'u_alpha':u_alpha, 'u_omega':u_omega, 'u_rho':u_rho,
-                'u_sin_theta':u_sin_theta, 'u_cos_theta':u_cos_theta,
-                'u_pres':u_pres, 'p_exist':p_exist
-            }
-        else:
-            return {
-                'u_alpha':u_alpha, 'u_omega':u_omega, 'u_rho':u_rho,
-                'u_sin_theta':u_sin_theta, 'u_cos_theta':u_cos_theta
-            }
+        u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres = out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
+
+        return {
+            'u_alpha':u_alpha, 'u_omega':u_omega, 'u_rho':u_rho,
+            'u_sin_theta':u_sin_theta, 'u_cos_theta':u_cos_theta,
+            'u_pres':u_pres
+        }
 
 
 
 class LinearHFHead(nn.Module):
-    def __init__(self, K_max: int, use_presence: bool):
+    def __init__(self, K_max: int):
         super().__init__()
-        self.use_presence = use_presence
         self.K_max = K_max
-        self.nout = 6 if use_presence else 5
+        self.nout = 6
 
         # 一个 6×6（或 5×5）的线性变换，对每个槽位的参数向量做仿射变换
         self.linear = nn.Linear(self.nout, self.nout)
@@ -156,19 +148,12 @@ class LinearHFHead(nn.Module):
             nn.init.zeros_(self.linear.bias)
 
     def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
-        if self.use_presence:
-            U = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B,K,6)
-        else:
-            U = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)         # (B,K,5)
-
-        B, K, nout = U.shape  # nout=5/6
+        U = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B,K,6)
+        B, K, nout = U.shape  # nout=6
         # 在最后一维上做线性映射：先拉成 (B*K, nout)，linear 后再拉回 (B,K,nout)
         Y = self.linear(U.view(-1, nout)).view(B, K, nout)
 
-        if self.use_presence:
-            return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
-        else:
-            return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4]
+        return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
 
 
 
@@ -179,7 +164,7 @@ class AdaptationHead(nn.Module):
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_chn = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
         in_dim  = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim + 5
-        out_dim = cfg.K_max * (6 if cfg.use_presence_head else 5)
+        out_dim = cfg.K_max * 6
 
         layers: List[nn.Module] = []
         last = in_dim
@@ -244,36 +229,30 @@ class AdaptationHead(nn.Module):
         uL_pool = torch.stack([uL_alpha,uL_omega,uL_rho,uL_sin_theta,uL_cos_theta], dim=-1).mean(dim=1)  # (B,5)
         e_exc = self.emb_exc(exc_id); e_chn = self.emb_chn(ch_id)
         x = torch.cat([H, M, e_exc, e_chn, uL_pool], dim=-1)
-        out = self.mlp(x).view(-1, self.cfg.K_max, (6 if self.cfg.use_presence_head else 5))
+        out = self.mlp(x).view(-1, self.cfg.K_max, 6)
         # FiLM调制只作用于残差δ
         if getattr(self.cfg, "use_modulation_in_high", False):
             out = out * self.mod(exc_id, ch_id)
         # p_exist门控减少不确定槽位的残差影响
-        if self.cfg.use_presence_head:
-            u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres = (
-                out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
-            )
-            p_exist = torch.sigmoid(u_pres)
-            return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres
-        else:
-            u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta = (
-                out[...,0], out[...,1], out[...,2], out[...,3], out[...,4]
-            )
-            return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta
+        u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres = (
+            out[...,0], out[...,1], out[...,2], out[...,3], out[...,4], out[...,5]
+        )
+        return u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres
 
 
 
 class ParamPZK(nn.Module):
     def __init__(self):
         super().__init__()
-    def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta):
+    def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres):
         alpha = -F.softplus(u_alpha)
         omega =  F.sigmoid(u_omega)
         rho  =  u_rho
         norm = torch.sqrt(u_sin_theta.pow(2) + u_cos_theta.pow(2) + 1e-8)  # 防止除0
         sin_theta = u_sin_theta / norm
         cos_theta = u_cos_theta / norm
-        return alpha, omega, rho, sin_theta, cos_theta
+        p_exist = torch.sigmoid(u_pres)
+        return alpha, omega, rho, sin_theta, cos_theta, p_exist
 
 
 class MFDNN(nn.Module):
@@ -281,10 +260,10 @@ class MFDNN(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.low  = LowFidelityHead(cfg)
-        self.lin  = LinearHFHead(cfg.K_max, use_presence=cfg.use_presence_head)
+        self.lin  = LinearHFHead(cfg.K_max)
         self.adaptation = AdaptationHead(cfg)
         self.param = ParamPZK()
-        nout = 6 if cfg.use_presence_head else 5
+        nout = 6
         self.register_buffer('online_gain', torch.ones(1, cfg.K_max, nout))
         self.register_buffer('online_bias', torch.zeros(1, cfg.K_max, nout))
         self.enable_online_fix = False
@@ -293,69 +272,45 @@ class MFDNN(nn.Module):
 
     def forward_low(self, H, M, exc_id, ch_id):
         outL = self.low(H, M, exc_id, ch_id)
-        alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
-            outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta']
+        alpha, omega, rho, sin_theta, cos_theta, p_exist = self.param.to_physical(
+            outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
         )
         out = {
             **outL,
-            'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta
+            'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta, 'p_exist':p_exist
         }
-        if self.cfg.use_presence_head:
-            out['p_exist'] = outL['p_exist']
-            out['u_pres']  = outL['u_pres']
+
         return out
 
 
     def forward_high(self, H, M, exc_id, ch_id, outL: dict):
-        if self.cfg.use_presence_head:
-            uA,uW,uR,uS,uC,uP = self.lin(
-                outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
-            )
-            dA,dW,dR,dS,dC,dP = self.adaptation(
-                H, M, exc_id, ch_id,
-                outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
-            )
-            # 合成 (LHF + NHF)
-            U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP], dim=-1)  # (B,K,6)
-            # 在线快修偏置
-            if self.enable_online_fix:
-                U = self.online_gain * U + self.online_bias
-            # 物理域映射
-            alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
-                U[...,0], U[...,1], U[...,2], U[...,3], U[...,4]
-            )
-            p_exist = torch.sigmoid(U[...,5])
-            return {
-                'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta,
-                'u_alpha':U[...,0],'u_omega':U[...,1],'u_rho':U[...,2],'u_sin_theta':U[...,3],'u_cos_theta':U[...,4],
-                'p_exist':p_exist,'u_pres':U[...,5]
-            }
-        else:
-            # === 没有存在头的情况（nout=5） ===
-            uA,uW,uR,uS,uC = self.lin(
-                outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], None
-            )
-            dA,dW,dR,dS,dC = self.adaptation(
-                H, M, exc_id, ch_id,
-                outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], None
-            )
-            U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC], dim=-1)        # (B,K,5)
-            if self.enable_online_fix:
-                U = self.online_gain * U + self.online_bias                    # 同样在线仿射
-            alpha, omega, rho, sin_theta, cos_theta = self.param.to_physical(
-                U[...,0], U[...,1], U[...,2], U[...,3], U[...,4]
-            )
-            return {
-                'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta,
-                'u_alpha':U[...,0],'u_omega':U[...,1],'u_rho':U[...,2],'u_sin_theta':U[...,3],'u_cos_theta':U[...,4]
-            }
+        uA,uW,uR,uS,uC,uP = self.lin(
+            outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
+        )
+        dA,dW,dR,dS,dC,dP = self.adaptation(
+            H, M, exc_id, ch_id,
+            outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
+        )
+        # 合成 (LHF + NHF)
+        U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP], dim=-1)  # (B,K,6)
+        # 在线快修偏置
+        if self.enable_online_fix:
+            U = self.online_gain * U + self.online_bias
+        # 物理域映射
+        alpha, omega, rho, sin_theta, cos_theta, p_exist = self.param.to_physical(
+            U[...,0], U[...,1], U[...,2], U[...,3], U[...,4], U[...,5]
+        )
+        return {
+            'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta,'p_exist':p_exist,
+            'u_alpha':U[...,0],'u_omega':U[...,1],'u_rho':U[...,2],'u_sin_theta':U[...,3],'u_cos_theta':U[...,4],'u_pres':U[...,5]
+        }
 
     # 顶层 forward：给出低保真 + 高保真输出
     def forward(self, H, M, exc_id, ch_id):
         """
         返回一个 dict:
-          - low:  低保真物理域 + u 域（含 p_exist/u_pres）
-          - high: 高保真物理域 + u 域（含 p_exist/u_pres）
+          - low:  低保真物理域 + u 域
+          - high: 高保真物理域 + u 域
         """
         outL = self.forward_low(H, M, exc_id, ch_id)
         outH = self.forward_high(H, M, exc_id, ch_id, outL)
@@ -396,35 +351,40 @@ class MFDNN(nn.Module):
 
     # ===== 岭回归重标定 LHF：直接更新 LinearHFHead 的 W,b =====
     @torch.no_grad()
-    def ridge_recalibrate_linear(self, X_low: torch.Tensor, Y_target_u: torch.Tensor, reg: float = 1e-2):
+    def ridge_recalibrate_linear(self, U_low: torch.Tensor, U_target: torch.Tensor, reg: float = 1e-2):
         """
-        X_low: (N, D) = 由 LF 的 u 输出(含 LF-FiLM)展平得到
-        Y_target_u: (N, D) = 目标物理值反算回 u 空间后展平
-        仅更新 self.lin.linear 的 weight/bias（无激活线性），其它网络不动。
+        U_low:    (N, K, nout)   -- LF 输出的 u（网络空间，未物理映射）
+        U_target: (N, K, nout)   -- 真实标签反算回 u 空间之后的值
         """
         device = self.lin.linear.weight.device
-        X = X_low.to(device); Y = Y_target_u.to(device)
-        N, D = X.shape
-        assert Y.shape == (N, D), f"Y shape {Y.shape} mismatch X shape {(N,D)}"
+        U_low    = U_low.to(device)
+        U_target = U_target.to(device)
 
-        # 带偏置的岭回归闭式解
-        X_aug = torch.cat([X, torch.ones(N,1, device=device)], dim=1)   # (N, D+1)
-        G = X_aug.T @ X_aug                                             # (D+1, D+1)
-        # 只对权重部分加正则（不惩罚 bias）
-        Lambda = torch.zeros_like(G); Lambda[:D,:D].fill_(reg)
-        W_aug = torch.linalg.solve(G + Lambda, X_aug.T @ Y)             # (D+1, D)
-        W, b = W_aug[:D,:], W_aug[D:,:].squeeze(0)                      # W:(D,D), b:(D,)
+        N, K, nout = U_low.shape
+        assert U_target.shape == (N, K, nout)
 
-        # 写回 nn.Linear（weight: (D_out,D) = (D,D)）
+        # 所有 slot 展开成 (N*K, nout)
+        X = U_low.reshape(N*K, nout)       # 输入
+        Y = U_target.reshape(N*K, nout)    # 目标
+
+        ones = torch.ones(N*K, 1, device=device)
+        X_aug = torch.cat([X, ones], dim=1)    # (N*K, nout+1)
+
+        G = X_aug.T @ X_aug                    # (nout+1, nout+1)
+        Lambda = torch.zeros_like(G)
+        Lambda[:nout, :nout].fill_(reg)
+
+        W_aug = torch.linalg.solve(G + Lambda, X_aug.T @ Y)  # (nout+1, nout)
+
+        W = W_aug[:nout, :]     # (nout, nout)
+        b = W_aug[nout, :]      # (nout,)
+
         self.lin.linear.weight.copy_(W.T.contiguous())
         self.lin.linear.bias.copy_(b.contiguous())
 
+
     # ===== 辅助：把 u 分量展平为 (B, D) =====
     def flatten_u(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None) -> torch.Tensor:
-        if self.cfg.use_presence_head:
-            assert u_pres is not None, "use_presence_head=True 时必须给 u_pres"
-            U = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B, K*6)
-        else:
-            U = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)          # (B, K*5)
+        U = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B, K*6)
         return U
     

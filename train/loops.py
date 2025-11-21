@@ -18,8 +18,7 @@ from .dataloaders import build_dataloaders
 def _cur_lr(optimizer):
     return optimizer.param_groups[0]['lr']
 
-def _mse_per_param_z(pred, yN, mask, mean, std, use_presence: bool):
-    eps = 1e-8
+def _mse_per_param_z(pred, yN, mask, mean, std):
     P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # [B,3,K]
     P1 = torch.stack([pred['sin_theta'], pred['cos_theta']], dim=1)      # [B,2,K]
     TN = torch.stack([yN['alpha'], yN['omega'], yN['rho'], yN['sin_theta'], yN['cos_theta']], dim=1)  # [B,5,K]
@@ -41,16 +40,16 @@ def _mse_per_param_z(pred, yN, mask, mean, std, use_presence: bool):
         'cos_theta': mse_ch[4].item()
     }
 
-    if use_presence:
-        if 'u_pres' in pred:
-            logits = pred['u_pres']
-            target = (mask > 0.5).float()
-            bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, reduction='none').mean().item()
-        else:
-            p = pred.get('p_exist', torch.sigmoid(torch.zeros_like(mask)))
-            p = p.clamp(1e-6, 1-1e-6)
-            target = (mask > 0.5).float()
-            bce = -(target*torch.log(p) + (1-target)*torch.log(1-p)).mean().item()
+
+    if 'u_pres' in pred:
+        logits = pred['u_pres']
+        target = (mask > 0.5).float()
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, reduction='none').mean().item()
+    else:
+        p = pred.get('p_exist', torch.sigmoid(torch.zeros_like(mask)))
+        p = p.clamp(1e-6, 1-1e-6)
+        target = (mask > 0.5).float()
+        bce = -(target*torch.log(p) + (1-target)*torch.log(1-p)).mean().item()
 
         pred_cnt = (torch.sigmoid(pred['u_pres']) if 'u_pres' in pred else pred.get('p_exist', 0.0)).sum(dim=1)
         true_cnt = (mask > 0.5).float().sum(dim=1)
@@ -231,7 +230,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                     outL, _ = model(H, M, e, c)
                     loss = crit_s1(outL, yN, mask)
                     with torch.no_grad():
-                        stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim, cfg.use_presence_head)
+                        stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim)
                         _accum_stat(comp_accum, stat); comp_count += 1
                     torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
                     loss.backward(); opt1.step()

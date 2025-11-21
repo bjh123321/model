@@ -1,8 +1,11 @@
 # surrogate_model/cli/online_ridge.py
+# %%
 import argparse
 import torch
 import csv
 from pathlib import Path
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct
@@ -11,181 +14,340 @@ from surrogate_model.models.blocks import MFDNN
 
 
 # ===========================
-# 反推：physical → u-space
+# 物理域 → u-space 反推
 # ===========================
-def invert_to_u_space(alpha, omega, rho, sin_t, cos_t, r):
+def invert_to_u_space(alpha, omega, rho, sin_t, cos_t, mask, r):
     neg_alpha = -alpha
     u_alpha = torch.log(torch.exp(neg_alpha) - 1.0 + 1e-12)
+
+    # u_omega (inverse sigmoid)
     omega = omega.clamp(1e-6, 1 - 1e-6)
     u_omega = torch.log(omega / (1 - omega))
     u_rho = rho
     u_sin = r * sin_t
     u_cos = r * cos_t
+    u_pres = torch.where(
+        mask > 0.5,
+        torch.full_like(mask, 10.0),
+        torch.full_like(mask, -2.0),
+    )
 
-    return u_alpha, u_omega, u_rho, u_sin, u_cos
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt",        type=str, required=True)
-    ap.add_argument("--calib_csv",   type=str, required=True)
-    ap.add_argument("--save_ckpt",   type=str, default="")
-    ap.add_argument("--lambda_ridge",type=float, default=1e-2)
-    ap.add_argument("--mode", type=str, choices=["lhf", "bias", "affine"], default="bias",
-                    help="lhf=重标定LHF; bias=仅偏置快修; affine=仿射快修")
-
-    args = ap.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    cfg = Config()
-
-    # -------------------------------
-    # 加载模型
-    # -------------------------------
-    model = MFDNN(cfg).to(device)
-    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
-    state = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state, strict=False)
-    model.eval()
-
-    # -------------------------------
-    # 读取 normalizer
-    # -------------------------------
-    input_norm_path = Path(args.ckpt).with_name("Normalizer_Input_Sim.pth")  # with_name表示替换文件名，相当于拆分路径后生成新路径
-    output_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Real_Fold0.pth")
-    in_norm: Normalizer  = Normalizer.load(input_norm_path)
-    out_norm: Normalizer = Normalizer.load(output_norm_path)
+    return u_alpha, u_omega, u_rho, u_sin, u_cos, u_pres
 
 
-# -------------------------------
-# 读取校准数据 → ParsedRow
-# -------------------------------
-    rows_float = []
-    with open(args.calib_csv, "r", newline="", encoding="utf-8-sig") as f:  # utf-8-sig 自动去掉 BOM，newline="" 兼容各种换行符
-        reader = csv.reader(f)
-        for row in reader:
-            # 去掉左右空白，过滤掉空单元格
-            cleaned = []
-            for x in row:
-                x = x.strip()
-                if not x:
-                    continue
-                # 去掉可能存在的 BOM
-                x = x.lstrip("\ufeff")
-                cleaned.append(float(x))
-            if cleaned:
-                rows_float.append(cleaned)
+def normlizer(pred: torch.Tensor, mean, std):
+    # 转为 torch.Tensor 并对齐设备和精度
+    mean_t = torch.as_tensor(mean, dtype=pred.dtype, device=pred.device)
+    std_t  = torch.as_tensor(std,  dtype=pred.dtype, device=pred.device)
 
-    # 这里 rows_float 的类型就是 List[List[float]]
-    parsed, stats = parse_rows_to_struct(rows_float)
+    # 只对前 3 维 [alpha, omega, rho] 做标准化
+    core = pred[..., :3]       # (..., 3)
+    others = pred[..., 3:]     # (..., 2) -> [sin_theta, cos_theta]
 
-    # parsed 是 List[ParsedRow]
-    N = len(parsed)
-    if N == 0:
-        raise RuntimeError("校准数据为空！")
+    # mean/std 长度 = 3，这里 reshape 成 (..., 3)，前面的维度用 1 方便广播
+    assert mean_t.numel() == 3 and std_t.numel() == 3, "mean/std 必须是长度为 3"
+    view_shape = [1] * (core.ndim - 1) + [3]   # 例如 core 是 (B,K,3) -> mean/std 变成 (1,1,3)
+    mean_t = mean_t.view(*view_shape)
+    std_t  = std_t.view(*view_shape)
 
-    # -------------------------------
-    # 构建批量输入 (H,M,E,C)
-    # -------------------------------
-    H = torch.tensor([p.H for p in parsed], dtype=torch.float32, device=device).unsqueeze(-1)
-    M = torch.tensor([p.M for p in parsed], dtype=torch.float32, device=device).unsqueeze(-1)
-    E = torch.tensor([p.exc_id for p in parsed], dtype=torch.long,   device=device)
-    C = torch.tensor([p.ch_id for p in parsed], dtype=torch.long,   device=device)
+    core_n = (core - mean_t) / std_t  # 标准化后的 (alpha, omega, rho)
 
-    # 输入归一化（与 train_pzk 保持一致）
-    H = (H - in_norm.mean[0]) / in_norm.std[0]
-    M = (M - in_norm.mean[1]) / in_norm.std[1]
+    # 再把没归一化的 sinθ, cosθ 拼回去
+    pred_norm = torch.cat([core_n, others], dim=-1)  # (..., 5)
 
-    # -------------------------------
-    # 构建目标物理域 → u-space（标准化后）
-    # -------------------------------
-    # 模态结构：alpha, omega, rho, sinθ, cosθ  (K_max × 5)
-    K = cfg.K_max
-    use_pres = cfg.use_presence_head
-    nout = 6 if use_pres else 5
-    D = K * nout
+    return pred_norm
 
-    U_list = []
-    for p in parsed:
-        # 物理域参数（训练时就是用的这些）
-        alpha = torch.from_numpy(p.alpha.copy()).to(device)       # (K,)
-        omega = torch.from_numpy(p.omega.copy()).to(device)       # (K,)
-        rho   = torch.from_numpy(p.rho.copy()).to(device)         # (K,)
-        sin_t = torch.from_numpy(p.sin_theta.copy()).to(device)   # (K,)
-        cos_t = torch.from_numpy(p.cos_theta.copy()).to(device)   # (K,)
 
-        # ---- 只对 alpha/omega/rho 做 z-score，与 ModalDataset 保持一致 ----
-        lab = torch.stack([alpha, omega, rho], dim=0)             # (3,K)
-        m = torch.as_tensor(out_norm.mean, dtype=lab.dtype, device=device).view(3, 1)
-        s = torch.as_tensor(out_norm.std,  dtype=lab.dtype, device=device).view(3, 1).clamp_min(1e-8)
-        lab_norm = (lab - m) / s                                  # (3,K)
+def hungarian_match(
+    predN: torch.Tensor,   # (K,nout)
+    tgt: torch.Tensor,    # (K,nout)
+    w_alpha=1.0, w_omega=1.0, w_rho=1.0,
+    big=1e6
+):
 
-        # sin/cos 不做归一化，直接拼上
-        sin_t = sin_t.unsqueeze(0)                                # (1,K)
-        cos_t = cos_t.unsqueeze(0)                                # (1,K)
-        U = torch.cat([lab_norm, sin_t, cos_t], dim=0)            # (5,K)
+    PA, PO, PR, PS, PC = predN[:,:,0], predN[:,:,1], predN[:,:,2], predN[:,:,3], predN[:,:,4]
+    TA, TO, TR, TS, TC, mask = tgt[:,:,0], tgt[:,:,1], tgt[:,:,2], tgt[:,:,3], tgt[:,:,4], tgt[:,:,5]
+    B = PA.size(0)
+    K = PA.size(1)
+    
+    dA = (PA.unsqueeze(2) - TA.unsqueeze(1))**2
+    dO = (PO.unsqueeze(2) - TO.unsqueeze(1))**2
+    dR = (PR.unsqueeze(2) - TR.unsqueeze(1))**2
+    dS = (PS.unsqueeze(2) - TS.unsqueeze(1))**2
+    dC = (PC.unsqueeze(2) - TC.unsqueeze(1))**2
+    cost = dA + dO + dR + dS + dC
 
-        # 若使用 presence head，为 u_pres 构造“存在/不存在”的 logit 目标
-        if use_pres:
-            mask = torch.from_numpy(p.mask.copy()).to(device)     # (K,)
-            # 存在 -> 大正数，不存在 -> 大负数（相当于目标概率接近 1 / 0）
-            u_pres = torch.where(
-                mask > 0.5,
-                torch.full_like(mask, 10.0),
-                torch.full_like(mask, -10.0),
-            ).unsqueeze(0)                                       # (1,K)
-            U = torch.cat([U, u_pres], dim=0)                     # (6,K)
+    pm = torch.ones(B, K, 1, dtype=cost.dtype, device=cost.device)
+    tm = (mask > 0.5).to(cost.dtype).unsqueeze(1)
+    valid_pair = pm * tm
 
-        U_list.append(U)                                          # 每个样本 (nout,K)
+    big = cost.new_full(cost.shape, 1e6)
+    cost = torch.where(valid_pair > 0.5, cost, big)
+    cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
 
-    # 堆成批量：先 (N, nout, K)，再展平成 (N, D)
-    U_target = torch.stack(U_list, dim=0)                         # (N, nout, K)
-    U_target_flat = U_target.permute(0, 2, 1).reshape(len(parsed), -1)  # (N, K*nout)
-
-    # -------------------------------
-    # 计算特征 X：根据模式不同
-    # -------------------------------
-    with torch.no_grad():
-        if args.mode == "lhf":      # 如果修LF后的输出, 则网络输出低保真
-            outL = model.forward_low(H, M, E, C)
-            X = model.flatten_u(
-                outL["u_alpha"], outL["u_omega"], outL["u_rho"],
-                outL["u_sin_theta"], outL["u_cos_theta"],
-                outL.get("u_pres", None) # get安全取出u_pres，如果不存在就返回None
-            )   # (N, D)
+    assign_rows, assign_cols, m_eff_list = [], [], []
+    for b in range(B):
+        cb = cost[b]       # (K_pred, K_tgt)
+        row_ind, col_ind = linear_sum_assignment(cb)    # 选中的行索引和列索引，计算得到cost最小
+        # 过滤掉 big 惩罚的无效配对
+        keep = (cb[row_ind, col_ind] < 1e5)
+        if keep.any():  # keep.any()表示这个布尔数组中是否存在至少一个True，
+            r = row_ind[keep]     # 布尔索引也是numpy和pytorch的一个核心特性，True时取出，False时舍弃
+            c = col_ind[keep]
+            assign_rows.append(torch.from_numpy(r).to(device))
+            assign_cols.append(torch.from_numpy(c).to(device))
+            m_eff_list.append(int(len(c)))
         else:
-            model.enable_online_fix = False     # 关闭在线快修，获取原始输出
-            outL = model.forward_low(H, M, E, C)
-            outH = model.forward_high(H, M, E, C, outL)
-            X = model.flatten_u(
-                outH["u_alpha"], outH["u_omega"], outH["u_rho"],
-                outH["u_sin_theta"], outH["u_cos_theta"],
-                outH.get("u_pres", None)
-            )
+            assign_rows.append(torch.empty(0, device=device, dtype=torch.long))
+            assign_cols.append(torch.empty(0, device=device, dtype=torch.long))
+            m_eff_list.append(0)
 
-    # -------------------------------
-    # 执行岭回归
-    # -------------------------------
-    if args.mode == "lhf":
-        # ===== 重标定 LHF =====
-        model.ridge_recalibrate_linear(X, U_target_flat, reg=args.lambda_ridge)     # 岭回归直接修改 LHF 的线性层
+    return assign_rows, assign_cols, m_eff_list
 
-    elif args.mode == "bias":
-        # ===== 偏置快修 =====
-        delta_vec = (U_target_flat - X).sum(dim=0) / (N + args.lambda_ridge)
+
+
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--ckpt", type=str, required=True)
+ap.add_argument("--calib_csv", type=str, required=True)
+ap.add_argument("--save_ckpt", type=str, default="")
+ap.add_argument("--lambda_ridge", type=float, default=1e-2)
+ap.add_argument("--mode", type=str,
+                choices=["lhf", "bias", "affine"],
+                default="lhf",
+                help="lhf: 重标定 LHF | bias: 偏置修正 | affine: 仿射修正")
+args = ap.parse_args()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+cfg = Config()
+K = cfg.K_max
+nout = 6
+D = K * nout
+
+# --------------------------------------------------------
+# 加载模型
+# --------------------------------------------------------
+model = MFDNN(cfg).to(device)
+ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
+state = ckpt.get("model_state_dict", ckpt)
+model.load_state_dict(state, strict=False)
+model.eval()
+
+
+# --------------------------------------------------------
+# CSV 数据
+# --------------------------------------------------------
+rows_float = []
+with open(args.calib_csv, "r", encoding="utf-8-sig") as f:
+    reader = csv.reader(f)
+    for row in reader:
+        cleaned = [float(x.strip().lstrip("\ufeff"))
+                    for x in row if x.strip()]
+        if cleaned:
+            rows_float.append(cleaned)
+
+parsed, stats = parse_rows_to_struct(rows_float)
+N = len(parsed)
+if N == 0:
+    raise RuntimeError("校准 CSV 为空！")
+
+# --------------------------------------------------------
+# 载入 normalizer
+# --------------------------------------------------------
+in_norm_path = Path(args.ckpt).with_name("Normalizer_Input_Sim.pth")
+in_norm = Normalizer.load(in_norm_path)
+if args.mode == "lhf":
+    out_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Sim.pth")
+else:
+    out_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Real_Fold0.pth")
+out_norm = Normalizer.load(out_norm_path)
+
+
+# --------------------------------------------------------
+# 构建批量输入  (H,M,Exc,Ch)
+# --------------------------------------------------------
+H = torch.tensor([p.H for p in parsed], dtype=torch.float32, device=device).unsqueeze(-1)
+M = torch.tensor([p.M for p in parsed], dtype=torch.float32, device=device).unsqueeze(-1)
+E = torch.tensor([p.exc_id for p in parsed], dtype=torch.long, device=device)
+Cc = torch.tensor([p.ch_id for p in parsed], dtype=torch.long, device=device)
+
+# 输入归一化
+H = (H - in_norm.mean[0]) / in_norm.std[0]
+M = (M - in_norm.mean[1]) / in_norm.std[1]
+
+
+# --------------------------------------------------------
+# 1) 特征输入网络，构造网络输出
+# --------------------------------------------------------
+with torch.no_grad():
+    outL = model.forward_low(H, M, E, Cc)
+u_sin_theta = outL["u_sin_theta"]  # (N,K)
+u_cos_theta = outL["u_cos_theta"]  # (N,K)
+r = torch.sqrt(u_sin_theta**2 + u_cos_theta**2)  # (N,K) 拿到u空间的留数模长，真实物理参数反推回u空间时用
+# 真实数据输入特征后得到网络输出与to_physical空间后的参数
+U_low = torch.stack([outL["u_alpha"], outL["u_omega"], outL["u_rho"], outL["u_sin_theta"], outL["u_cos_theta"], outL["u_pres"]], dim=-1)        # (N,K,nout)
+Pred_low = torch.stack([outL["alpha"], outL["omega"], outL["rho"], outL["sin_theta"], outL["cos_theta"]], dim=-1)   # (N,K,5)
+# 对网络输出的物理参数做归一化
+PredN_low = normlizer(Pred_low, out_norm.mean, out_norm.std)
+
+
+# --------------------------------------------------------
+# 2) 标签反推回 u空间，准备岭回归数据
+# --------------------------------------------------------
+U_target_list = []
+target_list = []
+for i, p in enumerate(parsed):# 每行真实数据，分别拿到所有物理参数
+    alpha = torch.from_numpy(p.alpha.copy()).to(device)   # (K,)
+    omega = torch.from_numpy(p.omega.copy()).to(device)   # (K,)
+    rho   = torch.from_numpy(p.rho.copy()).to(device)     # (K,)
+    sin_t = torch.from_numpy(p.sin_theta.copy()).to(device)  # (K,)
+    cos_t = torch.from_numpy(p.cos_theta.copy()).to(device)  # (K,)
+    mask  = torch.from_numpy(p.mask.copy()).to(device)    # (K,)
+
+    # 将真实数据的物理参数反推回 u-space，岭回归备用
+    u_alpha, u_omega, u_rho, u_sin, u_cos, u_pres = invert_to_u_space(
+        alpha, omega, rho, sin_t, cos_t, mask, r[i, :]
+    )
+
+    U = torch.stack([u_alpha, u_omega, u_rho, u_sin, u_cos, u_pres], dim=-1)
+    T = torch.stack([alpha, omega, rho, sin_t, cos_t, mask], dim=-1)  # (K,5)
+    U_target_list.append(U)   # (K,nout)
+    target_list.append(T)     # (K,5)
+
+U_target = torch.stack(U_target_list, dim=0)   # (N,K,nout) 真实数据反推回u空间，包括mask
+target = torch.stack(target_list, dim=0)     # (N,K,5) 真实数据物理参数
+targetN = normlizer(target, out_norm.mean, out_norm.std)  # (N,5,K) 真实数据物理参数归一化
+
+
+# --------------------------------------------------------
+# 3) 对每个样本做训练同款匈牙利匹配，在物理空间对齐槽位
+# --------------------------------------------------------
+rows, cols, mlist = hungarian_match(PredN_low, targetN)
+
+
+# --------------------------------------------------------
+# 4) 根据模式执行校准（最关键部分）
+# --------------------------------------------------------
+
+# ========= 准备岭回归数据：用匈牙利匹配结果对齐 u-space =========
+
+X_list = []   # u_pred
+Y_list = []   # u_target
+
+for b in range(N):
+    rb = rows[b]   # 预测槽位
+    cb = cols[b]   # 真实槽位
+
+    if rb.numel() == 0:
+        continue
+
+    # u_pred 取自 U_low（LHF 输出的 u-space）
+    up = U_low[b, rb, :]      # (m_eff, nout)
+
+    # u_target 取自 U_target（真实反推回 u-space）
+    ut = U_target[b, cb, :]   # (m_eff, nout)
+
+    X_list.append(up)
+    Y_list.append(ut)
+
+if len(X_list) == 0:
+    raise RuntimeError("没有任何有效匹配，无法进行岭回归！")
+
+X_u = torch.cat(X_list, dim=0)   # (Nt, nout)  预测 u
+Y_u = torch.cat(Y_list, dim=0)   # (Nt, nout)  真实 u
+
+
+# ========= 根据模式重新计算  =========
+
+if args.mode == "lhf":
+    # ------------------------------------------
+    # LHF：对 slot-wise 线性层进行独立岭回归
+    # ------------------------------------------
+    # 注意：模型里 LHF 的线性层就是每个槽位的仿射变换，
+    #       ridge_recalibrate_linear 内部要求格式 (N,K,nout)
+    #       所以我们需要把 X_u 和 Y_u 再按槽位方式整理成 (K,nout)
+    # ------------------------------------------
+
+    # 建立 (K, nout) 的容器
+    X_slot = [[] for _ in range(K)]
+    Y_slot = [[] for _ in range(K)]
+
+    # 重新按槽位分配
+    idx_total = 0
+    for b in range(N):
+        rb = rows[b]
+        cb = cols[b]
+        for j in range(rb.numel()):
+            slot_pred = rb[j].item()
+            X_slot[slot_pred].append(X_u[idx_total])
+            Y_slot[slot_pred].append(Y_u[idx_total])
+            idx_total += 1
+
+    # 转成矩阵形式
+    X_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
+              for v in X_slot]
+    Y_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
+              for v in Y_slot]
+
+    # 构成 (K,nout) 的目标结构
+    U_pred_slot = torch.zeros(K, nout, device=device)
+    U_tgt_slot  = torch.zeros(K, nout, device=device)
+
+    for k in range(K):
+        if X_slot[k].size(0) > 0:
+            # 均值作为校准值
+            U_pred_slot[k] = X_slot[k].mean(dim=0)
+            U_tgt_slot[k]  = Y_slot[k].mean(dim=0)
+
+    # 调用模型内部提供的 LHF 重标定函数
+    model.ridge_recalibrate_linear(
+        U_pred_slot.unsqueeze(0),   # (1,K,nout)
+        U_tgt_slot.unsqueeze(0),    # (1,K,nout)
+        reg=args.lambda_ridge
+    )
+
+    print("[OK] LHF 参数已使用岭回归重新标定。")
+
+else:
+    # ------------------------------------------
+    # bias | affine : 在线 quick-fix
+    # ------------------------------------------
+
+    # (N,D)
+    model.enable_online_fix = False
+    with torch.no_grad():
+        outH = model.forward_high(H, M, E, Cc, outL)
+
+    X_flat = model.flatten_u(
+        outH["u_alpha"], outH["u_omega"], outH["u_rho"],
+        outH["u_sin_theta"], outH["u_cos_theta"],
+        outH.get("u_pres", None)
+    )   # shape = (N, D)= (N, K*nout)
+
+    # 同样 flatten target u
+    Y_flat = model.flatten_u(
+        U_target[:,:,0], U_target[:,:,1], U_target[:,:,2],
+        U_target[:,:,3], U_target[:,:,4], U_target[:,:,5]
+    )    # (N, D)
+
+    if args.mode == "bias":
+        # ---------- 偏置快修 ----------
+        delta_vec = (Y_flat - X_flat).mean(dim=0)
         delta = delta_vec.view(1, K, nout)
         model.quick_fix_biasgain({"delta": delta})
         model.enable_online_fix = True
+        print("[OK] 已应用偏置快修。")
 
     elif args.mode == "affine":
-        # ===== 仿射快修 =====
-        a = torch.zeros(D, device=device)
-        b = torch.zeros(D, device=device)
+        # ---------- 仿射快修 ----------
+        D_total = K * nout
+        a = torch.zeros(D_total, device=device)
+        b = torch.zeros(D_total, device=device)
         lam = args.lambda_ridge
 
-        for d in range(D):
-            z = X[:, d]
-            y = U_target_flat[:, d]
+        for d in range(D_total):
+            z = X_flat[:, d]
+            y = Y_flat[:, d]
             Xm = torch.stack([z, torch.ones_like(z)], dim=1)  # (N,2)
             G = Xm.T @ Xm
             Lambda = torch.zeros_like(G)
@@ -198,46 +360,15 @@ def main():
             "b": b.view(1, K, nout)
         })
         model.enable_online_fix = True
-
-    # -------------------------------
-    # 保存 ckpt
-    # -------------------------------
-    base = Path(args.ckpt).with_suffix("")
-    suffix = {"lhf": "_lhf", "bias": "_biasfix", "affine": "_affinefix"}[args.mode]
-    save_path = args.save_ckpt or str(base) + suffix + ".pth"
-
-    torch.save({"model_state_dict": model.state_dict()}, save_path)
-    print(f"[OK] 在线标定完成 mode={args.mode}, 保存到: {save_path}")
+        print("[OK] 已应用仿射快修。")
 
 
-if __name__ == "__main__":
-    main()
+# --------------------------------------------------------
+# 5) 保存模型
+# --------------------------------------------------------
+base = Path(args.ckpt).with_suffix("")
+suffix = {"lhf": "_lhf", "bias": "_biasfix", "affine": "_affinefix"}[args.mode]
+save_path = args.save_ckpt or str(base) + suffix + ".pth"
 
-
-"""
-重标定 LHF
-python -m surrogate_model.cli.online_ridge \
-    --ckpt "your_checkpoint.pth" \
-    --calib_csv "./surrogate_model/data/your_online_data.csv" \
-    --mode lhf \
-    --lambda_ridge 1e-2
-输出文件your_checkpoint_lhf.pth
-"""
-"""
-偏置快修
-python -m surrogate_model.cli.online_ridge \
-    --ckpt "your_checkpoint.pth" \
-    --calib_csv "./surrogate_model/data/your_online_data.csv" \
-    --mode bias \
-    --lambda_ridge 1e-2
-输出文件your_checkpoint_biasfix.pth
-"""
-"""
-仿射快修
-python -m surrogate_model.cli.online_ridge \
-    --ckpt "your_checkpoint.pth" \
-    --calib_csv "./surrogate_model/data/your_online_data.csv" \
-    --mode affine \
-    --lambda_ridge 1e-2
-输出文件your_checkpoint_affinefix.pth
-"""
+torch.save({"model_state_dict": model.state_dict()}, save_path)
+print(f"[OK] 在线标定完成（mode={args.mode}），模型已保存到：{save_path}")
