@@ -306,6 +306,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             print(f"[Fold {fold+1}] S1 skipped (reuse fold0).", flush=True)
 
     # ============ Stage 2 ============ #
+    crit_s1.pres_w = 0.0 # 存在头完全以真实数据为准
+    crit_s1.card_w = 0.0
     for p in model_core.lin.parameters(): p.requires_grad_(True)
     for p in model_core.adaptation.parameters(): p.requires_grad_(True)
     opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam)
