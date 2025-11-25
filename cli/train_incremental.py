@@ -310,9 +310,18 @@ if __name__ == "__main__":
 
 
 """
+GPU 环境下运行示例：
 torchrun --standalone --nproc_per_node=1 -m surrogate_model.cli.train_incremental \
   --base_ckpt "surrogate_model/outputs_pzk/checkpoint_stage2_fold0_earlystop_epoch1146.pth" \
   --real_new_txt "surrogate_model/data/new_real.txt" \
   --replay_txt   "surrogate_model/data/real_dataset_oe.txt" \
   --epochs 2000 --beta_kd 0.2 --gamma_replay 0.2 --lr 1e-3
+"""
+"""
+CPU 环境下运行示例：
+python -m surrogate_model.cli.train_incremental \
+    --base_ckpt "surrogate_model/outputs_pzk/checkpoint_stage2_fold0_earlystop_epoch1146.pth" \
+    --real_new_txt "surrogate_model/data/new_real.txt" \
+    --replay_txt   "surrogate_model/data/real_dataset_oe.txt" \
+    --epochs 2000 --beta_kd 0.2 --gamma_replay 0.2 --lr 1e-3
 """
