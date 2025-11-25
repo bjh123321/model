@@ -1,0 +1,66 @@
+[33m079837d[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mopt_dev_full_opt[m[33m, [m[1;31morigin/opt_dev_full_opt[m[33m)[m HEAD@{0}: commit: d
+[33me97f6d5[m HEAD@{1}: reset: moving to origin/opt_dev_full_opt
+[33me97f6d5[m HEAD@{2}: pull: Fast-forward
+[33m0840df4[m HEAD@{3}: commit: d
+[33m38a123e[m HEAD@{4}: pull: Fast-forward
+[33mcd15690[m HEAD@{5}: commit: d
+[33m192538b[m HEAD@{6}: pull: Fast-forward
+[33mbb8205f[m HEAD@{7}: commit: d
+[33m23f98ec[m HEAD@{8}: commit: d
+[33mde1fab4[m HEAD@{9}: pull (finish): returning to refs/heads/opt_dev_full_opt
+[33mde1fab4[m HEAD@{10}: pull (pick): d
+[33mc3a4312[m HEAD@{11}: pull (start): checkout c3a4312c88b8eb6aca0c972c04e137f902421768
+[33m9a25a94[m HEAD@{12}: commit: d
+[33m74680ac[m HEAD@{13}: commit: 自适应loss权重
+[33m9c47280[m HEAD@{14}: commit: model_test修改
+[33m677b2e4[m HEAD@{15}: checkout: moving from opt_dev_full to opt_dev_full_opt
+[33m27fe6c2[m[33m ([m[1;31morigin/opt_dev_full[m[33m, [m[1;32mopt_dev_full[m[33m)[m HEAD@{16}: commit: model_test修改
+[33md213581[m HEAD@{17}: checkout: moving from opt_dev_full_opt to opt_dev_full
+[33m677b2e4[m HEAD@{18}: commit: model_test修改
+[33m26e613d[m HEAD@{19}: pull (finish): returning to refs/heads/opt_dev_full_opt
+[33m26e613d[m HEAD@{20}: pull (pick): model_test修改
+[33m238eaba[m HEAD@{21}: pull (start): checkout 238eabad35212d873b17aa2d419effb5bac4ec7d
+[33m1b324ee[m HEAD@{22}: commit: model_test修改
+[33mdc4f2bb[m HEAD@{23}: checkout: moving from opt_dev_full to opt_dev_full_opt
+[33md213581[m HEAD@{24}: commit: model_test修改
+[33m4a5da03[m HEAD@{25}: checkout: moving from opt_dev_full_opt to opt_dev_full
+[33mdc4f2bb[m HEAD@{26}: commit: model_test修改
+[33m55a9b7a[m HEAD@{27}: checkout: moving from opt_dev_full to opt_dev_full_opt
+[33m4a5da03[m HEAD@{28}: commit: model_test修改
+[33m112e2a8[m HEAD@{29}: checkout: moving from opt_dev_full_opt to opt_dev_full
+[33m55a9b7a[m HEAD@{30}: checkout: moving from opt_dev_full_opt to opt_dev_full_opt
+[33m55a9b7a[m HEAD@{31}: pull (finish): returning to refs/heads/opt_dev_full_opt
+[33m55a9b7a[m HEAD@{32}: pull (pick): model_test修改
+[33m03c4893[m HEAD@{33}: pull (start): checkout 03c489349bc22ab95cc26b42d80e2700883db379
+[33m710e737[m HEAD@{34}: commit: model_test修改
+[33mec918a0[m HEAD@{35}: commit: 更新非线性高保真头的调制头使用判断
+[33m112e2a8[m HEAD@{36}: checkout: moving from opt_dev_full to opt_dev_full_opt
+[33m112e2a8[m HEAD@{37}: checkout: moving from opt_dev to opt_dev_full
+[33m483bc7b[m[33m ([m[1;31morigin/opt_dev[m[33m, [m[1;32mopt_dev[m[33m)[m HEAD@{38}: commit: 1
+[33m8d42dbd[m HEAD@{39}: checkout: moving from opt_dev_full to opt_dev
+[33m112e2a8[m HEAD@{40}: commit: 1
+[33m9f673eb[m HEAD@{41}: commit: 更新岭回归
+[33mee40255[m HEAD@{42}: commit: update
+[33m6653edc[m HEAD@{43}: commit: ?
+[33m2788730[m HEAD@{44}: commit: ??
+[33mfe52333[m HEAD@{45}: checkout: moving from opt_dev to opt_dev_full
+[33m8d42dbd[m HEAD@{46}: checkout: moving from dev to opt_dev
+[33m0277a8f[m[33m ([m[1;31morigin/dev[m[33m, [m[1;32mdev[m[33m)[m HEAD@{47}: checkout: moving from opt_dev_full to dev
+[33mfe52333[m HEAD@{48}: commit: ??
+[33m7989f3d[m HEAD@{49}: pull: Fast-forward
+[33m42a7467[m HEAD@{50}: pull: Fast-forward
+[33m143e99f[m HEAD@{51}: pull (finish): returning to refs/heads/opt_dev_full
+[33m143e99f[m HEAD@{52}: pull (pick): test
+[33mf4dfaea[m HEAD@{53}: pull (start): checkout f4dfaea367610df880f922da2d26e3f322544d47
+[33mcee4120[m HEAD@{54}: commit: test
+[33me1ccf7c[m HEAD@{55}: commit: 更新部署和修正模块
+[33m81213b5[m HEAD@{56}: commit: 更新部署和修正模块
+[33ma53b9e6[m HEAD@{57}: commit: 更新部署和修正模块
+[33m8d42dbd[m HEAD@{58}: checkout: moving from opt_dev to opt_dev_full
+[33m8d42dbd[m HEAD@{59}: reset: moving to HEAD
+[33m8d42dbd[m HEAD@{60}: commit: 无
+[33m8f81417[m HEAD@{61}: checkout: moving from main to opt_dev
+[33m816ad87[m[33m ([m[1;32mmain[m[33m)[m HEAD@{62}: checkout: moving from opt_dev to main
+[33m8f81417[m HEAD@{63}: pull (finish): returning to refs/heads/opt_dev
+[33m8f81417[m HEAD@{64}: pull (pick): 无
+[33md2d7230[m HEAD@{65}: pull (start): checkout d2d7230ed15921b08e42e65defc49770795eba4c
