@@ -425,37 +425,57 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 outL_s, _ = model(H_s, M_s, e_s, c_s)
                 loss_sim = crit_s1(outL_s, yNs, mask_s)
 
-            # ---------- 计算两项梯度并做 PCGrad 合并 ----------
+            # ---------- 计算两项梯度并做 PCGrad 合并（只在最后 unscale_ 一次） ----------
             if use_cuda:
-                # 任务1：sim
+                # ---------- 计算两项梯度并做 PCGrad（在“未缩放 FP32”空间），再缩放回去 ----------
+                if not torch.isfinite(loss_real):
+                    print("[WARN] loss_real is not finite. Skip step.", flush=True)
+                    continue
+
+                # 1) 逐任务 backward（保持缩放），先取“缩放后的梯度副本”
                 with _maybe_no_sync(model_core):
                     scaler2.scale(w_sim * loss_sim).backward(retain_graph=True)
-                    scaler2.unscale_(opt2)
-                g_sim = _clone_grads(params)
+                g_sim_scaled = _clone_grads(params)
 
-                # 任务2：real
                 _zero_grads(params)
                 with _maybe_no_sync(model_core):
                     scaler2.scale(w_real * loss_real).backward(retain_graph=True)
-                    scaler2.unscale_(opt2)
-                g_real = _clone_grads(params)
+                g_real_scaled = _clone_grads(params)
 
-                # PCGrad 合并 + （DDP）全局规约
-                g_comb = _pcgrad_two_tasks(g_sim, g_real)
-                _set_grads(params, g_comb)
+                # 2) 获取当前缩放因子，并把两份梯度还原到“未缩放 FP32”
+                cur_scale = scaler2.get_scale()
+                g_sim  = [None if g is None else (g.float() / cur_scale) for g in g_sim_scaled]
+                g_real = [None if g is None else (g.float() / cur_scale) for g in g_real_scaled]
+
+                # 3) 在未缩放空间做 PCGrad
+                g_comb = _pcgrad_two_tasks(g_sim, g_real)   # 现在是 FP32 未缩放梯度
+
+                # 4) 手动全局范数裁剪（未缩放空间）
+                max_norm = 1.0
+                total_sq = 0.0
+                for g in g_comb:
+                    if g is not None: total_sq += g.pow(2).sum()
+                total_norm = total_sq.sqrt()
+                clip_coef = (max_norm / (total_norm + 1e-12)).clamp(max=1.0)
+                if clip_coef < 1.0:
+                    for i, g in enumerate(g_comb):
+                        if g is not None: g_comb[i] = g * clip_coef
+
+                # 5) 乘回缩放因子，写回 .grad
+                g_comb_scaled = [None if g is None else (g * cur_scale) for g in g_comb]
+                _set_grads(params, g_comb_scaled)
+
+                # 6) （DDP）规约，然后直接 scaler.step/update（不调用 unscale_）
                 _allreduce_grads_inplace(params)
+                scaler2.step(opt2)
+                scaler2.update()
 
-                # clip + 更新
-                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
-                scaler2.step(opt2); scaler2.update()
             else:
-                # CPU/无 AMP 分支
-                # 任务1：sim
+                # CPU/无 AMP 分支保持原逻辑即可
                 with _maybe_no_sync(model_core):
                     (w_sim * loss_sim).backward(retain_graph=True)
                 g_sim = _clone_grads(params)
 
-                # 任务2：real
                 _zero_grads(params)
                 with _maybe_no_sync(model_core):
                     (w_real * loss_real).backward(retain_graph=True)
@@ -464,9 +484,9 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 g_comb = _pcgrad_two_tasks(g_sim, g_real)
                 _set_grads(params, g_comb)
                 _allreduce_grads_inplace(params)
-
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
                 opt2.step()
+
 
             bs_r = H_r.size(0); bs_s = H_s.size(0)
             sum_real += loss_real.item() * bs_r; cnt_real += bs_r
