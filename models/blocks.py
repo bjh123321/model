@@ -134,44 +134,51 @@ class LowFidelityHead(nn.Module):
         }
 
 
+class LinearHFHead(nn.Module):
+    """
+    LHF = 槽内特征混合(5×5，针对 α,ω,ρ,sinθ,cosθ) + pres 独立 1×1 仿射
+    （槽位混合如需以后加，再在外面接 K×K 即可）
+    """
+    def __init__(self, K_max: int):
+        super().__init__()
+        self.K_max = K_max
+        # 物理 5 维
+        self.aff_phys = nn.Linear(5, 5, bias=True)
+        # pres 独立 1×1（在线标定合成进这里）
+        self.aff_pres = nn.Linear(1, 1, bias=True)
+        with torch.no_grad():
+            nn.init.eye_(self.aff_phys.weight)
+            nn.init.zeros_(self.aff_phys.bias)
+            self.aff_pres.weight.fill_(1.0)
+            self.aff_pres.bias.zero_()
+
+    def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres):
+        # 物理 5 维：对最后一维做 5×5
+        U5 = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)  # (B,K,5)
+        B, K, _ = U5.shape
+        Y5 = self.aff_phys(U5.view(-1, 5)).view(B, K, 5)
+        # pres：1×1 仿射
+        pres = self.aff_pres(u_pres.unsqueeze(-1)).squeeze(-1)                          # (B,K)
+        return Y5[...,0], Y5[...,1], Y5[...,2], Y5[...,3], Y5[...,4], pres
+
+
 
 # class LinearHFHead(nn.Module):
 #     def __init__(self, K_max: int):
 #         super().__init__()
-#         self.K_max = K_max
-#         self.nout = 6
-
-#         # 一个 6×6（或 5×5）的线性变换，对每个槽位的参数向量做仿射变换
-#         self.linear = nn.Linear(self.nout, self.nout)
+#         nout = 6
+#         self.linear = nn.Linear(K_max * nout, K_max * nout)
 #         with torch.no_grad():
-#             nn.init.eye_(self.linear.weight)   # 精确恒等
+#             nn.init.eye_(self.linear.weight)              # 近似恒等
 #             nn.init.zeros_(self.linear.bias)
 
 #     def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
-#         U = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B,K,6)
-#         B, K, nout = U.shape  # nout=6
-#         # 在最后一维上做线性映射：先拉成 (B*K, nout)，linear 后再拉回 (B,K,nout)
-#         Y = self.linear(U.view(-1, nout)).view(B, K, nout)
-
-#         return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
-
-
-class LinearHFHead(nn.Module):
-    def __init__(self, K_max: int):
-        super().__init__()
-        nout = 6
-        self.linear = nn.Linear(K_max * nout, K_max * nout)
-        with torch.no_grad():
-            nn.init.eye_(self.linear.weight)              # 近似恒等
-            nn.init.zeros_(self.linear.bias)
-
-    def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
-        u_vec = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B, K*nout)
-        y_vec = self.linear(u_vec)  # (B, K*nout)
-        K = u_alpha.size(1); nout = 6
-        Y = y_vec.view(-1, K, nout) # (B,K,nout)
+#         u_vec = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B, K*nout)
+#         y_vec = self.linear(u_vec)  # (B, K*nout)
+#         K = u_alpha.size(1); nout = 6
+#         Y = y_vec.view(-1, K, nout) # (B,K,nout)
         
-        return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
+#         return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
 
 
 
@@ -372,34 +379,55 @@ class MFDNN(nn.Module):
     @torch.no_grad()
     def ridge_recalibrate_linear(self, U_low: torch.Tensor, U_target: torch.Tensor, reg: float = 1e-2):
         """
-        U_low:    (N, K, nout)   -- LF 输出的 u（网络空间，未物理映射）
-        U_target: (N, K, nout)   -- 真实标签反算回 u 空间之后的值
+        用岭回归“共享 5×5 + 偏置”重标定 LHF（只对前5维; pres 交由 calibrate_pres_platt）。
+        U_low:    (N, K, 6)  -- LHF 输入侧的 u（网络空间）
+        U_target: (N, K, 6)  -- 真实标签反推到 u 空间后的目标
         """
-        device = self.lin.linear.weight.device
+        device = self.lin.aff_phys.weight.device
         U_low    = U_low.to(device)
         U_target = U_target.to(device)
 
         N, K, nout = U_low.shape
-        assert U_target.shape == (N, K, nout)
+        assert nout == 6 and U_target.shape == (N, K, 6)
 
-        # 所有 slot 展开成 (N*K, nout)
-        X = U_low.reshape(N*K, nout)       # 输入
-        Y = U_target.reshape(N*K, nout)    # 目标
+        # 只对前5维做岭回归
+        X = U_low[...,  :5].reshape(N*K, 5)    # (NK,5)
+        Y = U_target[..., :5].reshape(N*K, 5)  # (NK,5)
 
-        ones = torch.ones(N*K, 1, device=device)
-        X_aug = torch.cat([X, ones], dim=1)    # (N*K, nout+1)
+        ones = torch.ones(N*K, 1, device=device, dtype=X.dtype)
+        X_aug = torch.cat([X, ones], dim=1)    # (NK,6) = [X, 1]
+        G = X_aug.T @ X_aug                    # (6,6)
 
-        G = X_aug.T @ X_aug                    # (nout+1, nout+1)
         Lambda = torch.zeros_like(G)
-        Lambda[:nout, :nout].fill_(reg)
+        Lambda[:5, :5].fill_(reg)              # 只正则权重，不正则偏置
 
-        W_aug = torch.linalg.solve(G + Lambda, X_aug.T @ Y)  # (nout+1, nout)
+        W_aug = torch.linalg.solve(G + Lambda, X_aug.T @ Y)  # (6,5)
+        W = W_aug[:5, :].T.contiguous()       # (5,5) -> nn.Linear 需要 out×in
+        b = W_aug[5, :].contiguous()          # (5,)
 
-        W = W_aug[:nout, :]     # (nout, nout)
-        b = W_aug[nout, :]      # (nout,)
+        # 写回 LHF（物理 5 维）
+        self.lin.aff_phys.weight.copy_(W)
+        self.lin.aff_phys.bias.copy_(b)
+        # pres（第6维）保持现状，后续由 calibrate_pres_platt 合成
 
-        self.lin.linear.weight.copy_(W.T.contiguous())
-        self.lin.linear.bias.copy_(b.contiguous())
+
+    @torch.no_grad()
+    def calibrate_pres_platt(self, a: torch.Tensor, b: torch.Tensor):
+        """
+        将 pres 的 logit 做 z' = a*z + b，直接折算进 LHF 的 aff_pres（1×1 仿射）。
+        a,b: 标量（tensor 或 float）
+        """
+        if not torch.is_tensor(a):
+            a = torch.tensor(a, dtype=self.lin.aff_pres.weight.dtype, device=self.lin.aff_pres.weight.device)
+        if not torch.is_tensor(b):
+            b = torch.tensor(b, dtype=self.lin.aff_pres.bias.dtype, device=self.lin.aff_pres.bias.device)
+
+        # w_new = a * w_old,  b_new = a * b_old + b
+        w_old = self.lin.aff_pres.weight.detach().clone()
+        b_old = self.lin.aff_pres.bias.detach().clone()
+        self.lin.aff_pres.weight.copy_(a * w_old)
+        self.lin.aff_pres.bias.copy_(a * b_old + b)
+
 
 
     # ===== 辅助：把 u 分量展平为 (B, D) =====

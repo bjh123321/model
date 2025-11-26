@@ -258,55 +258,52 @@ Y_u = torch.cat(Y_list, dim=0)   # (Nt, nout)  真实 u
 
 
 # ========= 根据模式重新计算  =========
-
 if args.mode == "lhf":
-    # ------------------------------------------
-    # LHF：对 slot-wise 线性层进行独立岭回归
-    # ------------------------------------------
-    # 注意：模型里 LHF 的线性层就是每个槽位的仿射变换，
-    #       ridge_recalibrate_linear 内部要求格式 (N,K,nout)
-    #       所以我们需要把 X_u 和 Y_u 再按槽位方式整理成 (K,nout)
-    # ------------------------------------------
+    # X_list, Y_list: 已按匈牙利匹配对齐的一堆 (m_eff, 6) 块
+    if len(X_list) == 0:
+        raise RuntimeError("没有任何有效匹配，无法进行 LHF 在线标定。")
 
-    # 建立 (K, nout) 的容器
-    X_slot = [[] for _ in range(K)]
-    Y_slot = [[] for _ in range(K)]
+    # 拼成 (N, K, 6) 的“伪 batch”（K 不一定等于 cfg.K_max，这里只要 (N*K,6) 一致即可）
+    X_u = torch.cat(X_list, dim=0)   # (T,6)  预测侧 u
+    Y_u = torch.cat(Y_list, dim=0)   # (T,6)  目标侧 u（由真实反推）
 
-    # 重新按槽位分配
-    idx_total = 0
-    for b in range(N):
-        rb = rows[b]
-        cb = cols[b]
-        for j in range(rb.numel()):
-            slot_pred = rb[j].item()
-            X_slot[slot_pred].append(X_u[idx_total])
-            Y_slot[slot_pred].append(Y_u[idx_total])
-            idx_total += 1
-
-    # 转成矩阵形式
-    X_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
-              for v in X_slot]
-    Y_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
-              for v in Y_slot]
-
-    # 构成 (K,nout) 的目标结构
-    U_pred_slot = torch.zeros(K, nout, device=device)
-    U_tgt_slot  = torch.zeros(K, nout, device=device)
-
-    for k in range(K):
-        if X_slot[k].size(0) > 0:
-            # 均值作为校准值
-            U_pred_slot[k] = X_slot[k].mean(dim=0)
-            U_tgt_slot[k]  = Y_slot[k].mean(dim=0)
-
-    # 调用模型内部提供的 LHF 重标定函数
+    # 1) 只对前5维做共享 5×5+偏置的岭回归（保持函数名不变）
     model.ridge_recalibrate_linear(
-        U_pred_slot.unsqueeze(0),   # (1,K,nout)
-        U_tgt_slot.unsqueeze(0),    # (1,K,nout)
+        U_low    = X_u.view(1, -1, 6),   # (1,T,6)
+        U_target = Y_u.view(1, -1, 6),   # (1,T,6)
         reg=args.lambda_ridge
     )
 
-    print("[OK] LHF 参数已使用岭回归重新标定。")
+    # 2) pres 的 Platt 标定：z' = a*z + b，p = sigmoid(z')
+    #   自变量：预测侧的 u_pres（可视作旧 logit）
+    #   标签：目标侧的 pres → 二值化为 {0,1}
+    z = X_u[:, 5].detach().clone()                # (T,)
+    y = (Y_u[:, 5] > 0).to(z.dtype)               # (T,)
+
+    # 若全 0 或全 1，跳过，给个平凡解
+    if (y.sum() == 0) or (y.sum() == y.numel()):
+        a = torch.tensor(1.0, device=z.device, dtype=z.dtype)
+        b = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+    else:
+        # 用一个小 Adam 做 Platt（你也可以换成 2×2 牛顿）
+        a = torch.zeros((), device=z.device, dtype=z.dtype).requires_grad_(True)
+        b = torch.zeros((), device=z.device, dtype=z.dtype).requires_grad_(True)
+        opt = torch.optim.Adam([a, b], lr=5e-2)
+        lam = args.lambda_ridge
+        for _ in range(200):
+            opt.zero_grad(set_to_none=True)
+            p = torch.sigmoid(a * z + b)
+            # BCE + L2 到 a，防过拟合；避免 log(0)
+            loss = -(y * torch.log(p + 1e-8) + (1 - y) * torch.log(1 - p + 1e-8)).mean() + 0.5 * lam * (a * a)
+            if not torch.isfinite(loss):
+                break
+            loss.backward()
+            opt.step()
+        a = a.detach(); b = b.detach()
+
+    model.calibrate_pres_platt(a, b)
+    print("[OK] LHF(5×5) 已岭回归，pres 已做 Platt 标定。")
+
 
 else:
     # ------------------------------------------
@@ -372,3 +369,12 @@ save_path = args.save_ckpt or str(base) + suffix + ".pth"
 
 torch.save({"model_state_dict": model.state_dict()}, save_path)
 print(f"[OK] 在线标定完成（mode={args.mode}），模型已保存到：{save_path}")
+
+
+"""
+python -m surrogate_model.cli.online_ridge \
+  --ckpt "surrogate_model/outputs_pzk/best_stage2_fold0.pth" \
+  --calib_csv "surrogate_model/data/new_real.csv" \
+  --mode lhf \
+  --lambda_ridge 1e-2
+"""
