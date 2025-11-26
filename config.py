@@ -41,6 +41,6 @@ class Config:
     use_hungarian_loss: bool = True
 
     # 存在头
-    presence_loss_weight: float = 0.1
+    presence_loss_weight: float = 0.2
     cardinality_loss_weight: float = 0.05
     presence_threshold: float = 0.5

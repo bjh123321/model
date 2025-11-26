@@ -157,9 +157,8 @@ class LowFidelityHead(nn.Module):
 
 
 class LinearHFHead(nn.Module):
-    def __init__(self, K_max: int, use_presence: bool):
+    def __init__(self, K_max: int):
         super().__init__()
-        self.use_presence = use_presence
         nout = 6
         self.linear = nn.Linear(K_max * nout, K_max * nout)
         with torch.no_grad():
