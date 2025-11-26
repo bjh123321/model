@@ -28,7 +28,7 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-real = True  # 是否使用真实响应网络
+real = False  # 是否使用真实响应网络
 # data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M1.90\1_H11_M1.90_方向舵对称_1-45Hz_幅值0.3.txt")
 data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.75.txt")
 # cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
@@ -38,7 +38,7 @@ checkpoint_dir = "outputs_pzk"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch100_lhf.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_earlystop_epoch1146.pth"
-checkpoint_file = "checkpoint_stage2_fold0_epoch2000.pth"
+checkpoint_file = "checkpoint_stage1_fold0_epoch2000.pth"
 
 
 H = 11          # 高度

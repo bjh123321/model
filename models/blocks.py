@@ -163,26 +163,6 @@ class LinearHFHead(nn.Module):
 
 
 
-# class LinearHFHead(nn.Module):
-#     def __init__(self, K_max: int):
-#         super().__init__()
-#         nout = 6
-#         self.linear = nn.Linear(K_max * nout, K_max * nout)
-#         with torch.no_grad():
-#             nn.init.eye_(self.linear.weight)              # 近似恒等
-#             nn.init.zeros_(self.linear.bias)
-
-#     def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres=None):
-#         u_vec = torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres], dim=-1)  # (B, K*nout)
-#         y_vec = self.linear(u_vec)  # (B, K*nout)
-#         K = u_alpha.size(1); nout = 6
-#         Y = y_vec.view(-1, K, nout) # (B,K,nout)
-        
-#         return Y[...,0],Y[...,1],Y[...,2],Y[...,3],Y[...,4],Y[...,5]
-
-
-
-
 class AdaptationHead(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -408,7 +388,6 @@ class MFDNN(nn.Module):
         # 写回 LHF（物理 5 维）
         self.lin.aff_phys.weight.copy_(W)
         self.lin.aff_phys.bias.copy_(b)
-        # pres（第6维）保持现状，后续由 calibrate_pres_platt 合成
 
 
     @torch.no_grad()

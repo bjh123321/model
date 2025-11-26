@@ -58,18 +58,17 @@ def normlizer(pred: torch.Tensor, mean, std):
     return pred_norm
 
 
+# [MOD BEGIN] use numpy with linear_sum_assignment，去掉对全局 device 的依赖
 def hungarian_match(
-    predN: torch.Tensor,   # (K,nout)
-    tgt: torch.Tensor,    # (K,nout)
+    predN: torch.Tensor,   # (N,K,5) after norm, 实际你传的是 (N,K,5) 或 (N,K,6) 取前5
+    tgt: torch.Tensor,     # (N,K,6)，其中第5列是 mask
     w_alpha=1.0, w_omega=1.0, w_rho=1.0,
     big=1e6
 ):
-
     PA, PO, PR, PS, PC = predN[:,:,0], predN[:,:,1], predN[:,:,2], predN[:,:,3], predN[:,:,4]
     TA, TO, TR, TS, TC, mask = tgt[:,:,0], tgt[:,:,1], tgt[:,:,2], tgt[:,:,3], tgt[:,:,4], tgt[:,:,5]
-    B = PA.size(0)
-    K = PA.size(1)
-    
+    B = PA.size(0); K = PA.size(1)
+
     dA = (PA.unsqueeze(2) - TA.unsqueeze(1))**2
     dO = (PO.unsqueeze(2) - TO.unsqueeze(1))**2
     dR = (PR.unsqueeze(2) - TR.unsqueeze(1))**2
@@ -81,30 +80,26 @@ def hungarian_match(
     tm = (mask > 0.5).to(cost.dtype).unsqueeze(1)
     valid_pair = pm * tm
 
-    big = cost.new_full(cost.shape, 1e6)
-    cost = torch.where(valid_pair > 0.5, cost, big)
-    cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
+    cost = torch.where(valid_pair > 0.5, cost, cost.new_full(cost.shape, big))
+    cost = torch.nan_to_num(cost, nan=big, posinf=big, neginf=big)
 
     assign_rows, assign_cols, m_eff_list = [], [], []
     for b in range(B):
-        cb = cost[b]       # (K_pred, K_tgt)
-        row_ind, col_ind = linear_sum_assignment(cb)    # 选中的行索引和列索引，计算得到cost最小
-        # 过滤掉 big 惩罚的无效配对
-        keep = (cb[row_ind, col_ind] < 1e5)
-        if keep.any():  # keep.any()表示这个布尔数组中是否存在至少一个True，
-            r = row_ind[keep]     # 布尔索引也是numpy和pytorch的一个核心特性，True时取出，False时舍弃
-            c = col_ind[keep]
-            assign_rows.append(torch.from_numpy(r).to(device))
-            assign_cols.append(torch.from_numpy(c).to(device))
-            m_eff_list.append(int(len(c)))
+        cb_np = cost[b].detach().cpu().numpy()   # <-- numpy
+        row_ind, col_ind = linear_sum_assignment(cb_np)
+        keep = (cb_np[row_ind, col_ind] < (big * 0.1))
+        if keep.any():
+            r = torch.from_numpy(row_ind[keep]).to(cost.device, dtype=torch.long)
+            c = torch.from_numpy(col_ind[keep]).to(cost.device, dtype=torch.long)
+            assign_rows.append(r)
+            assign_cols.append(c)
+            m_eff_list.append(int(keep.sum()))
         else:
-            assign_rows.append(torch.empty(0, device=device, dtype=torch.long))
-            assign_cols.append(torch.empty(0, device=device, dtype=torch.long))
+            assign_rows.append(torch.empty(0, device=cost.device, dtype=torch.long))
+            assign_cols.append(torch.empty(0, device=cost.device, dtype=torch.long))
             m_eff_list.append(0)
 
     return assign_rows, assign_cols, m_eff_list
-
-
 
 
 ap = argparse.ArgumentParser()
@@ -116,6 +111,8 @@ ap.add_argument("--mode", type=str,
                 choices=["lhf", "bias", "affine"],
                 default="lhf",
                 help="lhf: 重标定 LHF | bias: 偏置修正 | affine: 仿射修正")
+ap.add_argument("--ridge_reduce", type=str, choices=["slot", "mean"], default="mean",
+                help="LHF 岭回归的数据聚合方式：slot=逐行堆叠；mean=按槽位均值（保持旧逻辑）")
 args = ap.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -259,50 +256,87 @@ Y_u = torch.cat(Y_list, dim=0)   # (Nt, nout)  真实 u
 
 # ========= 根据模式重新计算  =========
 if args.mode == "lhf":
-    # X_list, Y_list: 已按匈牙利匹配对齐的一堆 (m_eff, 6) 块
-    if len(X_list) == 0:
-        raise RuntimeError("没有任何有效匹配，无法进行 LHF 在线标定。")
+    if args.ridge_reduce == "mean":
+        # ====== 保持你原来的“按槽位均值”逻辑 ======
+        # 建立 (K, nout) 的容器
+        X_slot = [[] for _ in range(K)]
+        Y_slot = [[] for _ in range(K)]
 
-    # 拼成 (N, K, 6) 的“伪 batch”（K 不一定等于 cfg.K_max，这里只要 (N*K,6) 一致即可）
-    X_u = torch.cat(X_list, dim=0)   # (T,6)  预测侧 u
-    Y_u = torch.cat(Y_list, dim=0)   # (T,6)  目标侧 u（由真实反推）
+        idx_total = 0
+        for b in range(N):
+            rb = rows[b]
+            for j in range(rb.numel()):
+                slot_pred = rb[j].item()
+                X_slot[slot_pred].append(X_u[idx_total])
+                Y_slot[slot_pred].append(Y_u[idx_total])
+                idx_total += 1
 
-    # 1) 只对前5维做共享 5×5+偏置的岭回归（保持函数名不变）
-    model.ridge_recalibrate_linear(
-        U_low    = X_u.view(1, -1, 6),   # (1,T,6)
-        U_target = Y_u.view(1, -1, 6),   # (1,T,6)
-        reg=args.lambda_ridge
-    )
+        # 转成矩阵形式
+        X_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
+                for v in X_slot]
+        Y_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
+                for v in Y_slot]
 
-    # 2) pres 的 Platt 标定：z' = a*z + b，p = sigmoid(z')
-    #   自变量：预测侧的 u_pres（可视作旧 logit）
-    #   标签：目标侧的 pres → 二值化为 {0,1}
-    z = X_u[:, 5].detach().clone()                # (T,)
-    y = (Y_u[:, 5] > 0).to(z.dtype)               # (T,)
 
-    # 若全 0 或全 1，跳过，给个平凡解
-    if (y.sum() == 0) or (y.sum() == y.numel()):
-        a = torch.tensor(1.0, device=z.device, dtype=z.dtype)
-        b = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+        # 构成 (K,6) 的目标结构（均值作为校准值）
+        U_pred_slot = torch.zeros(K, 6, device=device)
+        U_tgt_slot  = torch.zeros(K, 6, device=device)
+        cnt_slot    = torch.zeros(K, dtype=torch.long, device=device)
+
+        for k in range(K):
+            if X_slot[k].size(0) > 0:
+                U_pred_slot[k] = X_slot[k].mean(dim=0)
+                U_tgt_slot[k]  = Y_slot[k].mean(dim=0)
+                cnt_slot[k]    = X_slot[k].size(0)
+
+        # 岭回归：只对前5维（pres 留给 Platt）
+        model.ridge_recalibrate_linear(
+            U_pred_slot.unsqueeze(0),   # (1,K,6)
+            U_tgt_slot.unsqueeze(0),    # (1,K,6)
+            reg=args.lambda_ridge
+        )
+
     else:
-        # 用一个小 Adam 做 Platt（你也可以换成 2×2 牛顿）
-        a = torch.zeros((), device=z.device, dtype=z.dtype).requires_grad_(True)
-        b = torch.zeros((), device=z.device, dtype=z.dtype).requires_grad_(True)
+        # ====== slot：逐行堆叠（不分槽、信息更全） ======
+        model.ridge_recalibrate_linear(
+            U_low    = X_u.view(1, -1, 6),   # (1,T,6)
+            U_target = Y_u.view(1, -1, 6),   # (1,T,6)
+            reg      = args.lambda_ridge
+        )
+        # pres 的 Platt：用逐行样本
+        z = X_u[:, 5].detach().clone()                            # (T,)
+        y = (Y_u[:, 5] > 0).to(z.dtype)
+
+    # [MOD BEGIN] pres 的 Platt：用“全部预测槽位”，标签按匈牙利把预测索引置1
+    z_chunks, y_chunks = [], []
+    for b in range(N):
+        z_b = U_low[b, :, 5]                               # 该样本的所有预测槽位 u_pres，shape=(K,)
+        y_b = torch.zeros(K, device=z_b.device, dtype=z_b.dtype)
+        if rows[b].numel() > 0:
+            y_b[rows[b]] = 1.0                             # 预测索引(被匹配)置1，未匹配保持0
+        z_chunks.append(z_b)
+        y_chunks.append(y_b)
+
+    z_all = torch.cat(z_chunks, dim=0)                     # (N*K,)
+    y_all = torch.cat(y_chunks, dim=0)                     # (N*K,)
+
+    # 2 参数 Platt（BCE + L2 到 a）
+    if (y_all.sum() == 0) or (y_all.sum() == y_all.numel()):
+        a = z_all.new_tensor(1.0); b = z_all.new_tensor(0.0)
+    else:
+        a = z_all.new_zeros(()).requires_grad_(True)
+        b = z_all.new_zeros(()).requires_grad_(True)
         opt = torch.optim.Adam([a, b], lr=5e-2)
         lam = args.lambda_ridge
         for _ in range(200):
-            opt.zero_grad(set_to_none=True)
-            p = torch.sigmoid(a * z + b)
-            # BCE + L2 到 a，防过拟合；避免 log(0)
-            loss = -(y * torch.log(p + 1e-8) + (1 - y) * torch.log(1 - p + 1e-8)).mean() + 0.5 * lam * (a * a)
-            if not torch.isfinite(loss):
-                break
-            loss.backward()
-            opt.step()
+            p = torch.sigmoid(a * z_all + b)
+            loss = -(y_all * torch.log(p + 1e-8) + (1 - y_all) * torch.log(1 - p + 1e-8)).mean() + 0.5 * lam * (a * a)
+            if not torch.isfinite(loss): break
+            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
         a = a.detach(); b = b.detach()
 
     model.calibrate_pres_platt(a, b)
-    print("[OK] LHF(5×5) 已岭回归，pres 已做 Platt 标定。")
+    print(f"[OK] LHF 已重标定（reduce={args.ridge_reduce}），pres 使用全槽位+匈牙利索引完成 Platt 标定。")
 
 
 else:
