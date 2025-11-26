@@ -13,6 +13,11 @@ from ..losses.masked_mse import MaskedMSE, MaskedHungarianMSE
 from ..utils.dist_utils import is_main_process, dist_mean_scalar
 from ..data.normalizer import Normalizer
 from .dataloaders import build_dataloaders
+from ..utils.pcgrad import (
+    maybe_no_sync, clone_grads, zero_grads, pcgrad_two_tasks,
+    set_grads, allreduce_grads_inplace
+)
+
 
 
 def _cur_lr(optimizer):
@@ -306,7 +311,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             print(f"[Fold {fold+1}] S1 skipped (reuse fold0).", flush=True)
 
     # ============ Stage 2 ============ #
-    crit_s1.pres_w = 0.0 # 存在头完全以真实数据为准
+    crit_s1.pres_w = 0.0  # 存在头完全以真实数据为准
     crit_s1.card_w = 0.0
     for p in model_core.lin.parameters(): p.requires_grad_(True)
     for p in model_core.adaptation.parameters(): p.requires_grad_(True)
@@ -322,7 +327,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         min_lr=minlr2, eps=1e-12
     )
 
-    # w_sim, w_real = 0.3, 1.0
+    # 固定两任务权重（可调）
+    w_sim, w_real = 0.2, 1.0
     best_total = float('inf'); no_improve = 0
     sim_iter = None
     total_hist, sim_hist, real_hist = [], [], []
@@ -330,6 +336,56 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
     use_cuda = (device.type == 'cuda')
     scaler2 = torch.amp.GradScaler('cuda') if use_cuda else None
+
+    # ====== PCGrad helpers（就地定义即可）======
+    import torch.distributed as dist
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _maybe_no_sync(module):
+        no_sync = getattr(module, "no_sync", None)
+        if callable(no_sync):
+            with module.no_sync():
+                yield
+        else:
+            yield
+
+    def _clone_grads(params):
+        out = []
+        for p in params:
+            out.append(None if p.grad is None else p.grad.detach().clone())
+        return out
+
+    def _zero_grads(params):
+        for p in params: p.grad = None
+
+    def _pcgrad_two_tasks(g1, g2):
+        out = []
+        for a, b in zip(g1, g2):
+            if a is None and b is None: out.append(None); continue
+            if a is None: out.append(b); continue
+            if b is None: out.append(a); continue
+            va, vb = a.view(-1), b.view(-1)
+            dot = torch.dot(va, vb)
+            if dot < 0:
+                denom = vb.norm()**2 + 1e-12
+                a = a - (dot / denom) * b
+            out.append(a + b)
+        return out
+
+    def _set_grads(params, grads):
+        for p, g in zip(params, grads):
+            p.grad = None if g is None else g
+
+    def _allreduce_grads_inplace(params):
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        world = dist.get_world_size()
+        for p in params:
+            if p.grad is None: continue
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            if world > 1: p.grad.div_(world)
+    # ===========================================
 
     for epoch in range(cfg.epochs_stage2):
         model.train()
@@ -339,6 +395,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             sim_iter = cycle(sim_dl)
 
         sum_sim, sum_real, cnt_sim, cnt_real = 0.0, 0.0, 0, 0
+        params = list(model_core.parameters())
 
         for H_r, M_r, e_r, c_r, mask_r, yNr in real_dl:
             H_s, M_s, e_s, c_s, mask_s, yNs = next(sim_iter)
@@ -354,38 +411,60 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             for k in yNs: yNs[k] = yNs[k].to(device, non_blocking=True)
 
             opt2.zero_grad(set_to_none=True)
+
+            # ---------- 前向（一次完成两个任务的前向） ----------
             if use_cuda:
                 with torch.amp.autocast(device_type='cuda'):
                     _, outH_r = model(H_r, M_r, e_r, c_r)
                     loss_real = crit_s2(outH_r, yNr, mask_r)
                     outL_s, _ = model(H_s, M_s, e_s, c_s)
                     loss_sim = crit_s1(outL_s, yNs, mask_s)
-                    log_sigma_sim  = model_core.log_sigma_sim
-                    log_sigma_real = model_core.log_sigma_real
-                    # Kendall 形式：L = L/(2σ^2) + log σ
-                    inv_var_sim  = torch.exp(-2.0 * log_sigma_sim)   # 1 / σ^2
-                    inv_var_real = torch.exp(-2.0 * log_sigma_real)  # 1 / σ^2
-                    loss = 0.5 * inv_var_sim  * loss_sim \
-                         + 0.5 * inv_var_real * loss_real \
-                         + log_sigma_sim + log_sigma_real
-                scaler2.scale(loss).backward()
-                scaler2.unscale_(opt2)
-                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
-                scaler2.step(opt2); scaler2.update()
             else:
                 _, outH_r = model(H_r, M_r, e_r, c_r)
                 loss_real = crit_s2(outH_r, yNr, mask_r)
                 outL_s, _ = model(H_s, M_s, e_s, c_s)
                 loss_sim = crit_s1(outL_s, yNs, mask_s)
-                log_sigma_sim  = model_core.log_sigma_sim
-                log_sigma_real = model_core.log_sigma_real
-                inv_var_sim  = torch.exp(-2.0 * log_sigma_sim)
-                inv_var_real = torch.exp(-2.0 * log_sigma_real)
 
-                loss = 0.5 * inv_var_sim  * loss_sim \
-                     + 0.5 * inv_var_real * loss_real \
-                     + log_sigma_sim + log_sigma_real
-                loss.backward()
+            # ---------- 计算两项梯度并做 PCGrad 合并 ----------
+            if use_cuda:
+                # 任务1：sim
+                with _maybe_no_sync(model_core):
+                    scaler2.scale(w_sim * loss_sim).backward(retain_graph=True)
+                    scaler2.unscale_(opt2)
+                g_sim = _clone_grads(params)
+
+                # 任务2：real
+                _zero_grads(params)
+                with _maybe_no_sync(model_core):
+                    scaler2.scale(w_real * loss_real).backward(retain_graph=True)
+                    scaler2.unscale_(opt2)
+                g_real = _clone_grads(params)
+
+                # PCGrad 合并 + （DDP）全局规约
+                g_comb = _pcgrad_two_tasks(g_sim, g_real)
+                _set_grads(params, g_comb)
+                _allreduce_grads_inplace(params)
+
+                # clip + 更新
+                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
+                scaler2.step(opt2); scaler2.update()
+            else:
+                # CPU/无 AMP 分支
+                # 任务1：sim
+                with _maybe_no_sync(model_core):
+                    (w_sim * loss_sim).backward(retain_graph=True)
+                g_sim = _clone_grads(params)
+
+                # 任务2：real
+                _zero_grads(params)
+                with _maybe_no_sync(model_core):
+                    (w_real * loss_real).backward(retain_graph=True)
+                g_real = _clone_grads(params)
+
+                g_comb = _pcgrad_two_tasks(g_sim, g_real)
+                _set_grads(params, g_comb)
+                _allreduce_grads_inplace(params)
+
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
                 opt2.step()
 
@@ -403,16 +482,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
         sim_epoch   = (t_sim  / t_cnt_s).item() if t_cnt_s.item() > 0 else 0.0
         real_epoch  = (t_real / t_cnt_r).item() if t_cnt_r.item() > 0 else 0.0
-
-        # 从当前 log_sigma 反推等效权重（用于日志和 early stop，不参与反向）
-        with torch.no_grad():
-            log_sigma_sim  = model_core.log_sigma_sim
-            log_sigma_real = model_core.log_sigma_real
-            inv_var_sim  = torch.exp(-2.0 * log_sigma_sim)   # 1/σ^2
-            inv_var_real = torch.exp(-2.0 * log_sigma_real)
-            w_sim_eff  = (0.5 * inv_var_sim).item()
-            w_real_eff = (0.5 * inv_var_real).item()
-        total_epoch = float(w_sim_eff * sim_epoch + w_real_eff * real_epoch)
+        total_epoch = float(w_sim*sim_epoch + w_real*real_epoch)
 
         if is_main_process():
             prev_lr2 = _cur_lr(opt2)
@@ -429,8 +499,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
         if is_main_process():
             print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
-                  f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
-                  f'lr={_cur_lr(opt2):.3e}', flush=True)
+                f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
+                f'lr={_cur_lr(opt2):.3e}', flush=True)
             if (epoch + 1) % 1000 == 0:
                 save_path = out_dir / f'checkpoint_stage2_fold{fold}_epoch{epoch+1}.pth'
                 torch.save({
@@ -480,6 +550,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                         'lr_history': lr_hist_s2,
                     }, out_dir / f'checkpoint_stage2_fold{fold}_earlystop_epoch{epoch+1}.pth')
                 break
+
 
     # ============ Validation ============ #
     model.eval()
