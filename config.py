@@ -12,7 +12,7 @@ class Config:
 
     low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 256, 128, 64])
     mod_hidden: List[int] = field(default_factory=lambda: [32, 64])            # 调制头
-    adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64]) # 适配头
+    adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64])
     dropout_prob: float = 0
     mod_gamma: float = 0.2
     use_lora: bool = True
@@ -36,7 +36,7 @@ class Config:
     weight_decay: float = 5e-5
 
     # 网络与损失
-    use_modulation: bool = True
+    use_modulation: bool = False
     use_modulation_in_high: bool = False
     use_hungarian_loss: bool = True
 
