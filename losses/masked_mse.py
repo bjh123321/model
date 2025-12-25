@@ -119,6 +119,20 @@ class MaskedMSE(nn.Module):
         loss_reg = (self.w_alpha*(w*l_alpha).sum() + self.w_omega*(w*l_omega).sum() + self.w_rho *(w*l_rho).sum() +
                     self.w_sin_theta *(w*l_sin_theta).sum() + self.w_cos_theta *(w*l_cos_theta).sum()) / num
         loss_cls = self._presence_losses(pred, mask)
+
+        with torch.no_grad():
+            denom = float(num.detach().cpu().item()) if num is not None else 0.0
+            if denom > 0:
+                self.last_reg_stats = {
+                    "alpha":     float((w * l_alpha).sum().detach().cpu().item() / denom),
+                    "omega":     float((w * l_omega).sum().detach().cpu().item() / denom),
+                    "rho":       float((w * l_rho  ).sum().detach().cpu().item() / denom),
+                    "sin_theta": float((w * l_sin_theta).sum().detach().cpu().item() / denom),
+                    "cos_theta": float((w * l_cos_theta).sum().detach().cpu().item() / denom),
+                }
+            else:
+                self.last_reg_stats = {"alpha":0.0,"omega":0.0,"rho":0.0,"sin_theta":0.0,"cos_theta":0.0}
+
         return loss_reg + loss_cls
 
 class MaskedHungarianMSE(MaskedMSE):

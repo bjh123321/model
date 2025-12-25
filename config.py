@@ -38,9 +38,10 @@ class Config:
     # 网络与损失
     use_modulation: bool = False
     use_modulation_in_high: bool = False
-    use_hungarian_loss: bool = True
+    use_hungarian_loss: bool = False
 
     # 存在头
     presence_loss_weight: float = 0.2
     cardinality_loss_weight: float = 0.05
     presence_threshold: float = 0.5
+    
