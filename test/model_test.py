@@ -29,14 +29,14 @@ plt.rcParams.update({
 
 
 # ==== 配置区域 ====
-real = False  # 是否使用真实响应网络
-data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.90\1_H11_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
-# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.8\H11_M0.8_方向舵对称_幅值0.6.txt")
+real = True  # 是否使用真实响应网络
+# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.90\1_H11_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M1.3\H11_M1.3_方向舵对称_幅值0.75.txt")
 cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
 # cur_dir = Path(__file__).parents[2] / "surrogate_model"
 # checkpoint_dir = "outputs_pzk"
 checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad")
-checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
+checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch100_lhf.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_earlystop_epoch1146.pth"
 
@@ -49,7 +49,7 @@ checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 
 
 H = 11          # 高度
-M = 0.9        # 马赫数
+M = 1.05        # 马赫数
 exc_id = 0      # 激励方式
 ch_id  = 10    # 响应通道
 col_u = 0      # 激励
@@ -73,7 +73,7 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-loss = ckpt.get("loss_history", None)
+# loss = ckpt.get("loss_history", None)
 # loss = ckpt.get("loss_history_real", None)
 
 # region
@@ -159,27 +159,27 @@ with open(save_path, "w", encoding="utf-8") as f:
 y_hat = lfilter(B, A, u)
 
 
-plt.figure()
-plt.plot(loss, label="Loss Sim")
-plt.xlim(50, 2000)
-plt.ylim(0, 5)
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("Training Loss History")
-plt.legend()
-plt.grid()
+# plt.figure()
+# plt.plot(loss, label="Loss Sim")
+# plt.xlim(50, 5000)
+# plt.ylim(0, 2)
+# plt.xlabel("Epochs")
+# plt.ylabel("Loss")
+# plt.title("Training Loss History")
+# plt.legend()
+# plt.grid()
 
 plt.figure()
-# plt.subplot(2, 2, 1)
+plt.subplot(2, 2, 1)
 plt.plot(t, y)
 plt.title('origin')
 
 # plt.figure()
-# plt.subplot(2, 2, 3)
+plt.subplot(2, 2, 3)
 plt.plot(t, y_hat)
 plt.title('predict')
 
-plt.figure()
+# plt.figure()
 signals = [y, y_hat]
 for i, signal in enumerate(signals):
     signal_fft = np.fft.fft(signal)
@@ -190,7 +190,7 @@ for i, signal in enumerate(signals):
     signal_mag = 2.0  * np.abs(signal_fft[:N//2]) / N
     signal_freq = f[:N//2]
     # plt.figure()
-    # plt.subplot(2,2,2*(i+1))
+    plt.subplot(2,2,2*(i+1))
     plt.plot(signal_freq, signal_mag)
     plt.xlim(0, 60)
 plt.tight_layout()

@@ -278,13 +278,14 @@ omegaN = math.pi * 512
 
 # %%
 real = False  # True 用 outH；False 用 outL
-all_data = True  # True 用全部数据；False 用 sweepM 生成的数据
-Poles_Noise = True  # 是否给预测模态极点加噪声
-Mode_num_Noise = True  # 是否给预测模态数加噪声
+all_data = False  # True 用全部数据；False 用 sweepM 生成的数据
+Poles_Noise = False  # 是否给预测模态极点加噪声
+Mode_num_Noise = False  # 是否给预测模态数加噪声
 cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+# checkpoint_dir = "outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad"
 checkpoint_dir = "outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad"
+# checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
-
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Output_Sim.pth"
@@ -316,11 +317,59 @@ print(f"Missing keys: {missing}")
 print(f"Unexpected keys: {unexpected}")
 model.eval()
 
-data_rows = read_variable_txt(Path(__file__).parents[1] / "data" / "sim_dataset_oe.txt")
+data_rows = read_variable_txt(Path(__file__).parents[1] / "data" / "real_dataset_oe.txt")
 data_parsed, data_stats  = parse_rows_to_struct(data_rows)
 
+mode_num_all = np.array([d.K_valid for d in data_parsed]) # 每个样本的真实模态数（一维）
+mode_vals, counts = np.unique(mode_num_all, return_counts=True) # 统计各模态数的样本数
+# %%
+# 采样设置（如果每个文件 fs 不同，可放到 case 里单独配）
+fs = 512
+Ts = 1.0 / fs
+omegaN = np.pi * fs
+
+# 数据列设置
+col_u = 0  # 激励列
+# 1) 生成扫 Mach 的输入
+H_fix = 11
+exc_fix = 0
+ch_fix = 14
+
+# 筛选出对应条件的真实数据（固定高度、激励方式、通道、变马赫数用于对比）
+matched = filter_cases_with_index(data_parsed, H=H_fix, exc_id=exc_fix, ch_id=ch_fix) # matched数据结构： (index, data_struct（与data_parsed类型一样）)
+
+mode_num = np.array([d.K_valid for i, d in matched]) # 筛选出样本的真实模态数（一维）
+data = [d for i, d in matched] # data_struct(matched去掉index后的列表)
+idx = [i for i, d in matched] # 符合条件数据在总数据集里的索引
+M_list = sorted(list(set(d.M for d in data))) # 符合条件数据的马赫数列表（升序）
+
+alpha_real = np.array([d.alpha for d in data], dtype=float) # 条件筛选后极点实部
+omega_real = np.array([d.omega for d in data], dtype=float) * float(omegaN) # 极点虚部
+
+alpha_real = alpha_real[alpha_real!=0] # 拿到数据集里的有效槽位，数据为一维数组
+omega_real = omega_real[omega_real!=0]
+# idx_plot = alpha_real>-40 # 筛选出实部不是特别大的点（画图好看）
+# alpha_real = alpha_real[idx_plot]
+# omega_real = omega_real[idx_plot]
+
+freqs_real = omega_real / (4*np.pi) # 频率（Hz）
+damps_real = -alpha_real/np.sqrt(alpha_real**2 + omega_real**2) # 阻尼比%
+
+# M_list = np.linspace(0.8, 1.9, num=100)
+# 生成对应的 case 列表，用于全部数据批量推理
+cases_all = [
+    dict(
+        name=f"H{d.H}_M{d.M:.3f}_exc{d.exc_id}_ch{d.ch_id}",
+        H=float(d.H),
+        M=float(d.M),
+        exc_id=int(d.exc_id),
+        ch_id=int(d.ch_id),
+    ) for d in data_parsed
+]
+cases = make_cases_sweep_mach(H_fix, M_list, exc_fix, ch_fix, name_prefix="rudder_sym") # 用筛选后的变马赫数输入特征生成case列表
+
 target_list = []
-for i, p in enumerate(data_parsed):# 每行真实数据，分别拿到所有物理参数
+for i, p in enumerate(data_parsed if all_data else data):# 每行真实数据，分别拿到所有物理参数
     alpha = torch.from_numpy(p.alpha.copy()).to(device)   # (K,)
     omega = torch.from_numpy(p.omega.copy()).to(device)   # (K,)
     rho   = torch.from_numpy(p.rho.copy()).to(device)     # (K,)
@@ -332,57 +381,6 @@ for i, p in enumerate(data_parsed):# 每行真实数据，分别拿到所有物�
 
 target = torch.stack(target_list, dim=0)     # (N,K,5) 真实数据物理参数
 targetN = normlizer(target, out_norm.mean, out_norm.std)  # (N,5,K) 真实数据物理参数归一化
-
-
-mode_num_all = np.array([d.K_valid for d in data_parsed])
-mode_vals, counts = np.unique(mode_num_all, return_counts=True)
-# %%
-# 采样设置（如果每个文件 fs 不同，可放到 case 里单独配）
-fs = 512
-Ts = 1.0 / fs
-omegaN = np.pi * fs
-
-# 数据列设置
-col_u = 0  # 激励列
-
-# 1) 生成扫 Mach 的输入
-H_fix = 11
-exc_fix = 0
-ch_fix = 16
-
-# 筛选出对应条件的真实数据（用于对比）
-matched = filter_cases_with_index(data_parsed, H=H_fix, exc_id=exc_fix, ch_id=ch_fix)
-
-mode_num = np.array([d.K_valid for i, d in matched]) # 真实模态数（一维）
-data = [d for i, d in matched]
-idx = [i for i, d in matched] # 符合条件数据在总数据集里的索引
-M_list = sorted(list(set(d.M for d in data)))
-
-alpha_real = np.array([d.alpha for d in data], dtype=float) # 极点实部
-omega_real = np.array([d.omega for d in data], dtype=float) * float(omegaN) # 极点虚部
-
-alpha_real = alpha_real[alpha_real!=0] # 拿到数据集里的有效槽位
-omega_real = omega_real[omega_real!=0]
-# idx_plot = alpha_real>-40 # 筛选出实部不是特别大的点（画图好看）
-# alpha_real = alpha_real[idx_plot]
-# omega_real = omega_real[idx_plot]
-
-freqs_real = omega_real / (4*np.pi) # 频率（Hz）
-damps_real = -alpha_real/np.sqrt(alpha_real**2 + omega_real**2) # 阻尼比%
-
-# M_list = np.linspace(0.8, 1.9, num=100)
-# 生成对应的 case 列表，用于批量推理
-cases_all = [
-    dict(
-        name=f"H{d.H}_M{d.M:.3f}_exc{d.exc_id}_ch{d.ch_id}",
-        H=float(d.H),
-        M=float(d.M),
-        exc_id=int(d.exc_id),
-        ch_id=int(d.ch_id),
-    ) for d in data_parsed
-]
-cases = make_cases_sweep_mach(H_fix, M_list, exc_fix, ch_fix, name_prefix="rudder_sym")
-
 
 # =========================
 # 批量推理（模型部分可一次性 batch）
@@ -447,10 +445,10 @@ omega_b = omega_b * omegaN
 alpha_pred = alpha_b[idx_valid]
 omega_pred = omega_b[idx_valid]
 
-# K_metrics = eval_K_metrics(mode_num_all, mode_num_pred)
-# print("Mode number metrics:")
-# for k, v in K_metrics.items():
-#     print(f"  {k}: {v:.4f}")
+K_metrics = eval_K_metrics(mode_num_all if all_data else mode_num, mode_num_pred)
+print("Mode number metrics:")
+for k, v in K_metrics.items():
+    print(f"  {k}: {v:.4f}")
 
 # 给预测模态极点加点噪声
 if Poles_Noise:
@@ -491,12 +489,7 @@ omega_ref = omega_b[i0][np.argmax(p_exist_b[i0] >= exist_thresh)]  # 或你指�
 df_mode = build_mode_series(cases, p_exist_b, alpha_b, omega_b, rho_b, theta_b,
                             exist_thresh=exist_thresh, track="nearest", omega_ref=omega_ref)
 
-
-
-
 # %%
-
-
 plt.figure()
 plt.bar(mode_vals[2:8], counts[2:8],
         width=0.8, alpha=0.6,
