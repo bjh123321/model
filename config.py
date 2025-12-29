@@ -10,9 +10,11 @@ class Config:
     embed_excitation_dim: int = 4
     embed_channel_dim: int = 12
 
-    low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 256, 128, 64])
+    # low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 256, 128, 64])
+    low_hidden: List[int] = field(default_factory=lambda: [64, 128, 256, 128, 64])
     mod_hidden: List[int] = field(default_factory=lambda: [32, 64])            # 调制头
-    adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64])
+    # adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64])
+    adapt_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     dropout_prob: float = 0
     mod_gamma: float = 0.2
     use_lora: bool = True
@@ -38,10 +40,10 @@ class Config:
     # 网络与损失
     use_modulation: bool = True
     use_modulation_in_high: bool = False
-    use_hungarian_loss: bool = False
+    use_hungarian_loss: bool = True
 
     # 存在头
     presence_loss_weight: float = 0.2
     cardinality_loss_weight: float = 0.05
     presence_threshold: float = 0.5
-    
+
