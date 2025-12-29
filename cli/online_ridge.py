@@ -159,7 +159,6 @@ else:
     out_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Real_Fold0.pth")
 out_norm = Normalizer.load(out_norm_path)
 
-
 # --------------------------------------------------------
 # 构建批量输入  (H,M,Exc,Ch)
 # --------------------------------------------------------
@@ -412,3 +411,5 @@ python -m surrogate_model.cli.online_ridge \
   --mode lhf \
   --lambda_ridge 1e-2
 """
+
+# %%

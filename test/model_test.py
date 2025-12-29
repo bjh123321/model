@@ -1,3 +1,4 @@
+# %%
 import torch
 from pathlib import Path
 import numpy as np
@@ -29,12 +30,12 @@ plt.rcParams.update({
 
 # ==== 配置区域 ====
 real = False  # 是否使用真实响应网络
-data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250813标准\H3\M0.90\1_H3_M0.90_方向舵对称_0-50Hz_幅值0.6.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.90\1_H11_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.8\H11_M0.8_方向舵对称_幅值0.6.txt")
 cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
 # cur_dir = Path(__file__).parents[2] / "surrogate_model"
 # checkpoint_dir = "outputs_pzk"
-checkpoint_dir = "outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad"
+checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad")
 checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch100_lhf.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_earlystop_epoch1146.pth"
@@ -47,10 +48,10 @@ checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 
 
 
-H = 3          # 高度
+H = 11          # 高度
 M = 0.9        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 12    # 响应通道
+ch_id  = 10    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
@@ -62,7 +63,6 @@ Y = Y - Y.mean(axis=0, keepdims=True)
 u = Y[:, col_u]
 y = Y[:, col_y]
 t = np.arange(len(u)) / fs
-
 
 cfg = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -159,27 +159,27 @@ with open(save_path, "w", encoding="utf-8") as f:
 y_hat = lfilter(B, A, u)
 
 
-# plt.figure()
-# plt.plot(loss, label="Loss Sim")
-# # plt.xlim(0, 2000)
-# plt.xlabel("Epochs")
-# plt.ylabel("Loss")
-# plt.yscale("log")
-# plt.title("Training Loss History")
-# plt.legend()
-# plt.grid()
+plt.figure()
+plt.plot(loss, label="Loss Sim")
+plt.xlim(50, 2000)
+plt.ylim(0, 5)
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training Loss History")
+plt.legend()
+plt.grid()
 
 plt.figure()
-plt.subplot(2, 2, 1)
+# plt.subplot(2, 2, 1)
 plt.plot(t, y)
 plt.title('origin')
 
 # plt.figure()
-plt.subplot(2, 2, 3)
+# plt.subplot(2, 2, 3)
 plt.plot(t, y_hat)
 plt.title('predict')
 
-
+plt.figure()
 signals = [y, y_hat]
 for i, signal in enumerate(signals):
     signal_fft = np.fft.fft(signal)
@@ -190,7 +190,7 @@ for i, signal in enumerate(signals):
     signal_mag = 2.0  * np.abs(signal_fft[:N//2]) / N
     signal_freq = f[:N//2]
     # plt.figure()
-    plt.subplot(2,2,2*(i+1))
+    # plt.subplot(2,2,2*(i+1))
     plt.plot(signal_freq, signal_mag)
     plt.xlim(0, 60)
 plt.tight_layout()
@@ -206,3 +206,5 @@ plt.show()
 # print(f"对应 mean/std = {mean[1].item():.6f} ± {std[1].item():.6f}")
 # print(f"对应 mean/std = {mean[2].item():.6f} ± {std[2].item():.6f}")
 # print("-------------------")
+
+# %%
