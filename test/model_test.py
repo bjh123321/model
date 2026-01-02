@@ -13,29 +13,124 @@ from residue_pred import build_BA_from_residues
 
 
 plt.rcParams.update({
-    "font.family": "Times New Roman",  # 字体
-    "font.size": 10,                   # 默认字体大小
-    "axes.labelsize": 10,              # 坐标轴标签
-    "axes.titlesize": 12,              # 图标题
-    "xtick.labelsize": 8,              # X轴刻度
-    "ytick.labelsize": 8,              # Y轴刻度
-    "legend.fontsize": 8,              # 图例字体
-    "lines.linewidth": 1.0,            # 曲线宽度
-    "axes.linewidth": 1.0,             # 坐标轴线宽
-    # "figure.figsize": (3.5, 2.6),          # 图尺寸（英寸）单栏
-    "figure.figsize": (7.0, 4.5),          # 图尺寸（英寸）双栏
-    # "figure.dpi": 300                  # 分辨率 dpi
+    "figure.autolayout": False,
+    "figure.subplot.left": 0.15,
+    "figure.subplot.right": 0.98,
+    "figure.subplot.bottom": 0.15,
+    "figure.subplot.top": 0.92,
+    # "figure.subplot.left": 0.12,
+    # "figure.subplot.right": 0.98,
+    # "figure.subplot.bottom": 0.12,
+    # "figure.subplot.top": 0.98,
+    "axes.formatter.use_mathtext": True,
+    "axes.formatter.useoffset": True,
+    # "axes.formatter.limits": (0, 0),
+    # "legend.loc": "upper left",
+    "pdf.fonttype": 42,
+    "ps.fonttype": 42,
+    # ===== 字体 =====
+    "font.family": ["Times New Roman", "SimSun"],
+    "font.size": 8,                        # 主体字体大小
+    "axes.labelsize": 7,
+    "axes.titlesize": 10,
+    "figure.labelsize": 7,
+    "xtick.labelsize": 6,
+    "ytick.labelsize": 6,
+    "legend.fontsize": 6,
+    # ===== 线条 =====
+    "lines.linewidth": 0.5,
+    "axes.linewidth": 0.5,
+
+    # ===== 刻度线方向 =====
+    "xtick.direction": "in",
+    "ytick.direction": "in",
+
+    # ===== 刻度线长度 =====
+    "xtick.major.size": 3,
+    "ytick.major.size": 3,
+
+    # ===== 刻度线宽度 =====
+    "xtick.major.width": 0.5,
+    "ytick.major.width": 0.5,
+
+    "figure.figsize": (2.626, 1.969),  # 一般大小（英寸），对应6.67cm×5cm
+    # "figure.figsize": (3.543, 2.657),  # 一般大小（英寸），对应9cm×6.75cm
+    # "figure.figsize": (5.315, 3.543),  # 一般大小（英寸），对应13.5cm×9cm
+    "figure.dpi": 300                  # 分辨率 dpi
 })
 
+def compute_spectrum(x, fs, window=False, mode="amplitude"):
+    """
+    计算单边频谱（Amplitude Spectrum / Power Spectrum / PSD）
+
+    参数
+    ----
+    x : 1D array
+        输入信号
+    fs : float
+        采样率（Hz）
+    window : bool
+        是否使用汉宁窗减轻泄漏
+    mode : str, optional
+        "amplitude" → 单边幅度谱 (默认)
+        "power"     → 功率谱 |X|^2
+        "psd"       → 功率谱密度 (Power Spectral Density)
+
+    返回
+    ----
+    f : 1D array
+        频率轴（Hz）
+    X : 1D array
+        对应模式的频谱值
+    """
+
+    x = np.asarray(x, float)
+    N = len(x)
+
+    # 加窗
+    if window:
+        w = np.hanning(N)
+        xw = x * w
+        U = (w**2).sum() / N   # PSD 归一化用
+    else:
+        xw = x
+        U = 1
+
+    # FFT
+    Xf = np.fft.rfft(xw)
+    f = np.fft.rfftfreq(N, d=1/fs)
+
+    # 单边幅度谱
+    if mode == "amplitude":
+        X_amp = np.abs(Xf) / (N / 2)
+        X_amp[0] /= 2  # DC
+        return f, X_amp
+
+    # 功率谱（|X|^2）
+    elif mode == "power":
+        X_pow = (np.abs(Xf)**2) / (N**2)
+        X_pow[1:-1] *= 2  # 单边谱修正
+        return f, X_pow
+
+    # 功率谱密度 PSD（与 Welch 一致的定义）
+    elif mode == "psd":
+        X_psd = (np.abs(Xf)**2) / (fs * N * U)
+        X_psd[1:-1] *= 2
+        return f, X_psd
+
+    else:
+        raise ValueError(f"mode 必须是 amplitude / power / psd，但现在是: {mode}")
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
-# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H11\M0.90\1_H11_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M1.3\H11_M1.3_方向舵对称_幅值0.75.txt")
-cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.90\1_H8.23_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
+# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.6.txt")
 # cur_dir = Path(__file__).parents[2] / "surrogate_model"
 # checkpoint_dir = "outputs_pzk"
-checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad")
+cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+checkpoint_dir = Path(r"outputs_pzk_from_opt_dev")
+# checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch100_lhf.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_earlystop_epoch1146.pth"
@@ -47,15 +142,14 @@ checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 
 
 
-
-H = 11          # 高度
-M = 1.05        # 马赫数
+H = 5.5          # 高度
+M = 0.74        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 10    # 响应通道
+ch_id  = 11    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 fs = 512
-Ts = 1.0 / fs
+Ts = 1.0 / 512
 
 df = pd.read_table(data_file, sep=r"[,\t ]+", engine="python")
 Y = df.to_numpy(dtype=np.float64)
@@ -104,7 +198,7 @@ Hn, Mn = x_norm[:, :1], x_norm[:, 1:]
 
 exc = torch.tensor([exc_id], dtype=torch.long, device=device)
 ch  = torch.tensor([ch_id], dtype=torch.long, device=device)
-omegaN = np.pi * fs
+omegaN = np.pi * 512
 # ==== 推理 ====
 with torch.no_grad():
     outL, outH = model(Hn, Mn, exc, ch)
@@ -169,32 +263,78 @@ y_hat = lfilter(B, A, u)
 # plt.legend()
 # plt.grid()
 
-plt.figure()
-plt.subplot(2, 2, 1)
-plt.plot(t, y)
-plt.title('origin')
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
+ax1.plot(t, y/20, label="原始信号")
+ax1.legend()
 
-# plt.figure()
-plt.subplot(2, 2, 3)
-plt.plot(t, y_hat)
-plt.title('predict')
+ax2.plot(t, y_hat/20, label='预测信号')
+ax2.legend()
+ax2.set_xlabel("时间/s")
+plt.subplots_adjust(hspace=0)
+bbox1 = ax1.get_position()
+bbox2 = ax2.get_position()
+y_center = (bbox1.y1 + bbox2.y0) / 2
+fig.text(
+    0.04, y_center, "幅值",
+    rotation="vertical",
+    va="center",
+    fontsize=7
+)
+# plt.show()
 
-# plt.figure()
+
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
+label_names = ["原始信号频谱", "预测信号频谱"]
 signals = [y, y_hat]
 for i, signal in enumerate(signals):
-    signal_fft = np.fft.fft(signal)
-    N = signal.shape[-1]
-    window = np.hanning(N)
-    signal = signal * window
-    f = np.fft.fftfreq(N, d=1/fs)
-    signal_mag = 2.0  * np.abs(signal_fft[:N//2]) / N
-    signal_freq = f[:N//2]
-    # plt.figure()
-    plt.subplot(2,2,2*(i+1))
-    plt.plot(signal_freq, signal_mag)
-    plt.xlim(0, 60)
-plt.tight_layout()
+    f, S = compute_spectrum(signal, fs, mode="amplitude")
+    ax = ax1 if i == 0 else ax2
+    ax.plot(f, S, label=label_names[i])
+    ax.legend()
+
+plt.xlim(0, 60)
+ax2.set_xlabel("频率/Hz")
+
+plt.subplots_adjust(hspace=0)
+fig.text(
+    0.04, y_center, "幅值",
+    rotation="vertical",
+    va="center",
+    fontsize=7
+)
 plt.show()
+
+
+# plt.figure()
+# plt.subplot(2, 2, 1)
+# plt.plot(t, y)
+# plt.title('origin')
+
+# # plt.figure()
+# plt.subplot(2, 2, 3)
+# plt.subplots_adjust(hspace=0)
+# plt.plot(t, y_hat)
+# plt.title('predict')
+
+
+# plt.figure()
+# signals = [y, y_hat]
+# for i, signal in enumerate(signals):
+#     signal_fft = np.fft.fft(signal)
+#     N = signal.shape[-1]
+#     window = np.hanning(N)
+#     signal = signal * window
+#     f = np.fft.fftfreq(N, d=1/fs)
+#     signal_mag = 2.0  * np.abs(signal_fft[:N//2]) / N
+#     signal_freq = f[:N//2]
+#     plt.figure()
+#     # plt.subplot(2,2,2*(i+1))
+#     plt.plot(signal_freq, signal_mag)
+#     plt.xlabel('频率/Hz')
+#     plt.ylabel('幅值')
+#     plt.xlim(0, 60)
+# plt.tight_layout()
+# plt.show()
 # # ==== 验证归一化关系 ====
 # out_norm = Normalizer.load(out_norm_path)
 # mean = torch.tensor(out_norm.mean, dtype=torch.float32)

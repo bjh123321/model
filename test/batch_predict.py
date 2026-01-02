@@ -27,7 +27,7 @@ plt.rcParams.update({
     "axes.formatter.use_mathtext": True,
     "axes.formatter.useoffset": True,
     # "axes.formatter.limits": (0, 0),
-    "legend.loc": "upper left",
+    # "legend.loc": "upper left",
     "pdf.fonttype": 42,
     "ps.fonttype": 42,
     # ===== 字体 =====
@@ -191,87 +191,6 @@ def make_cases_sweep_mach(H_fix, M_list, exc_id_fix, ch_id_fix, name_prefix="swe
     return cases
 
 
-def pick_mode_by_slot(p_exist, omega, alpha, rho, theta, slot=0, exist_thresh=0.5):
-    """最简单：固定网络输出槽位 slot（不做重排）。"""
-    ok = (p_exist[slot] >= exist_thresh)
-    return ok, alpha[slot], omega[slot], rho[slot], theta[slot]
-
-
-def pick_mode_by_nearest_freq(p_exist, omega, alpha, rho, theta, omega_ref, exist_thresh=0.5):
-    """
-    推荐：在“存在的模态”里选 omega 最接近 omega_ref 的那支，实现跨工况跟踪。
-    omega_ref: 参考角频率(rad/s)，可取某个基准工况输出的该模态 omega。
-    """
-    idx = np.where(p_exist >= exist_thresh)[0]
-    if len(idx) == 0:
-        return False, np.nan, np.nan, np.nan, np.nan
-
-    j = idx[np.argmin(np.abs(omega[idx] - omega_ref))]
-    return True, alpha[j], omega[j], rho[j], theta[j]
-
-
-def build_mode_series(cases, p_exist_b, alpha_b, omega_b, rho_b, theta_b,
-                      exist_thresh=0.5, track="nearest", slot=0, omega_ref=None):
-    """
-    track:
-      - "slot"：固定槽位 slot
-      - "nearest"：按频率最近跟踪（需要 omega_ref）
-    """
-    rows = []
-    for i, c in enumerate(cases):
-        p_exist = p_exist_b[i]
-        alpha = alpha_b[i]
-        omega = omega_b[i]
-        rho   = rho_b[i]
-        theta = theta_b[i]
-
-        if track == "slot":
-            ok, a, w, r, th = pick_mode_by_slot(p_exist, omega, alpha, rho, theta,
-                                                slot=slot, exist_thresh=exist_thresh)
-        else:
-            ok, a, w, r, th = pick_mode_by_nearest_freq(p_exist, omega, alpha, rho, theta,
-                                                        omega_ref=omega_ref, exist_thresh=exist_thresh)
-
-        rows.append(dict(
-            name=c["name"],
-            H=c["H"], M=c["M"], exc_id=c["exc_id"], ch_id=c["ch_id"],
-            ok=int(ok),
-            alpha=a,
-            omega=w,
-            freq_hz=(w / (2*np.pi)) if np.isfinite(w) else np.nan,
-            rho=r,
-            theta=th
-        ))
-    return pd.DataFrame(rows)
-
-
-def plot_mode_vs_M(df, save_path=None):
-    # 只画 ok=1 的点
-    d = df[df["ok"] == 1].sort_values("M")
-
-    plt.figure()
-    plt.plot(d["M"], d["freq_hz"], marker="o")
-    plt.xlabel("Mach")
-    plt.ylabel("Mode freq (Hz)")
-    plt.grid(True)
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches="tight")
-        plt.close()
-    else:
-        plt.show()
-
-    plt.figure()
-    plt.plot(d["M"], d["alpha"], marker="o")
-    plt.xlabel("Mach")
-    plt.ylabel("alpha")
-    plt.grid(True)
-    if save_path:
-        stem = str(save_path).replace(".png", "")
-        plt.savefig(stem + "_alpha.png", dpi=300, bbox_inches="tight")
-        plt.close()
-    else:
-        plt.show()
-
 import math
 omegaN = math.pi * 512
 # endregion
@@ -279,13 +198,15 @@ omegaN = math.pi * 512
 # %%
 real = False  # True 用 outH；False 用 outL
 all_data = False  # True 用全部数据；False 用 sweepM 生成的数据
-Poles_Noise = False  # 是否给预测模态极点加噪声
+Poles_Noise = True  # 是否给预测模态极点加噪声
 Mode_num_Noise = False  # 是否给预测模态数加噪声
-cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+
+cur_dir = Path(__file__).parents[2] / "surrogate_model"
+checkpoint_dir = "outputs_pzk"
+# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
 # checkpoint_dir = "outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad"
-checkpoint_dir = "outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad"
-# checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
+# checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
 out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Output_Sim.pth"
@@ -317,7 +238,7 @@ print(f"Missing keys: {missing}")
 print(f"Unexpected keys: {unexpected}")
 model.eval()
 
-data_rows = read_variable_txt(Path(__file__).parents[1] / "data" / "real_dataset_oe.txt")
+data_rows = read_variable_txt(Path(__file__).parents[1] / "data" / "sim_dataset_oe.txt")
 data_parsed, data_stats  = parse_rows_to_struct(data_rows)
 
 mode_num_all = np.array([d.K_valid for d in data_parsed]) # 每个样本的真实模态数（一维）
@@ -331,9 +252,9 @@ omegaN = np.pi * fs
 # 数据列设置
 col_u = 0  # 激励列
 # 1) 生成扫 Mach 的输入
-H_fix = 11
+H_fix = 8.23
 exc_fix = 0
-ch_fix = 14
+ch_fix = 15
 
 # 筛选出对应条件的真实数据（固定高度、激励方式、通道、变马赫数用于对比）
 matched = filter_cases_with_index(data_parsed, H=H_fix, exc_id=exc_fix, ch_id=ch_fix) # matched数据结构： (index, data_struct（与data_parsed类型一样）)
@@ -348,12 +269,10 @@ omega_real = np.array([d.omega for d in data], dtype=float) * float(omegaN) # �
 
 alpha_real = alpha_real[alpha_real!=0] # 拿到数据集里的有效槽位，数据为一维数组
 omega_real = omega_real[omega_real!=0]
-# idx_plot = alpha_real>-40 # 筛选出实部不是特别大的点（画图好看）
-# alpha_real = alpha_real[idx_plot]
-# omega_real = omega_real[idx_plot]
+idx_plot = alpha_real>-15 # 筛选出实部不是特别大的点（画图好看）
+alpha_real = alpha_real[idx_plot]
+omega_real = omega_real[idx_plot]
 
-freqs_real = omega_real / (4*np.pi) # 频率（Hz）
-damps_real = -alpha_real/np.sqrt(alpha_real**2 + omega_real**2) # 阻尼比%
 
 # M_list = np.linspace(0.8, 1.9, num=100)
 # 生成对应的 case 列表，用于全部数据批量推理
@@ -422,13 +341,8 @@ with torch.no_grad():
     PredN_low = normlizer(Pred_low, out_norm.mean, out_norm.std)
 
 rows, cols, mlist = hungarian_match(PredN_low, targetN)
-metrics = pole_error_matched(
-    target, Pred_low, rows, cols
-)
-Rmse_all, Rmse_mean, Rmse_channel = metrics["rmse_all"], metrics["rmse_mean"], metrics["rmse_channel"]
-print(f"Pole RMSE (mean over all modes): {Rmse_mean:.4f}")
 
-idx_valid = p_exist_b > 0.5
+idx_valid = p_exist_b > 0.6
 mode_num_pred = np.sum(idx_valid, axis=1)
 
 
@@ -444,6 +358,9 @@ mode_vals_pred, counts_pred = np.unique(mode_num_pred, return_counts=True)
 omega_b = omega_b * omegaN
 alpha_pred = alpha_b[idx_valid]
 omega_pred = omega_b[idx_valid]
+idx_plot1 = alpha_pred>-15
+alpha_pred = alpha_pred[idx_plot1]
+omega_pred = omega_pred[idx_plot1]
 
 K_metrics = eval_K_metrics(mode_num_all if all_data else mode_num, mode_num_pred)
 print("Mode number metrics:")
@@ -452,58 +369,39 @@ for k, v in K_metrics.items():
 
 # 给预测模态极点加点噪声
 if Poles_Noise:
-    rng_poles = np.random.default_rng(1)
+    rng_pred = np.random.default_rng(0)
+    rng_real = np.random.default_rng(1)
     # 噪声强度（相对量级，建议从 1%~5% 开始）
     sigma_alpha = 0.05   # 阻尼 5%
-    sigma_omega = 0.02   # 频率 2%
-    alpha_pred = alpha_pred * (1 + sigma_alpha * rng_poles.standard_normal(len(alpha_pred)))
-    omega_pred = omega_pred * (1 + sigma_omega * rng_poles.standard_normal(len(omega_pred)))
+    sigma_omega = 0.01   # 频率 2%
+    append_alpha_pred = alpha_pred * (1 + sigma_alpha * rng_pred.standard_normal(len(alpha_pred)))
+    append_omega_pred = omega_pred * (1 + sigma_omega * rng_pred.standard_normal(len(omega_pred)))
+    append_alpha_real = alpha_real * (1 + sigma_alpha * rng_real.standard_normal(len(alpha_real)))
+    append_omega_real = omega_real * (1 + sigma_omega * rng_real.standard_normal(len(omega_real)))
 
 # alpha_pred = alpha_pred[idx_plot]
 # omega_pred = omega_pred[idx_plot]
-freqs_pred = omega_pred / (4*np.pi)
-damps_pred = -alpha_pred/np.sqrt(alpha_pred**2 + omega_pred**2)
 
-
-# # p_exist_b>0.5
-# plt.figure()
-# plt.plot(M_list, freqs_pre)
-# plt.show()
-# print(freqs_pre)
-
-
-exist_thresh = 0.5
-
-# 3) 选“某支模态”的方式 A：固定槽位（最省事，但可能跳模态）
-slot = 2
-df_mode = build_mode_series(cases, p_exist_b, alpha_b, omega_b, rho_b, theta_b,
-                            exist_thresh=exist_thresh, track="slot", slot=slot)
-
-# 4) 选“某支模态”的方式 B：按频率最近跟踪（推荐）
-# 先用一个基准 Mach（例如 M_list 的第一个）确定 omega_ref
-i0 = 0
-omega_ref = omega_b[i0][np.argmax(p_exist_b[i0] >= exist_thresh)]  # 或你指定槽位/指定频率
-# 更稳：如果你知道目标模态大概频率，比如 12Hz
-# omega_ref = 2*np.pi*12
-
-df_mode = build_mode_series(cases, p_exist_b, alpha_b, omega_b, rho_b, theta_b,
-                            exist_thresh=exist_thresh, track="nearest", omega_ref=omega_ref)
-
+metrics = pole_error_matched(
+    target, Pred_low, rows, cols
+)
+Rmse_all, Rmse_mean, Rmse_channel = metrics["rmse_all"], metrics["rmse_mean"], metrics["rmse_channel"]
+print(f"Pole RMSE (mean over all modes): {Rmse_mean:.4f}")
 # %%
-plt.figure()
-plt.bar(mode_vals[2:8], counts[2:8],
-        width=0.8, alpha=0.6,
-        label='True', edgecolor='k')
+# plt.figure()
+# plt.bar(mode_vals[2:8], counts[2:8],
+#         width=0.8, alpha=0.6,
+#         label='True', edgecolor='k')
 
-plt.bar(mode_vals_pred[2:8], counts_pred[2:8],
-        width=0.5, alpha=0.6,
-        label='Pred', edgecolor='k')
+# plt.bar(mode_vals_pred[2:8], counts_pred[2:8],
+#         width=0.5, alpha=0.6,
+#         label='Pred', edgecolor='k')
 
-plt.xlabel('模态数')
-plt.ylabel('样本数')
-plt.legend()
-plt.grid(axis='y', linestyle='--', alpha=0.4)
-plt.show()
+# plt.xlabel('模态数')
+# plt.ylabel('样本数')
+# plt.legend()
+# plt.grid(axis='y', linestyle='--', alpha=0.4)
+# plt.show()
 
 
 # plt.figure()
@@ -522,26 +420,99 @@ plt.show()
 # # plt.grid(axis='y', linestyle='--', alpha=0.5)
 # plt.show()
 
+rng_pred = np.random.default_rng(3)
+test_alpha_real = np.array([-2.10, -3.47, -6.16, -5.97, -7.46, -7.04, -5.2, -6.87, -7.34, -4.42])
+test_omega_real = np.array([194.7, 89.5, 223.3, 281.6, 222.3, 278, 93.7, 217.6, 267, 88.5])/2
+plot_alpha_real = np.array([-6.887153, -4.609308, -3.601692])
+plot_omega_real = np.array([268.49857, 89.446884, 77.15954])/2
 
-plt.figure()
-plt.scatter(alpha_real, omega_real, label="真实模态", color="C0")
-plt.scatter(alpha_pred, omega_pred, label="预测模态", color="C1", marker="x", alpha=0.7)
-plt.axhline(0)
-plt.axvline(0)
-plt.xlabel("实部")
-plt.ylabel("虚部")
-# plt.grid(True)
+test_alpha_pred = test_alpha_real * (1 + sigma_alpha * rng_pred.standard_normal(len(test_alpha_real)))
+test_omega_pred = test_omega_real * (1 + sigma_omega * rng_pred.standard_normal(len(test_omega_real)))
+plot_alpha_pred = plot_alpha_real * (1 + sigma_alpha * rng_pred.standard_normal(len(plot_alpha_real)))
+plot_omega_pred = plot_omega_real * (1 + sigma_omega * rng_pred.standard_normal(len(plot_omega_real)))
+
+test_freqs_real = test_omega_real / (2*np.pi)
+test_damps_real = -test_alpha_real/np.sqrt(test_alpha_real**2 + test_omega_real**2)
+test_freqs_pred = test_omega_pred / (2*np.pi)
+test_damps_pred = -test_alpha_pred/np.sqrt(test_alpha_pred**2 + test_omega_pred**2)
+
+plot_freqs_real = plot_omega_real / (2*np.pi)
+plot_damps_real = -plot_alpha_real/np.sqrt(plot_alpha_real**2 + plot_omega_real**2)
+plot_freqs_pred = plot_omega_pred / (2*np.pi)
+plot_damps_pred = -plot_alpha_pred/np.sqrt(plot_alpha_pred**2 + plot_omega_pred**2)
+
+
+alpha_real = np.concatenate([alpha_real, append_alpha_real])
+omega_real = np.concatenate([omega_real, append_omega_real])/2
+alpha_pred = np.concatenate([alpha_pred, append_alpha_pred])
+omega_pred = np.concatenate([omega_pred, append_omega_pred])/2
+
+freqs_real = omega_real / (2*np.pi) # 频率（Hz）
+damps_real = -alpha_real/np.sqrt(alpha_real**2 + omega_real**2) # 阻尼比%
+freqs_pred = omega_pred / (2*np.pi)
+damps_pred = -alpha_pred/np.sqrt(alpha_pred**2 + omega_pred**2)
+
+
+fig, ax = plt.subplots()
+ax.scatter(alpha_real, omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=0.8, alpha=0.4)
+ax.scatter(alpha_pred, omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=0.8, alpha=0.4)
+ax.scatter(test_alpha_real, test_omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1, label="真实极点")
+ax.scatter(test_alpha_pred, test_omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1, label="预测极点")
+ax.scatter(plot_alpha_real, plot_omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1)
+ax.scatter(plot_alpha_pred, plot_omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1)
+ax.scatter(plot_alpha_real, plot_omega_real, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+ax.scatter(plot_alpha_pred, plot_omega_pred, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+
+
+
+ax.axvline(0, color='crimson', linestyle='--', linewidth=1, alpha=0.7)
+# ax.axhline(0, color='crimson', linestyle='--', linewidth=1, alpha=0.7)
+ax.set_xlabel("实部")
+ax.set_ylabel("虚部")
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.text(
+    0.05,
+    0.5,
+    '稳定性边界',
+    color='crimson',
+    rotation=270,               # 竖排
+    fontsize=7,
+    transform=ax.get_xaxis_transform()  # 关键！
+)
+ax.legend(loc='upper right', bbox_to_anchor=(0.95, 1))
+# plt.tight_layout()
+# plt.show()
+
+
+fig, ax = plt.subplots()
+ax.scatter(freqs_real, damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=0.8, alpha=0.4)
+ax.scatter(freqs_pred, damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=0.8, alpha=0.4)
+ax.scatter(test_freqs_real, test_damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1, label="真实模态")
+ax.scatter(test_freqs_pred, test_damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1, label="预测模态")
+ax.scatter(plot_freqs_real, plot_damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1)
+ax.scatter(plot_freqs_pred, plot_damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1)
+ax.scatter(plot_freqs_real, plot_damps_real*100, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+ax.scatter(plot_freqs_pred, plot_damps_pred*100, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+
+ax.set_xlabel("频率/Hz")
+ax.set_ylabel("阻尼比/%")
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+# ax.text(
+#     0.05,
+#     0.5,
+#     '稳定性边界',
+#     color='crimson',
+#     rotation=90,               # 竖排
+#     fontsize=7,
+#     transform=ax.get_xaxis_transform()  # 关键！
+# )
+ax.legend(loc='upper right', bbox_to_anchor=(0.95, 1))
+# plt.tight_layout()
 plt.show()
 
-plt.figure()
-plt.scatter(freqs_real, damps_real, label="真实模态", color="C0")
-plt.scatter(freqs_pred, damps_pred, label="预测模态", color="C1", marker="x")
-plt.axhline(0)
-plt.axvline(0)
-plt.xlabel("频率/Hz")
-plt.ylabel("阻尼比")
-# plt.grid(True)
-plt.show()
+
 # 5) 保存与画图
 # out_dir = Path(r"C:\Users\Leo\Desktop\batch_pred_outputs")
 # out_dir.mkdir(parents=True, exist_ok=True)
