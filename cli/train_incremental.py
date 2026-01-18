@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from ..config import Config
 from ..models.blocks import MFDNN, LoRALinear
-from ..losses.masked_mse import MaskedMSE
+from ..losses.masked_mse import MaskedHungarianMSE
 from ..data.normalizer import Normalizer
 from ..data.io import parse_rows_to_struct
 
@@ -209,7 +209,7 @@ def main():
     # ------- 损失：MaskedMSE（与你训练阶段的结构一致：dict） -------
     mean_t = torch.as_tensor(out_norm.mean, dtype=torch.float32, device=device)
     std_t  = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device)
-    crit = MaskedMSE(mean=mean_t, std=std_t)
+    crit = MaskedHungarianMSE(mean=mean_t, std=std_t)
 
     opt = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad],

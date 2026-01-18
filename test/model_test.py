@@ -25,7 +25,7 @@ plt.rcParams.update({
     "axes.formatter.use_mathtext": True,
     "axes.formatter.useoffset": True,
     # "axes.formatter.limits": (0, 0),
-    # "legend.loc": "upper left",
+    "legend.loc": "upper center",
     "pdf.fonttype": 42,
     "ps.fonttype": 42,
     # ===== 字体 =====
@@ -36,7 +36,7 @@ plt.rcParams.update({
     "figure.labelsize": 7,
     "xtick.labelsize": 6,
     "ytick.labelsize": 6,
-    "legend.fontsize": 6,
+    "legend.fontsize": 5,
     # ===== 线条 =====
     "lines.linewidth": 0.5,
     "axes.linewidth": 0.5,
@@ -123,32 +123,32 @@ def compute_spectrum(x, fs, window=False, mode="amplitude"):
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
+# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.80\1_H8.23_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.90\1_H8.23_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H5.5\M0.74\H5.5_M0.74_方向舵对称_幅值0.6.txt")
+
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H8.23\M1.4\H8.23_M1.4_方向舵对称_幅值0.6.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.6.txt")
+
 # cur_dir = Path(__file__).parents[2] / "surrogate_model"
 # checkpoint_dir = "outputs_pzk"
+
 cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-checkpoint_dir = Path(r"outputs_pzk_from_opt_dev")
+checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_smaller_net")
+
+checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
-checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
-# checkpoint_file = "checkpoint_stage1_fold0_epoch100_lhf.pth"
-# checkpoint_file = "checkpoint_stage2_fold0_earlystop_epoch1146.pth"
 
-# checkpoint_file = "checkpoint_stage1_fold0.pth"
-# checkpoint_file = "checkpoint_stage1_fold0_mix.pth"
-# checkpoint_file = "checkpoint_stage1_fold1.pth"
-# checkpoint_file = "checkpoint_stage1_fold1_mix.pth"
+# checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
+# checkpoint_file = "checkpoint_stage2_fold0_epoch5000_inc.pth"
 
-
-
-H = 5.5          # 高度
-M = 0.74        # 马赫数
+H = 8.23          # 高度
+M = 0.8        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 11    # 响应通道
+ch_id  = 15    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
-fs = 512
+# col_y =17
+fs = 256
 Ts = 1.0 / 512
 
 df = pd.read_table(data_file, sep=r"[,\t ]+", engine="python")
@@ -167,8 +167,8 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-# loss = ckpt.get("loss_history", None)
-# loss = ckpt.get("loss_history_real", None)
+loss = ckpt.get("loss_history", None)
+# print(min(loss))
 
 # region
 # 自动推断 embed 维度
@@ -188,6 +188,7 @@ missing, unexpected = model.load_state_dict(state, strict=False)
 print(f"Missing keys: {missing}")
 print(f"Unexpected keys: {unexpected}")
 model.eval()
+# model.lin.enable_state_correction(True)
 
 # endregion
 # ==== 输入归一化 ====
@@ -240,28 +241,28 @@ print("rho   :", np.array2string(rho, precision=6))
 print("theta   :", np.array2string(theta, precision=6))
 print("----------------------------")
 data_to_save = [p_exist, alpha, omega, rho, theta]
-B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exist_thresh=0.5)
+B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exist_thresh=0.56)
 
 
 # ==== 保存结果到 txt 文件 ====
-save_path = r"C:\Users\Leo\Desktop\model_output.txt"
-with open(save_path, "w", encoding="utf-8") as f:
-    for arr in data_to_save:
-        np.savetxt(f, arr[None, :], fmt="%.6e", delimiter="\t")
+# save_path = r"C:\Users\Leo\Desktop\model_output.txt"
+# with open(save_path, "w", encoding="utf-8") as f:
+#     for arr in data_to_save:
+#         np.savetxt(f, arr[None, :], fmt="%.6e", delimiter="\t")
 
 # print(f"\n结果已保存至: {save_path}")
 y_hat = lfilter(B, A, u)
 
 
-# plt.figure()
-# plt.plot(loss, label="Loss Sim")
-# plt.xlim(50, 5000)
-# plt.ylim(0, 2)
-# plt.xlabel("Epochs")
-# plt.ylabel("Loss")
-# plt.title("Training Loss History")
-# plt.legend()
-# plt.grid()
+plt.figure()
+plt.plot(loss, label="Loss")
+plt.xlim(100, 5000)
+plt.ylim(0, 0.2)
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training Loss History")
+plt.legend()
+plt.grid()
 
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
 ax1.plot(t, y/20, label="原始信号")
@@ -292,7 +293,7 @@ for i, signal in enumerate(signals):
     ax.plot(f, S, label=label_names[i])
     ax.legend()
 
-plt.xlim(0, 60)
+plt.xlim(0, 30)
 ax2.set_xlabel("频率/Hz")
 
 plt.subplots_adjust(hspace=0)

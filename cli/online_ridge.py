@@ -24,8 +24,10 @@ def invert_to_u_space(alpha, omega, rho, sin_t, cos_t, mask, r):
     omega = omega.clamp(1e-6, 1 - 1e-6)
     u_omega = torch.log(omega / (1 - omega))
     u_rho = rho
-    u_sin = r * sin_t
-    u_cos = r * cos_t
+    u_sin = sin_t
+    u_cos = cos_t
+    # u_sin = r * sin_t
+    # u_cos = r * cos_t
     u_pres = torch.where(
         mask > 0.5,
         torch.full_like(mask, 10.0),
@@ -107,12 +109,9 @@ ap.add_argument("--ckpt", type=str, required=True)
 ap.add_argument("--calib_csv", type=str, required=True)
 ap.add_argument("--save_ckpt", type=str, default="")
 ap.add_argument("--lambda_ridge", type=float, default=1e-2)
-ap.add_argument("--mode", type=str,
-                choices=["lhf", "bias", "affine"],
-                default="lhf",
-                help="lhf: 重标定 LHF | bias: 偏置修正 | affine: 仿射修正")
-ap.add_argument("--ridge_reduce", type=str, choices=["slot", "mean"], default="mean",
-                help="LHF 岭回归的数据聚合方式：slot=逐行堆叠；mean=按槽位均值（保持旧逻辑）")
+ap.add_argument("--target_params", type=str, default="omega",
+                choices=["omega", "alpha_omega", "all"],
+                help="选择要标定的参数：omega(只标定频率), alpha_omega(标定频率和阻尼), all(标定所有参数)")
 args = ap.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -129,7 +128,7 @@ ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
 model.load_state_dict(state, strict=False)
 model.eval()
-
+model.lin.enable_state_correction(True)
 
 # --------------------------------------------------------
 # CSV 数据
@@ -145,18 +144,13 @@ with open(args.calib_csv, "r", encoding="utf-8-sig") as f:
 
 parsed, stats = parse_rows_to_struct(rows_float)
 N = len(parsed)
-if N == 0:
-    raise RuntimeError("校准 CSV 为空！")
 
 # --------------------------------------------------------
 # 载入 normalizer
 # --------------------------------------------------------
 in_norm_path = Path(args.ckpt).with_name("Normalizer_Input_Sim.pth")
+out_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Sim.pth")
 in_norm = Normalizer.load(in_norm_path)
-if args.mode == "lhf":
-    out_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Sim.pth")
-else:
-    out_norm_path = Path(args.ckpt).with_name("Normalizer_Output_Real_Fold0.pth")
 out_norm = Normalizer.load(out_norm_path)
 
 # --------------------------------------------------------
@@ -219,23 +213,13 @@ targetN = normlizer(target, out_norm.mean, out_norm.std)  # (N,5,K) 真实数据
 # 3) 对每个样本做训练同款匈牙利匹配，在物理空间对齐槽位
 # --------------------------------------------------------
 rows, cols, mlist = hungarian_match(PredN_low, targetN)
-
-
-# --------------------------------------------------------
-# 4) 根据模式执行校准（最关键部分）
-# --------------------------------------------------------
-
-# ========= 准备岭回归数据：用匈牙利匹配结果对齐 u-space =========
-
 X_list = []   # u_pred
 Y_list = []   # u_target
-
+H_list = []   # 高度信息
+M_list = []   # 马赫数信息
 for b in range(N):
     rb = rows[b]   # 预测槽位
     cb = cols[b]   # 真实槽位
-
-    if rb.numel() == 0:
-        continue
 
     # u_pred 取自 U_low（LHF 输出的 u-space）
     up = U_low[b, rb, :]      # (m_eff, nout)
@@ -243,173 +227,111 @@ for b in range(N):
     # u_target 取自 U_target（真实反推回 u-space）
     ut = U_target[b, cb, :]   # (m_eff, nout)
 
+    h_b = H[b]
+    m_b = M[b]
+
+    h_expanded = h_b.expand(rb.size(0), 1)
+    m_expanded = m_b.expand(rb.size(0), 1)
     X_list.append(up)
     Y_list.append(ut)
-
-if len(X_list) == 0:
-    raise RuntimeError("没有任何有效匹配，无法进行岭回归！")
+    H_list.append(h_expanded)
+    M_list.append(m_expanded)
 
 X_u = torch.cat(X_list, dim=0)   # (Nt, nout)  预测 u
 Y_u = torch.cat(Y_list, dim=0)   # (Nt, nout)  真实 u
+H_u = torch.cat(H_list, dim=0)   # (Nt, 1)     高度
+M_u = torch.cat(M_list, dim=0)   # (Nt, 1)     马赫数
+
+# # 建立 (K, nout) 的容器
+# X_slot = [[] for _ in range(K)]
+# Y_slot = [[] for _ in range(K)]
+
+# idx_total = 0
+# for b in range(N):
+#     rb = rows[b]
+#     for j in range(rb.numel()):
+#         slot_pred = rb[j].item()
+#         X_slot[slot_pred].append(X_u[idx_total])
+#         Y_slot[slot_pred].append(Y_u[idx_total])
+#         idx_total += 1
+
+# # 转成矩阵形式
+# X_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
+#         for v in X_slot]
+# Y_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
+#         for v in Y_slot]
 
 
-# ========= 根据模式重新计算  =========
-if args.mode == "lhf":
-    if args.ridge_reduce == "mean":
-        # ====== 保持你原来的“按槽位均值”逻辑 ======
-        # 建立 (K, nout) 的容器
-        X_slot = [[] for _ in range(K)]
-        Y_slot = [[] for _ in range(K)]
+# # 构成 (K,6) 的目标结构（均值作为校准值）
+# U_pred_slot = torch.zeros(K, 6, device=device)
+# U_tgt_slot  = torch.zeros(K, 6, device=device)
+# cnt_slot    = torch.zeros(K, dtype=torch.long, device=device)
 
-        idx_total = 0
-        for b in range(N):
-            rb = rows[b]
-            for j in range(rb.numel()):
-                slot_pred = rb[j].item()
-                X_slot[slot_pred].append(X_u[idx_total])
-                Y_slot[slot_pred].append(Y_u[idx_total])
-                idx_total += 1
+# for k in range(K):
+#     if X_slot[k].size(0) > 0:
+#         U_pred_slot[k] = X_slot[k].mean(dim=0)
+#         U_tgt_slot[k]  = Y_slot[k].mean(dim=0)
+#         cnt_slot[k]    = X_slot[k].size(0)
 
-        # 转成矩阵形式
-        X_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
-                for v in X_slot]
-        Y_slot = [torch.stack(v, dim=0) if len(v)>0 else torch.zeros(0, nout, device=device)
-                for v in Y_slot]
+# 岭回归：只对前5维（pres 留给 Platt）
+model.ridge_recalibrate_linear(
+    X_u.unsqueeze(0),   # (1, Nt, 6)
+    Y_u.unsqueeze(0),   # (1, Nt, 6)
+    H_u.unsqueeze(0),   # (1, Nt, 1) 每个样本的高度
+    M_u.unsqueeze(0),   # (1, Nt, 1) 每个样本的马赫数
+    reg=args.lambda_ridge,
+    target_params=args.target_params
+)
 
 
-        # 构成 (K,6) 的目标结构（均值作为校准值）
-        U_pred_slot = torch.zeros(K, 6, device=device)
-        U_tgt_slot  = torch.zeros(K, 6, device=device)
-        cnt_slot    = torch.zeros(K, dtype=torch.long, device=device)
+# pres 的 Platt：用“全部预测槽位”，标签按匈牙利把预测索引置1
+z_chunks, y_chunks = [], []
+for b in range(N):
+    z_b = U_low[b, :, 5]                               # 该样本的所有预测槽位 u_pres，shape=(K,)
+    y_b = torch.zeros(K, device=z_b.device, dtype=z_b.dtype)
+    if rows[b].numel() > 0:
+        y_b[rows[b]] = 1.0                             # 预测索引(被匹配)置1，未匹配保持0
+    z_chunks.append(z_b)
+    y_chunks.append(y_b)
 
-        for k in range(K):
-            if X_slot[k].size(0) > 0:
-                U_pred_slot[k] = X_slot[k].mean(dim=0)
-                U_tgt_slot[k]  = Y_slot[k].mean(dim=0)
-                cnt_slot[k]    = X_slot[k].size(0)
+z_all = torch.cat(z_chunks, dim=0)                     # (N*K,)
+y_all = torch.cat(y_chunks, dim=0)                     # (N*K,)
 
-        # 岭回归：只对前5维（pres 留给 Platt）
-        model.ridge_recalibrate_linear(
-            U_pred_slot.unsqueeze(0),   # (1,K,6)
-            U_tgt_slot.unsqueeze(0),    # (1,K,6)
-            reg=args.lambda_ridge
-        )
-
-    else:
-        # ====== slot：逐行堆叠（不分槽、信息更全） ======
-        model.ridge_recalibrate_linear(
-            U_low    = X_u.view(1, -1, 6),   # (1,T,6)
-            U_target = Y_u.view(1, -1, 6),   # (1,T,6)
-            reg      = args.lambda_ridge
-        )
-        # pres 的 Platt：用逐行样本
-        z = X_u[:, 5].detach().clone()                            # (T,)
-        y = (Y_u[:, 5] > 0).to(z.dtype)
-
-    # [MOD BEGIN] pres 的 Platt：用“全部预测槽位”，标签按匈牙利把预测索引置1
-    z_chunks, y_chunks = [], []
-    for b in range(N):
-        z_b = U_low[b, :, 5]                               # 该样本的所有预测槽位 u_pres，shape=(K,)
-        y_b = torch.zeros(K, device=z_b.device, dtype=z_b.dtype)
-        if rows[b].numel() > 0:
-            y_b[rows[b]] = 1.0                             # 预测索引(被匹配)置1，未匹配保持0
-        z_chunks.append(z_b)
-        y_chunks.append(y_b)
-
-    z_all = torch.cat(z_chunks, dim=0)                     # (N*K,)
-    y_all = torch.cat(y_chunks, dim=0)                     # (N*K,)
-
-    # 2 参数 Platt（BCE + L2 到 a）
-    if (y_all.sum() == 0) or (y_all.sum() == y_all.numel()):
-        a = z_all.new_tensor(1.0); b = z_all.new_tensor(0.0)
-    else:
-        a = z_all.new_zeros(()).requires_grad_(True)
-        b = z_all.new_zeros(()).requires_grad_(True)
-        opt = torch.optim.Adam([a, b], lr=5e-2)
-        lam = args.lambda_ridge
-        for _ in range(200):
-            p = torch.sigmoid(a * z_all + b)
-            loss = -(y_all * torch.log(p + 1e-8) + (1 - y_all) * torch.log(1 - p + 1e-8)).mean() + 0.5 * lam * (a * a)
-            if not torch.isfinite(loss): break
-            opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
-        a = a.detach(); b = b.detach()
-
-    model.calibrate_pres_platt(a, b)
-    print(f"[OK] LHF 已重标定（reduce={args.ridge_reduce}），pres 使用全槽位+匈牙利索引完成 Platt 标定。")
-
-
+# 2 参数 Platt（BCE + L2 到 a）
+if (y_all.sum() == 0) or (y_all.sum() == y_all.numel()):
+    a = z_all.new_tensor(1.0); b = z_all.new_tensor(0.0)
 else:
-    # ------------------------------------------
-    # bias | affine : 在线 quick-fix
-    # ------------------------------------------
+    a = z_all.new_zeros(()).requires_grad_(True)
+    b = z_all.new_zeros(()).requires_grad_(True)
+    opt = torch.optim.Adam([a, b], lr=5e-2)
+    lam = args.lambda_ridge
+    for _ in range(200):
+        p = torch.sigmoid(a * z_all + b)
+        loss = -(y_all * torch.log(p + 1e-8) + (1 - y_all) * torch.log(1 - p + 1e-8)).mean() + 0.5 * lam * (a * a)
+        if not torch.isfinite(loss): break
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    a = a.detach(); b = b.detach()
 
-    # (N,D)
-    model.enable_online_fix = False
-    with torch.no_grad():
-        outH = model.forward_high(H, M, E, Cc, outL)
-
-    X_flat = model.flatten_u(
-        outH["u_alpha"], outH["u_omega"], outH["u_rho"],
-        outH["u_sin_theta"], outH["u_cos_theta"],
-        outH.get("u_pres", None)
-    )   # shape = (N, D)= (N, K*nout)
-
-    # 同样 flatten target u
-    Y_flat = model.flatten_u(
-        U_target[:,:,0], U_target[:,:,1], U_target[:,:,2],
-        U_target[:,:,3], U_target[:,:,4], U_target[:,:,5]
-    )    # (N, D)
-
-    if args.mode == "bias":
-        # ---------- 偏置快修 ----------
-        delta_vec = (Y_flat - X_flat).mean(dim=0)
-        delta = delta_vec.view(1, K, nout)
-        model.quick_fix_biasgain({"delta": delta})
-        model.enable_online_fix = True
-        print("[OK] 已应用偏置快修。")
-
-    elif args.mode == "affine":
-        # ---------- 仿射快修 ----------
-        D_total = K * nout
-        a = torch.zeros(D_total, device=device)
-        b = torch.zeros(D_total, device=device)
-        lam = args.lambda_ridge
-
-        for d in range(D_total):
-            z = X_flat[:, d]
-            y = Y_flat[:, d]
-            Xm = torch.stack([z, torch.ones_like(z)], dim=1)  # (N,2)
-            G = Xm.T @ Xm
-            Lambda = torch.zeros_like(G)
-            Lambda[0, 0] = lam
-            theta = torch.linalg.solve(G + Lambda, Xm.T @ y)
-            a[d], b[d] = theta[0], theta[1]
-
-        model.quick_fix_biasgain({
-            "a": a.view(1, K, nout),
-            "b": b.view(1, K, nout)
-        })
-        model.enable_online_fix = True
-        print("[OK] 已应用仿射快修。")
+model.calibrate_pres_platt(a, b)
+print(f"[OK] LHF 已重标定，pres 使用全槽位+匈牙利索引完成 Platt 标定。")
 
 
 # --------------------------------------------------------
 # 5) 保存模型
 # --------------------------------------------------------
 base = Path(args.ckpt).with_suffix("")
-suffix = {"lhf": "_lhf", "bias": "_biasfix", "affine": "_affinefix"}[args.mode]
+suffix = "_lhf"
 save_path = args.save_ckpt or str(base) + suffix + ".pth"
 
 torch.save({"model_state_dict": model.state_dict()}, save_path)
-print(f"[OK] 在线标定完成（mode={args.mode}），模型已保存到：{save_path}")
+print(f"[OK] 在线标定完成，模型已保存到：{save_path}")
 
 
 """
 python -m surrogate_model.cli.online_ridge \
-  --ckpt "surrogate_model/outputs_pzk/best_stage2_fold0.pth" \
+  --ckpt "traindata/35/outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad/checkpoint_stage1_fold0_epoch5000.pth" \
   --calib_csv "surrogate_model/data/new_real.csv" \
-  --mode lhf \
-  --lambda_ridge 1e-2
+  --lambda_ridge 1e-3
 """
 
 # %%

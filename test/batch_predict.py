@@ -78,13 +78,12 @@ def pole_error_matched(target, Pred_low, rows, cols, eps=1e-12):
         c = cols[n].to(device=device, dtype=torch.long)
         pred_p = Pred_low[n, r, :2]
         true_p = target[n, c, :2]
-        m_bool = target[n, c, 5] > 0.5
         diff = pred_p - true_p
         Abs = true_p[:, 0]**2 + (true_p[:, 1] * omegaN)**2
         diff_alpha = diff[:, 0]
         diff_omega = diff[:, 1] * omegaN  # 转回 rad/s 再算误差
         rmse_diff_euclid = torch.sqrt(diff_alpha**2 + diff_omega**2 + eps) / Abs.sqrt()
-        Rmse.append(rmse_diff_euclid[m_bool].cpu().numpy())
+        Rmse.append(rmse_diff_euclid.cpu().numpy())
     Rmse_mean = np.concatenate(Rmse).mean()
     Rmse_channel = np.array([r.mean() if len(r) > 0 else np.nan for r in Rmse])
     return {
@@ -196,19 +195,22 @@ omegaN = math.pi * 512
 # endregion
 
 # %%
-real = False  # True 用 outH；False 用 outL
-all_data = False  # True 用全部数据；False 用 sweepM 生成的数据
-Poles_Noise = True  # 是否给预测模态极点加噪声
+real = True  # True 用 outH；False 用 outL
+all_data = True  # True 用全部数据；False 用 sweepM 生成的数据
+Poles_Noise = False  # 是否给预测模态极点加噪声
 Mode_num_Noise = False  # 是否给预测模态数加噪声
 
-cur_dir = Path(__file__).parents[2] / "surrogate_model"
-checkpoint_dir = "outputs_pzk"
-# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-# checkpoint_dir = "outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad"
-checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
-# checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
+# cur_dir = Path(__file__).parents[2] / "surrogate_model"
+# checkpoint_dir = "outputs_pzk"
+cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+checkpoint_dir = "outputs_pzk_from_opt_dev_full_smaller_net"
+# checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
+checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
+# if real:
+    # out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Output_Real_Fold0.pth"
+# else:
 out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Output_Sim.pth"
 in_norm = Normalizer.load(in_norm_path)
 out_norm = Normalizer.load(out_norm_path)
@@ -237,8 +239,9 @@ missing, unexpected = model.load_state_dict(state, strict=False)
 print(f"Missing keys: {missing}")
 print(f"Unexpected keys: {unexpected}")
 model.eval()
+model.lin.enable_state_correction(False)
 
-data_rows = read_variable_txt(Path(__file__).parents[1] / "data" / "sim_dataset_oe.txt")
+data_rows = read_variable_txt(Path(__file__).parents[1] / "data" / "real_dataset_oe.txt")
 data_parsed, data_stats  = parse_rows_to_struct(data_rows)
 
 mode_num_all = np.array([d.K_valid for d in data_parsed]) # 每个样本的真实模态数（一维）
@@ -252,7 +255,7 @@ omegaN = np.pi * fs
 # 数据列设置
 col_u = 0  # 激励列
 # 1) 生成扫 Mach 的输入
-H_fix = 8.23
+H_fix = 11
 exc_fix = 0
 ch_fix = 15
 
@@ -336,13 +339,13 @@ with torch.no_grad():
     rho_b = np.exp(out["rho"].detach().cpu().numpy())
     theta_b = np.arctan2(out["sin_theta"].detach().cpu().numpy(),
                         out["cos_theta"].detach().cpu().numpy())
-    Pred_low = torch.stack([outL["alpha"], outL["omega"], outL["rho"],
-                            outL["sin_theta"], outL["cos_theta"]], dim=-1)
+    Pred_low = torch.stack([out["alpha"], out["omega"], out["rho"],
+                            out["sin_theta"], out["cos_theta"]], dim=-1)
     PredN_low = normlizer(Pred_low, out_norm.mean, out_norm.std)
 
 rows, cols, mlist = hungarian_match(PredN_low, targetN)
 
-idx_valid = p_exist_b > 0.6
+idx_valid = p_exist_b > 0.5
 mode_num_pred = np.sum(idx_valid, axis=1)
 
 
@@ -382,11 +385,26 @@ if Poles_Noise:
 # alpha_pred = alpha_pred[idx_plot]
 # omega_pred = omega_pred[idx_plot]
 
-metrics = pole_error_matched(
-    target, Pred_low, rows, cols
-)
+metrics = pole_error_matched(target, Pred_low, rows, cols)
 Rmse_all, Rmse_mean, Rmse_channel = metrics["rmse_all"], metrics["rmse_mean"], metrics["rmse_channel"]
-print(f"Pole RMSE (mean over all modes): {Rmse_mean:.4f}")
+Rmse_all_box_plot = np.concatenate(Rmse_all)
+
+# %%
+plt.boxplot(
+    Rmse_all_box_plot,
+    labels=['SNED'],
+    showfliers=True,   # 显示异常值
+    widths=0.6
+)
+
+plt.ylabel('SNED')
+plt.xlabel('建模策略')
+plt.grid(axis='y', linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.yscale('log')
+plt.show()
+
+print(f"Pole RMSE (mean over all modes): {Rmse_mean:.8f}")
 # %%
 # plt.figure()
 # plt.bar(mode_vals[2:8], counts[2:8],
@@ -420,85 +438,77 @@ print(f"Pole RMSE (mean over all modes): {Rmse_mean:.4f}")
 # # plt.grid(axis='y', linestyle='--', alpha=0.5)
 # plt.show()
 
-rng_pred = np.random.default_rng(3)
-test_alpha_real = np.array([-2.10, -3.47, -6.16, -5.97, -7.46, -7.04, -5.2, -6.87, -7.34, -4.42])
-test_omega_real = np.array([194.7, 89.5, 223.3, 281.6, 222.3, 278, 93.7, 217.6, 267, 88.5])/2
-plot_alpha_real = np.array([-6.887153, -4.609308, -3.601692])
-plot_omega_real = np.array([268.49857, 89.446884, 77.15954])/2
+# rng_pred = np.random.default_rng(3)
+# test_alpha_real = np.array([-2.10, -3.47, -6.16, -5.97, -7.46, -7.04, -5.2, -6.87, -7.34, -4.42])
+# test_omega_real = np.array([194.7, 89.5, 223.3, 281.6, 222.3, 278, 93.7, 217.6, 267, 88.5])/2
+# plot_alpha_real = np.array([-6.887153, -4.609308, -3.601692])
+# plot_omega_real = np.array([268.49857, 89.446884, 77.15954])/2
 
-test_alpha_pred = test_alpha_real * (1 + sigma_alpha * rng_pred.standard_normal(len(test_alpha_real)))
-test_omega_pred = test_omega_real * (1 + sigma_omega * rng_pred.standard_normal(len(test_omega_real)))
-plot_alpha_pred = plot_alpha_real * (1 + sigma_alpha * rng_pred.standard_normal(len(plot_alpha_real)))
-plot_omega_pred = plot_omega_real * (1 + sigma_omega * rng_pred.standard_normal(len(plot_omega_real)))
+# test_alpha_pred = test_alpha_real * (1 + sigma_alpha * rng_pred.standard_normal(len(test_alpha_real)))
+# test_omega_pred = test_omega_real * (1 + sigma_omega * rng_pred.standard_normal(len(test_omega_real)))
+# plot_alpha_pred = plot_alpha_real * (1 + sigma_alpha * rng_pred.standard_normal(len(plot_alpha_real)))
+# plot_omega_pred = plot_omega_real * (1 + sigma_omega * rng_pred.standard_normal(len(plot_omega_real)))
 
-test_freqs_real = test_omega_real / (2*np.pi)
-test_damps_real = -test_alpha_real/np.sqrt(test_alpha_real**2 + test_omega_real**2)
-test_freqs_pred = test_omega_pred / (2*np.pi)
-test_damps_pred = -test_alpha_pred/np.sqrt(test_alpha_pred**2 + test_omega_pred**2)
+# test_freqs_real = test_omega_real / (2*np.pi)
+# test_damps_real = -test_alpha_real/np.sqrt(test_alpha_real**2 + test_omega_real**2)
+# test_freqs_pred = test_omega_pred / (2*np.pi)
+# test_damps_pred = -test_alpha_pred/np.sqrt(test_alpha_pred**2 + test_omega_pred**2)
 
-plot_freqs_real = plot_omega_real / (2*np.pi)
-plot_damps_real = -plot_alpha_real/np.sqrt(plot_alpha_real**2 + plot_omega_real**2)
-plot_freqs_pred = plot_omega_pred / (2*np.pi)
-plot_damps_pred = -plot_alpha_pred/np.sqrt(plot_alpha_pred**2 + plot_omega_pred**2)
-
-
-alpha_real = np.concatenate([alpha_real, append_alpha_real])
-omega_real = np.concatenate([omega_real, append_omega_real])/2
-alpha_pred = np.concatenate([alpha_pred, append_alpha_pred])
-omega_pred = np.concatenate([omega_pred, append_omega_pred])/2
-
-freqs_real = omega_real / (2*np.pi) # 频率（Hz）
-damps_real = -alpha_real/np.sqrt(alpha_real**2 + omega_real**2) # 阻尼比%
-freqs_pred = omega_pred / (2*np.pi)
-damps_pred = -alpha_pred/np.sqrt(alpha_pred**2 + omega_pred**2)
+# plot_freqs_real = plot_omega_real / (2*np.pi)
+# plot_damps_real = -plot_alpha_real/np.sqrt(plot_alpha_real**2 + plot_omega_real**2)
+# plot_freqs_pred = plot_omega_pred / (2*np.pi)
+# plot_damps_pred = -plot_alpha_pred/np.sqrt(plot_alpha_pred**2 + plot_omega_pred**2)
 
 
-fig, ax = plt.subplots()
-ax.scatter(alpha_real, omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=0.8, alpha=0.4)
-ax.scatter(alpha_pred, omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=0.8, alpha=0.4)
-ax.scatter(test_alpha_real, test_omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1, label="真实极点")
-ax.scatter(test_alpha_pred, test_omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1, label="预测极点")
-ax.scatter(plot_alpha_real, plot_omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1)
-ax.scatter(plot_alpha_pred, plot_omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1)
-ax.scatter(plot_alpha_real, plot_omega_real, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
-ax.scatter(plot_alpha_pred, plot_omega_pred, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+# alpha_real = np.concatenate([alpha_real, append_alpha_real])
+# omega_real = np.concatenate([omega_real, append_omega_real])/2
+# alpha_pred = np.concatenate([alpha_pred, append_alpha_pred])
+# omega_pred = np.concatenate([omega_pred, append_omega_pred])/2
+
+# freqs_real = omega_real / (2*np.pi) # 频率（Hz）
+# damps_real = -alpha_real/np.sqrt(alpha_real**2 + omega_real**2) # 阻尼比%
+# freqs_pred = omega_pred / (2*np.pi)
+# damps_pred = -alpha_pred/np.sqrt(alpha_pred**2 + omega_pred**2)
+
+
+# fig, ax = plt.subplots()
+# ax.scatter(alpha_real, omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=0.8, alpha=0.4)
+# ax.scatter(alpha_pred, omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=0.8, alpha=0.4)
+# ax.scatter(test_alpha_real, test_omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1, label="真实极点")
+# ax.scatter(test_alpha_pred, test_omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1, label="预测极点")
+# ax.scatter(plot_alpha_real, plot_omega_real, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1)
+# ax.scatter(plot_alpha_pred, plot_omega_pred, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1)
+# ax.scatter(plot_alpha_real, plot_omega_real, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+# ax.scatter(plot_alpha_pred, plot_omega_pred, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
 
 
 
-ax.axvline(0, color='crimson', linestyle='--', linewidth=1, alpha=0.7)
-# ax.axhline(0, color='crimson', linestyle='--', linewidth=1, alpha=0.7)
-ax.set_xlabel("实部")
-ax.set_ylabel("虚部")
-ax.spines['top'].set_visible(False)
-ax.spines['right'].set_visible(False)
-ax.text(
-    0.05,
-    0.5,
-    '稳定性边界',
-    color='crimson',
-    rotation=270,               # 竖排
-    fontsize=7,
-    transform=ax.get_xaxis_transform()  # 关键！
-)
-ax.legend(loc='upper right', bbox_to_anchor=(0.95, 1))
-# plt.tight_layout()
-# plt.show()
+# ax.axvline(0, color='crimson', linestyle='--', linewidth=1, alpha=0.7)
+# # ax.axhline(0, color='crimson', linestyle='--', linewidth=1, alpha=0.7)
+# ax.set_xlabel("实部")
+# ax.set_ylabel("虚部")
+# ax.spines['top'].set_visible(False)
+# ax.spines['right'].set_visible(False)
+# ax.text(0.05,  0.5, '稳定性边界', color='crimson', rotation=270, fontsize=7, transform=ax.get_xaxis_transform())
+# ax.legend(loc='upper right', bbox_to_anchor=(0.95, 1))
+# # plt.tight_layout()
+# # plt.show()
 
 
-fig, ax = plt.subplots()
-ax.scatter(freqs_real, damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=0.8, alpha=0.4)
-ax.scatter(freqs_pred, damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=0.8, alpha=0.4)
-ax.scatter(test_freqs_real, test_damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1, label="真实模态")
-ax.scatter(test_freqs_pred, test_damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1, label="预测模态")
-ax.scatter(plot_freqs_real, plot_damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1)
-ax.scatter(plot_freqs_pred, plot_damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1)
-ax.scatter(plot_freqs_real, plot_damps_real*100, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
-ax.scatter(plot_freqs_pred, plot_damps_pred*100, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+# fig, ax = plt.subplots()
+# ax.scatter(freqs_real, damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=0.8, alpha=0.4)
+# ax.scatter(freqs_pred, damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=0.8, alpha=0.4)
+# ax.scatter(test_freqs_real, test_damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1, label="真实模态")
+# ax.scatter(test_freqs_pred, test_damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1, label="预测模态")
+# ax.scatter(plot_freqs_real, plot_damps_real*100, facecolors='none', edgecolors='#1f77b4', s=20, linewidths=1, alpha=1)
+# ax.scatter(plot_freqs_pred, plot_damps_pred*100, marker='x', color='#ff7f0e', s=20, linewidths=1, alpha=1)
+# ax.scatter(plot_freqs_real, plot_damps_real*100, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
+# ax.scatter(plot_freqs_pred, plot_damps_pred*100, facecolors='none', edgecolors='red', s=60, linewidths=1, alpha=1, marker='o')  # 红色外围圆圈
 
-ax.set_xlabel("频率/Hz")
-ax.set_ylabel("阻尼比/%")
-ax.spines['top'].set_visible(False)
-ax.spines['right'].set_visible(False)
+# ax.set_xlabel("频率/Hz")
+# ax.set_ylabel("阻尼比/%")
+# ax.spines['top'].set_visible(False)
+# ax.spines['right'].set_visible(False)
 # ax.text(
 #     0.05,
 #     0.5,
@@ -508,9 +518,9 @@ ax.spines['right'].set_visible(False)
 #     fontsize=7,
 #     transform=ax.get_xaxis_transform()  # 关键！
 # )
-ax.legend(loc='upper right', bbox_to_anchor=(0.95, 1))
-# plt.tight_layout()
-plt.show()
+# ax.legend(loc='upper right', bbox_to_anchor=(0.95, 1))
+# # plt.tight_layout()
+# plt.show()
 
 
 # 5) 保存与画图

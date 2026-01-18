@@ -135,32 +135,97 @@ class LowFidelityHead(nn.Module):
 
 
 class LinearHFHead(nn.Module):
-    """
-    LHF = 槽内特征混合(5×5，针对 α,ω,ρ,sinθ,cosθ) + pres 独立 1×1 仿射
-    （槽位混合如需以后加，再在外面接 K×K 即可）
-    """
     def __init__(self, K_max: int):
         super().__init__()
         self.K_max = K_max
-        # 物理 5 维
+        
+        # 原来的 5×5 线性层保持不变
         self.aff_phys = nn.Linear(5, 5, bias=True)
-        # pres 独立 1×1（在线标定合成进这里）
+        
+        # 新增：状态感知的修正器 (7->5)，可以修正所有5个参数
+        # 输入: [H, M, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta]
+        self.state_corrector = nn.Linear(7, 5, bias=True)
+        
+        # pres 独立 1×1
         self.aff_pres = nn.Linear(1, 1, bias=True)
+        
         with torch.no_grad():
+            # 初始化原有层
             nn.init.eye_(self.aff_phys.weight)
             nn.init.zeros_(self.aff_phys.bias)
+            
+            # 初始化状态修正器为零修正
+            nn.init.zeros_(self.state_corrector.weight)
+            nn.init.zeros_(self.state_corrector.bias)
+            
             self.aff_pres.weight.fill_(1.0)
             self.aff_pres.bias.zero_()
+        
+        # 修正掩码：决定修正哪些参数 [alpha, omega, rho, sin_theta, cos_theta]
+        self.correction_mask = torch.ones(5, dtype=torch.bool)
+        # 标志位：是否启用状态修正
+        self.use_state_correction = False
 
-    def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres):
-        # 物理 5 维：对最后一维做 5×5
+    def forward(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres, 
+                H=None, M=None):
         U5 = torch.stack([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)  # (B,K,5)
         B, K, _ = U5.shape
-        Y5 = self.aff_phys(U5.view(-1, 5)).view(B, K, 5)
-        # pres：1×1 仿射
-        pres = self.aff_pres(u_pres.unsqueeze(-1)).squeeze(-1)                          # (B,K)
+        
+        # 基础线性变换
+        Y5_base = self.aff_phys(U5.view(-1, 5)).view(B, K, 5)
+        
+        # 如果提供了H,M且启用了状态修正
+        if self.use_state_correction and H is not None and M is not None:
+            # 扩展H,M到槽位维度
+            H_exp = H.unsqueeze(1).expand(B, K, 1)  # (B,K,1)
+            M_exp = M.unsqueeze(1).expand(B, K, 1)  # (B,K,1)
+            
+            # 构建特征: [H, M, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta]
+            features = torch.cat([
+                H_exp, M_exp, U5
+            ], dim=-1)  # (B,K,7)
+            
+            # 计算所有参数的修正量
+            all_corrections = self.state_corrector(features.view(-1, 7)).view(B, K, 5)
+            
+            # 应用掩码：只启用选定的参数修正
+            masked_corrections = torch.zeros_like(all_corrections)
+            for i in range(5):
+                if self.correction_mask[i]:
+                    masked_corrections[..., i] = all_corrections[..., i]
+            
+            # 应用修正
+            Y5 = Y5_base + masked_corrections
+        else:
+            # 回退到原始行为
+            Y5 = Y5_base
+        
+        # pres：1×1 仿射（保持不变）
+        pres = self.aff_pres(u_pres.unsqueeze(-1)).squeeze(-1)  # (B,K)
+        
         return Y5[...,0], Y5[...,1], Y5[...,2], Y5[...,3], Y5[...,4], pres
-
+    
+    def enable_state_correction(self, enable=True):
+        """启用或禁用状态修正"""
+        self.use_state_correction = enable
+    
+    def set_correction_mask(self, mask):
+        """
+        设置修正掩码
+        mask: 长度为5的布尔列表或张量，对应[alpha, omega, rho, sin_theta, cos_theta]
+        例如：[False, True, False, False, False] 表示只修正omega
+            [True, True, False, False, False] 表示修正alpha和omega
+        """
+        if isinstance(mask, list):
+            mask = torch.tensor(mask, dtype=torch.bool)
+        self.correction_mask = mask.to(self.state_corrector.weight.device)
+        print(f"设置修正掩码: {self.correction_mask.tolist()}")
+    
+    def calibrate_state_corrector(self, weight, bias):
+        """设置状态修正器的权重"""
+        with torch.no_grad():
+            self.state_corrector.weight.copy_(weight)
+            self.state_corrector.bias.copy_(bias)
 
 
 class AdaptationHead(nn.Module):
@@ -290,25 +355,36 @@ class MFDNN(nn.Module):
 
 
     def forward_high(self, H, M, exc_id, ch_id, outL: dict):
-        uA,uW,uR,uS,uC,uP = self.lin(
-            outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
+        # 调用lin时传入H和M
+        uA, uW, uR, uS, uC, uP = self.lin(
+            outL['u_alpha'], outL['u_omega'], outL['u_rho'], 
+            outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres'],
+            H, M  # 新增：传入状态信息
         )
-        dA,dW,dR,dS,dC,dP = self.adaptation(
+        
+        dA, dW, dR, dS, dC, dP = self.adaptation(
             H, M, exc_id, ch_id,
-            outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
+            outL['u_alpha'], outL['u_omega'], outL['u_rho'], 
+            outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
         )
+        
         # 合成 (LHF + NHF)
         U = torch.stack([uA+dA, uW+dW, uR+dR, uS+dS, uC+dC, uP+dP], dim=-1)  # (B,K,6)
+        
         # 在线快修偏置
         if self.enable_online_fix:
             U = self.online_gain * U + self.online_bias
+        
         # 物理域映射
         alpha, omega, rho, sin_theta, cos_theta, p_exist = self.param.to_physical(
             U[...,0], U[...,1], U[...,2], U[...,3], U[...,4], U[...,5]
         )
+        
         return {
-            'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta,'p_exist':p_exist,
-            'u_alpha':U[...,0],'u_omega':U[...,1],'u_rho':U[...,2],'u_sin_theta':U[...,3],'u_cos_theta':U[...,4],'u_pres':U[...,5]
+            'alpha': alpha, 'omega': omega, 'rho': rho, 
+            'sin_theta': sin_theta, 'cos_theta': cos_theta, 'p_exist': p_exist,
+            'u_alpha': U[...,0], 'u_omega': U[...,1], 'u_rho': U[...,2], 
+            'u_sin_theta': U[...,3], 'u_cos_theta': U[...,4], 'u_pres': U[...,5]
         }
 
     # 顶层 forward：给出低保真 + 高保真输出
@@ -355,39 +431,140 @@ class MFDNN(nn.Module):
         self.enable_online_fix = flag
 
 
-    # ===== 岭回归重标定 LHF：直接更新 LinearHFHead 的 W,b =====
     @torch.no_grad()
-    def ridge_recalibrate_linear(self, U_low: torch.Tensor, U_target: torch.Tensor, reg: float = 1e-2):
+    def ridge_recalibrate_linear(self, U_low: torch.Tensor, U_target: torch.Tensor,
+                                H_norm: torch.Tensor, M_norm: torch.Tensor,
+                                reg: float = 1e-2,
+                                target_params: str = "omega"):
         """
-        用岭回归“共享 5×5 + 偏置”重标定 LHF（只对前5维; pres 交由 calibrate_pres_platt）。
-        U_low:    (N, K, 6)  -- LHF 输入侧的 u（网络空间）
-        U_target: (N, K, 6)  -- 真实标签反推到 u 空间后的目标
+        新的岭回归函数：可选标定参数
+        
+        U_low:   (1, N_total, 6) - 所有有效样本的预测U值
+        U_target: (1, N_total, 6) - 所有有效样本的真实U值
+        H_norm: (1, N_total, 1) - 每个样本的高度（归一化）
+        M_norm: (1, N_total, 1) - 每个样本的马赫数（归一化）
+        reg:    正则化系数
+        target_params: 标定参数选项
+            "omega": 只标定omega
+            "alpha_omega": 标定alpha和omega
+            "all": 标定所有5个参数
         """
         device = self.lin.aff_phys.weight.device
-        U_low    = U_low.to(device)
-        U_target = U_target.to(device)
-
-        N, K, nout = U_low.shape
-        assert nout == 6 and U_target.shape == (N, K, 6)
-
-        # 只对前5维做岭回归
-        X = U_low[...,  :5].reshape(N*K, 5)    # (NK,5)
-        Y = U_target[..., :5].reshape(N*K, 5)  # (NK,5)
-
-        ones = torch.ones(N*K, 1, device=device, dtype=X.dtype)
-        X_aug = torch.cat([X, ones], dim=1)    # (NK,6) = [X, 1]
-        G = X_aug.T @ X_aug                    # (6,6)
-
-        Lambda = torch.zeros_like(G)
-        Lambda[:5, :5].fill_(reg)              # 只正则权重，不正则偏置
-
-        W_aug = torch.linalg.solve(G + Lambda, X_aug.T @ Y)  # (6,5)
-        W = W_aug[:5, :].T.contiguous()       # (5,5) -> nn.Linear 需要 out×in
-        b = W_aug[5, :].contiguous()          # (5,)
-
-        # 写回 LHF（物理 5 维）
-        self.lin.aff_phys.weight.copy_(W)
-        self.lin.aff_phys.bias.copy_(b)
+        
+        # 去掉批次维度
+        U_low = U_low.squeeze(0)    # (N_total, 6)
+        U_target = U_target.squeeze(0)  # (N_total, 6)
+        H_norm = H_norm.squeeze(0)  # (N_total, 1)
+        M_norm = M_norm.squeeze(0)  # (N_total, 1)
+        
+        N_total = U_low.shape[0]
+        
+        # 1. 构建特征矩阵 Phi: [1, H, M, u_alpha, u_omega, u_rho, u_sin, u_cos]
+        ones = torch.ones(N_total, 1, device=device)
+        Phi = torch.cat([
+            ones,                    # 偏置项
+            H_norm,                  # 高度
+            M_norm,                  # 马赫数
+            U_low[:, :5]             # 低保真预测的5个参数
+        ], dim=-1)  # (N_total, 8)
+        
+        # 2. 构建目标矩阵 Delta: 真实值 - 预测值
+        Delta = U_target[:, :5] - U_low[:, :5]  # (N_total, 5)
+        
+        # 3. 根据target_params确定要标定的参数索引
+        param_names = ["alpha", "omega", "rho", "sin_theta", "cos_theta"]
+        
+        if target_params == "omega":
+            target_indices = [1]  # 只标定omega
+        elif target_params == "alpha_omega":
+            target_indices = [0, 1]  # 标定alpha和omega
+        elif target_params == "all":
+            target_indices = list(range(5))  # 标定所有参数
+        else:
+            raise ValueError(f"未知的target_params: {target_params}")
+        
+        print(f"标定参数: {[param_names[i] for i in target_indices]}")
+        
+        # 4. 初始化完整的权重矩阵和偏置向量（5×7和5维）
+        W_full = torch.zeros(5, 7, device=device)
+        b_full = torch.zeros(5, device=device)
+        
+        # 5. 对每个目标参数进行岭回归
+        for i in target_indices:
+            y_i = Delta[:, i]  # (N_total,)
+            
+            # 岭回归闭式解: (Phi^T Phi + λI) θ = Phi^T y_i
+            A = Phi.T @ Phi  # (8, 8)
+            B = Phi.T @ y_i  # (8,)
+            
+            # 正则化矩阵：只对权重部分正则化，不对偏置项正则化
+            I_reg = torch.eye(8, device=device)
+            I_reg[0, 0] = 0  # 不对偏置项正则化
+            
+            theta_i = torch.linalg.solve(A + reg * I_reg, B)  # (8,)
+            
+            b_i = theta_i[0]       # 偏置
+            w_i = theta_i[1:]      # 权重 (7,)
+            
+            W_full[i] = w_i
+            b_full[i] = b_i
+            
+            # 输出该参数的统计信息
+            param_name = param_names[i]
+            error_mean = y_i.mean().item()
+            error_std = y_i.std().item()
+            weight_norm = torch.norm(w_i).item()
+            
+            print(f"  {param_name}: 平均误差={error_mean:.6f}, "
+                f"标准差={error_std:.6f}, 权重范数={weight_norm:.4f}")
+        
+        # 6. 将权重写入修正器
+        self.lin.calibrate_state_corrector(W_full, b_full)
+        
+        # 7. 设置修正掩码
+        if target_params == "omega":
+            self.lin.set_correction_mask([False, True, False, False, False])
+        elif target_params == "alpha_omega":
+            self.lin.set_correction_mask([True, True, False, False, False])
+        elif target_params == "all":
+            self.lin.set_correction_mask([True, True, True, True, True])
+        
+        # 8. 启用状态修正
+        self.lin.enable_state_correction(True)
+        
+        # 9. 更新原来的 aff_phys 偏置（只更新被标定的参数）
+        with torch.no_grad():
+            for i in target_indices:
+                error_mean = Delta[:, i].mean().item()
+                self.lin.aff_phys.bias[i] += error_mean
+        
+        print(f"岭回归完成，使用 {N_total} 个有效样本")
+        print(f"正则化系数 λ={reg}")
+        
+        # 10. 诊断几个样本的修正效果
+        if N_total > 0:
+            print("\n修正效果诊断（前3个样本）:")
+            for sample_idx in range(min(3, N_total)):
+                # 构建特征
+                phi_i = torch.cat([
+                    torch.ones(1, 1, device=device),
+                    H_norm[sample_idx:sample_idx+1],
+                    M_norm[sample_idx:sample_idx+1],
+                    U_low[sample_idx:sample_idx+1, :5]
+                ], dim=-1)
+                
+                # 计算预测修正量
+                corrections_pred = (phi_i[:, 1:] @ W_full.T + b_full).squeeze()
+                corrections_true = Delta[sample_idx]
+                
+                print(f"  样本{sample_idx}:")
+                for i in range(5):
+                    if i in target_indices:
+                        pred = corrections_pred[i].item()
+                        true = corrections_true[i].item()
+                        ratio = pred / (true + 1e-8)
+                        print(f"    {param_names[i]}: 预测修正={pred:.6f}, "
+                            f"需要修正={true:.6f}, 比例={ratio:.2f}")
 
 
     @torch.no_grad()
@@ -406,7 +583,6 @@ class MFDNN(nn.Module):
         b_old = self.lin.aff_pres.bias.detach().clone()
         self.lin.aff_pres.weight.copy_(a * w_old)
         self.lin.aff_pres.bias.copy_(a * b_old + b)
-
 
 
     # ===== 辅助：把 u 分量展平为 (B, D) =====
