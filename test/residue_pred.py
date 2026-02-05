@@ -37,7 +37,6 @@ def build_BA_from_residues(alpha, omega, rho, theta, Ts,
     rho   = rho[mask]
     theta = theta[mask]
 
-    print(mask)
     # ===== 连续 -> 离散 极点 =====
     p_plus  = np.exp((alpha + 1j*omega) * Ts)   # e^{(α+jω)Ts}
     p_minus = np.exp((alpha - 1j*omega) * Ts)   # e^{(α-jω)Ts}

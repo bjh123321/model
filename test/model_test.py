@@ -10,6 +10,7 @@ from scipy.signal import lfilter
 import pandas as pd
 from zero_pred import build_BA_from_zeros
 from residue_pred import build_BA_from_residues
+import argparse
 
 
 plt.rcParams.update({
@@ -123,17 +124,17 @@ def compute_spectrum(x, fs, window=False, mode="amplitude"):
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
-# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.80\1_H8.23_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.80\1_H8.23_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.90\1_H8.23_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
 
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H8.23\M1.4\H8.23_M1.4_方向舵对称_幅值0.6.txt")
+# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H8.23\M1.4\H8.23_M1.4_方向舵对称_幅值0.6.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.6.txt")
 
 # cur_dir = Path(__file__).parents[2] / "surrogate_model"
 # checkpoint_dir = "outputs_pzk"
 
 cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_smaller_net")
+checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad")
 
 checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
@@ -141,10 +142,11 @@ checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000_inc.pth"
 
+
 H = 8.23          # 高度
-M = 0.8        # 马赫数
+M = 1.4        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 15    # 响应通道
+ch_id  = 21    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 # col_y =17
@@ -167,7 +169,7 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-loss = ckpt.get("loss_history", None)
+# loss = ckpt.get("loss_history_real", None)
 # print(min(loss))
 
 # region
@@ -240,8 +242,23 @@ print("omega  :", np.array2string(omega, precision=6))
 print("rho   :", np.array2string(rho, precision=6))
 print("theta   :", np.array2string(theta, precision=6))
 print("----------------------------")
-data_to_save = [p_exist, alpha, omega, rho, theta]
-B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exist_thresh=0.56)
+
+mask = p_exist > 0.5
+freqs = omega[mask] / (2 * np.pi)
+# freqs = sorted(omega[mask] / (2 * np.pi))
+# print(freqs)
+damping_ratios = -alpha[mask] / np.sqrt(alpha[mask]**2 + omega[mask]**2)
+# damping_ratios = damping_ratios[idx]
+
+print("----------------------------")
+print("\n--- 网络输出 (模态参数) ---")
+print("frequency:", np.array2string(freqs, precision=2))
+print("damping ratio:", np.array2string(damping_ratios, precision=2))
+print("----------------------------")
+
+
+# data_to_save = [p_exist, alpha, omega, rho, theta]
+B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exist_thresh=0.5)
 
 
 # ==== 保存结果到 txt 文件 ====
@@ -254,18 +271,18 @@ B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exi
 y_hat = lfilter(B, A, u)
 
 
-plt.figure()
-plt.plot(loss, label="Loss")
-plt.xlim(100, 5000)
-plt.ylim(0, 0.2)
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("Training Loss History")
-plt.legend()
-plt.grid()
+# plt.figure()
+# plt.plot(loss, label="Loss")
+# plt.xlim(100, 5000)
+# plt.ylim(0, 0.2)
+# plt.xlabel("Epochs")
+# plt.ylabel("Loss")
+# plt.title("Training Loss History")
+# plt.legend()
+# plt.grid()
 
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
-ax1.plot(t, y/20, label="原始信号")
+ax1.plot(t, y/20, label="仿真信号")
 ax1.legend()
 
 ax2.plot(t, y_hat/20, label='预测信号')
@@ -276,7 +293,7 @@ bbox1 = ax1.get_position()
 bbox2 = ax2.get_position()
 y_center = (bbox1.y1 + bbox2.y0) / 2
 fig.text(
-    0.04, y_center, "幅值",
+    0.02, y_center, "加速度/g",
     rotation="vertical",
     va="center",
     fontsize=7
@@ -285,7 +302,7 @@ fig.text(
 
 
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
-label_names = ["原始信号频谱", "预测信号频谱"]
+label_names = ["仿真信号频谱", "预测信号频谱"]
 signals = [y, y_hat]
 for i, signal in enumerate(signals):
     f, S = compute_spectrum(signal, fs, mode="amplitude")
@@ -298,7 +315,7 @@ ax2.set_xlabel("频率/Hz")
 
 plt.subplots_adjust(hspace=0)
 fig.text(
-    0.04, y_center, "幅值",
+    0.02, y_center, "加速度幅度/g",
     rotation="vertical",
     va="center",
     fontsize=7
