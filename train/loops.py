@@ -118,6 +118,14 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         sim_parsed, real_parsed, cfg, args.kfold, fold, device, out_dir
     )
 
+
+    def _maybe_set_epoch(dl, epoch: int):
+        # dl.sampler 可能为 None（非DDP），也可能不是 DistributedSampler
+        sampler = getattr(dl, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+
+
     # excitation vocab size
     max_exc = 0
     for p in (sim_parsed + real_parsed):
@@ -129,9 +137,13 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     for name, p in model_core.named_parameters():
         if not name.startswith("low."):
             p.requires_grad = False
-    model = nn.parallel.DistributedDataParallel(
-        model_core, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
-    )
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1 and device.type == "cuda":
+        model = nn.parallel.DistributedDataParallel(
+            model_core, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+        )
+    else:
+        model = model_core  # 单进程/CPU/非DDP：直接用原模型
+
 
     norm_sim  = Normalizer.load(out_dir / 'Normalizer_Output_Sim.pth')
     norm_real = Normalizer.load(out_dir / f'Normalizer_Output_Real_Fold{fold}.pth')
@@ -201,7 +213,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
         for epoch in range(cfg.epochs_stage1):
             model.train()
-            sim_dl.sampler.set_epoch(epoch)
+            _maybe_set_epoch(sim_dl, epoch)
             sum_loss = 0.0; seen = 0
             comp_accum = {}; comp_count = 0
 
@@ -338,7 +350,6 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     scaler2 = torch.amp.GradScaler('cuda') if use_cuda else None
 
     # ====== PCGrad helpers（就地定义即可）======
-    import torch.distributed as dist
     from contextlib import contextmanager
 
     @contextmanager
@@ -389,8 +400,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
     for epoch in range(cfg.epochs_stage2):
         model.train()
-        real_dl.sampler.set_epoch(epoch)
-        sim_dl.sampler.set_epoch(epoch)
+        _maybe_set_epoch(real_dl, epoch)
+        _maybe_set_epoch(sim_dl, epoch)
         if sim_iter is None:
             sim_iter = cycle(sim_dl)
 
@@ -570,6 +581,17 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                         'lr_history': lr_hist_s2,
                     }, out_dir / f'checkpoint_stage2_fold{fold}_earlystop_epoch{epoch+1}.pth')
                 break
+
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    if is_main_process():
+        save_path = out_dir / (out_dir.name + '.pth')
+        torch.save(model_core.state_dict(), save_path)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
     # ============ Validation ============ #
