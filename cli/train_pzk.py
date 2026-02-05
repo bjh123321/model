@@ -1,6 +1,6 @@
 from __future__ import annotations
 from __future__ import annotations
-
+import multiprocessing as mp
 import os
 import sys
 import argparse
@@ -85,13 +85,13 @@ def main():
                         help='Set to 1 to train stage 2 on every fold, 0 to train once')
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
     parser.add_argument('--embed_channel_dim', type=int, default=12)
-    parser.add_argument('--epochs_s1', type=int, default=2)
-    parser.add_argument('--epochs_s2', type=int, default=2)
+    parser.add_argument('--epochs_s1', type=int, default=2000)
+    parser.add_argument('--epochs_s2', type=int, default=2000)
     parser.add_argument('--batch_sim', type=int, default=256)
     parser.add_argument('--batch_real', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--prefetch', type=int, default=4)
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     # DDP / device init
     is_ddp, rank, world_size = _ddp_setup()
@@ -145,5 +145,40 @@ def main():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-if __name__ == '__main__':
+    import socket
+    def udp_sender():
+        # 配置参数
+        HOST = 'localhost'
+        PORT = 12345
+        MESSAGE = "XGD_CONSTRUCTION_EXE_FINISHED"
+
+        # 创建UDP socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        try:
+            print("UDP发送端已启动")
+            print(f"目标地址: {HOST}:{PORT}")
+            print(f"发送内容: {MESSAGE}")
+            print("\n正在发送...")
+
+            # 发送消息
+            sock.sendto(MESSAGE.encode('utf-8'), (HOST, PORT))
+
+            print("消息发送成功！")
+
+        except Exception as e:
+            print(f"发送失败: {e}")
+        finally:
+            sock.close()
+            print("发送端已关闭")
+
+    udp_sender()
+
+
+if __name__ == "__main__":
+    mp.freeze_support()
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     main()
