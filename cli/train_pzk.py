@@ -1,53 +1,120 @@
 from __future__ import annotations
-import os, argparse
+from __future__ import annotations
+
+import os
+import sys
+import argparse
 from pathlib import Path
+
+# ------------------------------------------------------------
+# Make "python train_pzk_user.py" runnable from any working dir
+# This file is: .../surrogate_model/cli/train_pzk_user.py
+# Project root should be: .../ (two levels up from surrogate_model)
+# ------------------------------------------------------------
+_THIS_FILE = Path(__file__).resolve()
+# .../surrogate_model/cli/train_pzk_user.py -> parents[2] = .../ (project root)
+_PROJECT_ROOT = _THIS_FILE.parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 import torch
 import torch.distributed as dist
-from ..config import Config
-from ..data.io import read_variable_txt, parse_rows_to_struct
-from ..train.loops import train_one_fold
+
+from surrogate_model.config import Config
+from surrogate_model.data.io import read_variable_txt, parse_rows_to_struct
+from surrogate_model.train.loops import train_one_fold
+
+
+def get_exe_dir():
+    """
+    返回 exe 所在目录：
+    - 打包后（exe）：exe 文件所在目录
+    - 未打包（python 运行）：当前脚本所在目录
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).resolve().parent
+
+
+def _ddp_is_requested() -> bool:
+    # torchrun 会注入这些环境变量；普通 python 运行不会有
+    return ("RANK" in os.environ) and ("WORLD_SIZE" in os.environ)
+
+
+def _ddp_backend() -> str:
+    # Linux + CUDA 用 nccl；Windows 或 CPU 用 gloo
+    if torch.cuda.is_available() and sys.platform != "win32":
+        return "nccl"
+    return "gloo"
+
+
+def _ddp_setup() -> tuple[bool, int, int]:
+    """
+    Returns: (is_ddp, rank, world_size)
+    Only initializes process group when launched by torchrun.
+    """
+    if not _ddp_is_requested():
+        return False, 0, 1
+
+    dist.init_process_group(backend=_ddp_backend(), init_method="env://")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+
+    return True, rank, world_size
+
 
 def main():
+    base_dir = get_exe_dir()
+    user_input_path = base_dir / "user_input.dat"
+    with open(user_input_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+    model_version = lines[1].strip()
+
+    base_dir_parent = base_dir.parents[2]
     parser = argparse.ArgumentParser()
-    parser.add_argument('--sim_txt', type=str, required=True)
-    parser.add_argument('--real_txt', type=str, required=True)
-    parser.add_argument('--out_dir', type=str, default='./surrogate_model/outputs_pzk')
-    parser.add_argument('--kfold', type=int, default=5)
+    parser.add_argument('--out_dir', type=str, default=base_dir_parent / 'MX_XGD' / model_version)
+    parser.add_argument('--kfold', type=int, default=0)
     # parser.add_argument('--stage1_kfold', type=int, default=0, choices=[0, 1],
     #                     help='Set to 1 to train stage 1 on every fold, 0 to train once and reuse')
     parser.add_argument('--stage2_kfold', type=int, default=0, choices=[0, 1],
                         help='Set to 1 to train stage 2 on every fold, 0 to train once')
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
     parser.add_argument('--embed_channel_dim', type=int, default=12)
-    parser.add_argument('--epochs_s1', type=int, default=10000)
-    parser.add_argument('--epochs_s2', type=int, default=10000)
+    parser.add_argument('--epochs_s1', type=int, default=2)
+    parser.add_argument('--epochs_s2', type=int, default=2)
     parser.add_argument('--batch_sim', type=int, default=256)
     parser.add_argument('--batch_real', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--prefetch', type=int, default=4)
     args = parser.parse_args()
 
-    # DDP init
+    # DDP / device init
+    is_ddp, rank, world_size = _ddp_setup()
+
     if torch.cuda.is_available():
-        dist.init_process_group(backend='nccl')
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        torch.cuda.set_device(local_rank)
-    device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0))) if torch.cuda.is_available() else torch.device('cpu')
-    if torch.cuda.is_available():
-        # 1) 允许 TF32 (Ampere+ GPU)：对 matmul 和 cuDNN 都打开
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # 2) cuDNN 算法自动搜索最优实现（卷积更快；输入尺寸稳定时收益更大）
         torch.backends.cudnn.benchmark = True
-        # 3) PyTorch 2.x：提高 float32 matmul 的内部精度/性能权衡
         try:
-            torch.set_float32_matmul_precision('high')
+            torch.set_float32_matmul_precision("high")
         except Exception:
             pass
+    else:
+        device = torch.device("cpu")
 
+
+    sim_dataset_path = base_dir / "sim_dataset.txt"
+    real_dataset_path = base_dir / "real_dataset.txt"
+    
     # Read data
-    sim_rows  = read_variable_txt(Path(args.sim_txt))
-    real_rows = read_variable_txt(Path(args.real_txt))
+    sim_rows  = read_variable_txt(sim_dataset_path)
+    real_rows = read_variable_txt(real_dataset_path)
 
     sim_parsed, sim_stats   = parse_rows_to_struct(sim_rows)
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
@@ -75,7 +142,7 @@ def main():
         if dist.is_initialized():
             torch.cuda.empty_cache()
 
-    if dist.is_initialized():
+    if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
 if __name__ == '__main__':

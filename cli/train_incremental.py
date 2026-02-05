@@ -1,17 +1,62 @@
 # surrogate_model/cli/train_incremental.py
 import argparse
 from pathlib import Path
-
+import sys
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+import configparser
+from typing import Dict
 
-from ..config import Config
-from ..models.blocks import MFDNN, LoRALinear
-from ..losses.masked_mse import MaskedHungarianMSE
-from ..data.normalizer import Normalizer
-from ..data.io import parse_rows_to_struct
+from surrogate_model.config import Config
+from surrogate_model.models.blocks import MFDNN, LoRALinear
+from surrogate_model.losses.masked_mse import MaskedHungarianMSE
+from surrogate_model.data.normalizer import Normalizer
+from surrogate_model.data.io import parse_rows_to_struct
 
+
+def load_paths_ini(paths_ini: str) -> Dict[str, str]:
+    """读取“路径 ini”（你给的那类 GeneralParameter/.../CONFIG/xxx.ini 之外的路径总表）。
+
+    返回一个扁平 dict，例如：
+      {
+        "CONFIG": "D:/.../CONFIG",
+        "PR_XGD": "D:/.../PR/XGD",
+        "VG_CG": ".../VG_CG",
+        "VF_CG": ".../VF_CG",
+        "HG_CG": ".../HG_CG",
+        "HF_CG": ".../HF_CG",
+        ...
+      }
+
+    规则：
+    - 读取每个 section 里第一个以 'path_' 开头的 key。
+    - 返回的 key 为 section 名（去掉前后空格）。
+    """
+    cp = configparser.ConfigParser()
+    cp.read(paths_ini, encoding="utf-8")
+
+    out: Dict[str, str] = {}
+    for sec in cp.sections():
+        # 找形如 path_XXX 的键
+        kv = [(k, v) for k, v in cp[sec].items() if k.lower().startswith("path_")]
+        if not kv:
+            continue
+        # 取第一个 path_* 的值
+        _, v = kv[0]
+        out[sec.strip()] = str(v).strip()
+    return out
+
+
+def get_exe_dir():
+    """
+    返回 exe 所在目录：
+    - 打包后（exe）：exe 文件所在目录
+    - 未打包（python 运行）：当前脚本所在目录
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).resolve().parent
 
 # ===========================
 # 只对 alpha, omega, rho 做 z-score，sin/cos 不变
@@ -160,16 +205,37 @@ def kd_loss_fn(new: dict, old: dict, mask: torch.Tensor, w=1.0):
 
 
 def main():
+    base_dir = get_exe_dir()
+    user_input_path = base_dir / "user_input.dat"
+    with open(user_input_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    paths_ini = Path(lines[0].strip()).expanduser()
+    paths_map = load_paths_ini(paths_ini)
+
+    # 待修正模型版本
+    model_version = lines[1].strip()
+    new_model_version = lines[2].strip()
+
+    # ===== 模型文件路径 =====
+    model_dir = Path(paths_map.get("MX_XGD", "")).expanduser()
+
+    base_ckpt_path = model_dir / model_version / (model_version + ".pth")
+    new_txt_path = base_dir / "new_data.txt"
+    replay_txt_path = base_dir / "replay_data.txt"
+    save_ckpt_path = model_dir / new_model_version / (new_model_version + ".pth")
+    save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--base_ckpt", type=str, required=True, help="作为 teacher 的旧模型（也是 student 初始权重）")
-    ap.add_argument("--real_new_txt", type=str, required=True, help="新真实数据 txt")
-    ap.add_argument("--replay_txt", type=str, default="", help="旧样本(真实/仿真) txt（可选）")
+    # ap.add_argument("--base_ckpt", type=str, required=True, help="作为 teacher 的旧模型（也是 student 初始权重）")
+    # ap.add_argument("--real_new_txt", type=str, required=True, help="新真实数据 txt")
+    # ap.add_argument("--replay_txt", type=str, default="", help="旧样本(真实/仿真) txt（可选）")
     ap.add_argument("--epochs", type=int, default=200)
-    ap.add_argument("--batch_size", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--batch_size", type=int, default=16)
+    ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--beta_kd", type=float, default=0.2)
     ap.add_argument("--gamma_replay", type=float, default=0.2)
-    ap.add_argument("--save_ckpt", type=str, default="")
+    # ap.add_argument("--save_ckpt", type=str, default="")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -181,7 +247,7 @@ def main():
     teacher = MFDNN(cfg).to(device).eval()
 
     # 载入同一份 base ckpt
-    ckpt = torch.load(args.base_ckpt, map_location="cpu")
+    ckpt = torch.load(base_ckpt_path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
     student.load_state_dict(state, strict=False)
     teacher.load_state_dict(state, strict=False)
@@ -190,18 +256,18 @@ def main():
     freeze_backbone_open_lora(student)
 
     # ------- 载入 normalizer（和 online_ridge 一样的命名） -------
-    ckpt_path = Path(args.base_ckpt)
-    in_norm_path = ckpt_path.with_name("Normalizer_Input_Sim.pth")
-    out_norm_path = ckpt_path.with_name("Normalizer_Output_Real_Fold0.pth")
+    ckpt_path = base_ckpt_path
+    in_norm_path = model_dir / "Normalizer_Input.pth"
+    out_norm_path = model_dir / "Normalizer_Output.pth"
     in_norm = Normalizer.load(in_norm_path)
     out_norm = Normalizer.load(out_norm_path)
 
     # ------- 数据集：直接用上面的 RealIncrementalDataset -------
-    ds_new = RealIncrementalDataset(args.real_new_txt, in_norm, out_norm)
+    ds_new = RealIncrementalDataset(new_txt_path, in_norm, out_norm)
 
     ds_replay = None
-    if args.replay_txt and args.replay_txt.strip():
-        ds_replay = RealIncrementalDataset(args.replay_txt, in_norm, out_norm)
+    if replay_txt_path:
+        ds_replay = RealIncrementalDataset(replay_txt_path, in_norm, out_norm)
 
     dl_new = DataLoader(ds_new, batch_size=args.batch_size, shuffle=True, drop_last=False)
     dl_replay = DataLoader(ds_replay, batch_size=args.batch_size, shuffle=True, drop_last=False) if ds_replay is not None else None
@@ -298,10 +364,39 @@ def main():
             )
 
     # ------- 保存 student 权重（带 LoRA 增量更新） -------
-    save_path = args.save_ckpt or (str(Path(args.base_ckpt).with_suffix("")) + "_inc.pth")
+    save_path = save_ckpt_path or (str(Path(base_ckpt_path).with_suffix("")) + "_inc.pth")
     torch.save({"model_state_dict": student.state_dict()}, save_path)
     print(f"[OK] Incremental (LoRA+Replay+KD) saved to: {save_path}")
 
+
+    import socket
+    def udp_sender():
+        # 配置参数
+        HOST = 'localhost'
+        PORT = 12345
+        MESSAGE = "XGD_CORRECTION_EXE_FINISHED"
+
+        # 创建UDP socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        try:
+            print("UDP发送端已启动")
+            print(f"目标地址: {HOST}:{PORT}")
+            print(f"发送内容: {MESSAGE}")
+            print("\n正在发送...")
+
+            # 发送消息
+            sock.sendto(MESSAGE.encode('utf-8'), (HOST, PORT))
+
+            print("消息发送成功！")
+
+        except Exception as e:
+            print(f"发送失败: {e}")
+        finally:
+            sock.close()
+            print("发送端已关闭")
+
+    udp_sender()
 
 if __name__ == "__main__":
     main()
