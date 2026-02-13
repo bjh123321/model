@@ -11,11 +11,6 @@ from pathlib import Path
 # This file is: .../surrogate_model/cli/train_pzk_user.py
 # Project root should be: .../ (two levels up from surrogate_model)
 # ------------------------------------------------------------
-_THIS_FILE = Path(__file__).resolve()
-# .../surrogate_model/cli/train_pzk_user.py -> parents[2] = .../ (project root)
-_PROJECT_ROOT = _THIS_FILE.parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import torch
 import torch.distributed as dist
@@ -75,7 +70,7 @@ def main():
         lines = f.readlines()
     model_version = lines[1].strip()
 
-    base_dir_parent = base_dir.parents[2]
+    base_dir_parent = base_dir.parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument('--out_dir', type=str, default=base_dir_parent / 'MX_XGD' / model_version)
     parser.add_argument('--kfold', type=int, default=0)
@@ -165,7 +160,7 @@ def main():
             sock.sendto(MESSAGE.encode('utf-8'), (HOST, PORT))
 
             print("消息发送成功！")
-
+            
         except Exception as e:
             print(f"发送失败: {e}")
         finally:
