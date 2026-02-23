@@ -29,7 +29,7 @@ class Config:
     # Train/Val split
     # - False: 使用全部数据训练（不划分验证集），early-stop / LR-scheduler 依据训练损失（保持原逻辑）
     # - True : 划分训练集与验证集，每个 epoch 计算验证集损失，并以其进行 early-stop / LR-scheduler
-    use_val_split: bool = True
+    use_val_split: bool = False
     val_ratio: float = 0.2
     val_seed: int = 42
 
@@ -45,7 +45,7 @@ class Config:
     weight_decay: float = 5e-5
 
     # 网络与损失
-    use_modulation: bool = False
+    use_modulation: bool = True
     use_modulation_in_high: bool = False
     use_hungarian_loss: bool = True
 
