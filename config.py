@@ -13,7 +13,7 @@ class Config:
     low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 256, 128, 64])
     # low_hidden: List[int] = field(default_factory=lambda: [64, 128, 256, 128, 64])
     mod_hidden: List[int] = field(default_factory=lambda: [32, 64])            # 调制头
-    adapt_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 128, 64])
+    adapt_hidden: List[int] = field(default_factory=lambda: [64, 128, 256, 128, 64])
     # adapt_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     dropout_prob: float = 0
     mod_gamma: float = 0.2
@@ -25,6 +25,13 @@ class Config:
     batch_real: int = 64
     num_workers: int = 8
     prefetch: int = 4
+
+    # Train/Val split
+    # - False: 使用全部数据训练（不划分验证集），early-stop / LR-scheduler 依据训练损失（保持原逻辑）
+    # - True : 划分训练集与验证集，每个 epoch 计算验证集损失，并以其进行 early-stop / LR-scheduler
+    use_val_split: bool = True
+    val_ratio: float = 0.2
+    val_seed: int = 42
 
     epochs_stage1: int = 10000
     epochs_stage2: int = 10000
@@ -38,7 +45,7 @@ class Config:
     weight_decay: float = 5e-5
 
     # 网络与损失
-    use_modulation: bool = True
+    use_modulation: bool = False
     use_modulation_in_high: bool = False
     use_hungarian_loss: bool = True
 

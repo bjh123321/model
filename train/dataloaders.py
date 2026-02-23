@@ -1,5 +1,5 @@
-from __future__ import annotations
 from pathlib import Path
+import numpy as np
 from typing import List
 import torch
 import torch.distributed as dist
@@ -30,46 +30,77 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     if is_main_process():
         out_norm_sim.save(out_dir / 'Normalizer_Output_Sim.pth')
 
-    # === 如果 kfold == 1，直接使用全部数据，不分折 ===
-    if kfold <= 1:
-        real_train = real_parsed
-        real_val   = []    # 或者 real_val = [] 根据你是否需要验证
+    # ========= Train/Val split =========
+    # cfg.use_val_split=False: 使用全部数据训练（不划分验证集），保持原有训练逻辑
+    # cfg.use_val_split=True : 划分验证集；当 kfold>1 时沿用 KFold，否则按 cfg.val_ratio 随机划分
+    use_val_split = bool(getattr(cfg, "use_val_split", False))
+    val_ratio = float(getattr(cfg, "val_ratio", 0.2))
+    seed = int(getattr(cfg, "val_seed", 42))
+
+    # --- Sim split (给 Stage-1 用) ---
+    if use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
+        rng = np.random.default_rng(seed)
+        idx = np.arange(len(sim_parsed))
+        rng.shuffle(idx)
+        n_val = max(1, int(round(len(sim_parsed) * val_ratio)))
+        val_idx = idx[:n_val]
+        tr_idx  = idx[n_val:]
+        sim_train = [sim_parsed[i] for i in tr_idx]
+        sim_val   = [sim_parsed[i] for i in val_idx]
     else:
-        # 正常 kfold 流程
-        kf = KFold(n_splits=kfold, shuffle=True, random_state=42)
-        indices = list(range(len(real_parsed)))
-        train_idx, val_idx = list(kf.split(indices))[fold_idx]
+        sim_train = sim_parsed
+        sim_val   = []
 
-        real_train = [real_parsed[i] for i in train_idx]
-        real_val   = [real_parsed[i] for i in val_idx]
-
+    # --- Real split (给 Stage-2 & final validation 用) ---
+    if use_val_split:
+        if kfold > 1 and len(real_parsed) > 1:
+            kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
+            indices = list(range(len(real_parsed)))
+            train_idx, val_idx = list(kf.split(indices))[fold_idx]
+            real_train = [real_parsed[i] for i in train_idx]
+            real_val   = [real_parsed[i] for i in val_idx]
+        elif (0.0 < val_ratio < 1.0) and (len(real_parsed) > 1):
+            rng = np.random.default_rng(seed + 1000)
+            idx = np.arange(len(real_parsed))
+            rng.shuffle(idx)
+            n_val = max(1, int(round(len(real_parsed) * val_ratio)))
+            val_idx = idx[:n_val]
+            tr_idx  = idx[n_val:]
+            real_train = [real_parsed[i] for i in tr_idx]
+            real_val   = [real_parsed[i] for i in val_idx]
+        else:
+            real_train = real_parsed
+            real_val   = []
+    else:
+        # 不划分验证集：全部用于训练
+        real_train = real_parsed
+        real_val   = []
 
     out_norm_real = compute_output_normalizer_masked(real_train)
     if is_main_process():
         out_norm_real.save(out_dir / f'Normalizer_Output_Real_Fold{fold_idx}.pth')
 
-    sim_ds  = ModalDataset(sim_parsed, cfg.K_max, in_norm_sim, out_norm_sim)
+    sim_ds  = ModalDataset(sim_train, cfg.K_max, in_norm_sim, out_norm_sim)
+    sim_va  = ModalDataset(sim_val,   cfg.K_max, in_norm_sim, out_norm_sim)
     real_tr = ModalDataset(real_train, cfg.K_max, in_norm_sim, out_norm_real)
     real_va = ModalDataset(real_val,   cfg.K_max, in_norm_sim, out_norm_real)
 
     if _ddp_ready():
-        sim_sampler  = DistributedSampler(sim_ds, shuffle=True, drop_last=True)
-        real_sampler = DistributedSampler(real_tr, shuffle=True, drop_last=True)
-        val_sampler  = DistributedSampler(real_va, shuffle=False, drop_last=False)
+        sim_sampler  = DistributedSampler(sim_ds,  shuffle=True,  drop_last=True) if len(sim_ds)  > 0 else None
+        real_sampler = DistributedSampler(real_tr, shuffle=True,  drop_last=True) if len(real_tr) > 0 else None
+        sim_val_sampler = DistributedSampler(sim_va, shuffle=False, drop_last=False) if len(sim_va) > 0 else None
+        val_sampler  = DistributedSampler(real_va, shuffle=False, drop_last=False) if len(real_va) > 0 else None
     else:
         sim_sampler  = None
         real_sampler = None
+        sim_val_sampler = None
         val_sampler  = None
 
-
-    # ---- DataLoader (DDP compatible + non-DDP safe) ----
-    sim_shuffle  = (sim_sampler is None)   # non-DDP: shuffle; DDP: sampler controls shuffle
+    sim_shuffle  = (sim_sampler is None)
     real_shuffle = (real_sampler is None)
 
-    # pin_memory only helps on CUDA; keep it safe for CPU/Windows
     _pin = bool(torch.cuda.is_available())
 
-    # prefetch_factor / persistent_workers only valid when num_workers > 0
     _nw = int(cfg.num_workers)
     _dl_kwargs = dict(
         num_workers=_nw,
@@ -98,6 +129,14 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         **_dl_kwargs
     )
 
+    sim_val_dl = DataLoader(
+        sim_va,
+        batch_size=cfg.batch_sim,
+        shuffle=False,
+        sampler=sim_val_sampler,
+        **_dl_kwargs
+    )
+
     val_dl = DataLoader(
         real_va,
         batch_size=cfg.batch_real,
@@ -106,5 +145,4 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         **_dl_kwargs
     )
 
-
-    return sim_dl, real_dl, val_dl, len(sim_ds), len(real_tr)
+    return sim_dl, real_dl, sim_val_dl, val_dl, len(sim_ds), len(real_tr)

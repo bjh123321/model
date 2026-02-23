@@ -23,6 +23,39 @@ from ..utils.pcgrad import (
 def _cur_lr(optimizer):
     return optimizer.param_groups[0]['lr']
 
+def _eval_loss(model, dl, crit, device, forward_high: bool):
+    """在给定 DataLoader 上计算平均损失；DDP 场景下做 all-reduce。"""
+    if dl is None:
+        return None
+    model.eval()
+    vsum, vcnt = 0.0, 0
+    with torch.no_grad():
+        for H, M, e, c, mask, yN in dl:
+            H = H.to(device, non_blocking=True)
+            M = M.to(device, non_blocking=True)
+            e = e.to(device, non_blocking=True)
+            c = c.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
+            if forward_high:
+                _, out = model(H, M, e, c)
+            else:
+                out, _ = model(H, M, e, c)
+            loss = crit(out, yN, mask)
+            bs = H.size(0)
+            vsum += float(loss.item()) * bs
+            vcnt += bs
+
+    t_sum = torch.tensor(vsum, device=device)
+    t_cnt = torch.tensor(vcnt, device=device, dtype=torch.float32)
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t_cnt, op=dist.ReduceOp.SUM)
+
+    if t_cnt.item() <= 0:
+        return None
+    return (t_sum / t_cnt).item()
+
 def _mse_per_param_z(pred, yN, mask, mean, std):
     P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # [B,3,K]
     P1 = torch.stack([pred['sin_theta'], pred['cos_theta']], dim=1)      # [B,2,K]
@@ -114,7 +147,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    sim_dl, real_dl, val_dl, N_sim, N_real = build_dataloaders(
+    sim_dl, real_dl, sim_val_dl, val_dl, N_sim, N_real = build_dataloaders(
         sim_parsed, real_parsed, cfg, args.kfold, fold, device, out_dir
     )
 
@@ -260,9 +293,19 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             loss_hist.append(float(epoch_loss_w))
             lr_hist.append(_cur_lr(opt1))
 
+            # ---- validation (Stage-1: sim) ----
+            use_val_split = bool(getattr(cfg, "use_val_split", False))
+            val_loss_w = None
+            if use_val_split:
+                val_loss = _eval_loss(model, sim_val_dl, crit_s1, device, forward_high=False)
+                if val_loss is not None:
+                    val_loss_w = dist_mean_scalar(val_loss, device)
+
+            metric_s1 = float(val_loss_w) if val_loss_w is not None else float(epoch_loss_w)
+
             if is_main_process():
                 prev_lr = _cur_lr(opt1)
-            sched1.step(epoch_loss_w)
+            sched1.step(metric_s1)
             if is_main_process():
                 now_lr = _cur_lr(opt1)
                 if now_lr < prev_lr:
@@ -291,7 +334,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 )
 
             if epoch_loss_w < best_sim - cfg.early_stop_min_delta:
-                best_sim = epoch_loss_w; no_improve = 0
+                best_sim = metric_s1; no_improve = 0
                 if is_main_process():
                     torch.save({
                         'fold': fold, 'stage': 1, 'epoch': epoch + 1,
@@ -314,6 +357,9 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                             'loss_history': loss_hist,
                             'lr_history': lr_hist,
                         }, out_dir / f'checkpoint_stage1_fold{fold}_earlystop_epoch{epoch+1}.pth')
+                        print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
+                        f'sim_loss={epoch_loss_w:.6f}' + (f' val_loss={metric_s1:.6f}' if (val_loss_w is not None) else '')
+                        + f' lr={_cur_lr(opt1):.3e}', flush=True)
                     break
     else:
         # 复用时依然需要把 high 层在 S1 期间禁用梯度（保持与常规路径一致），然后在 S2 再开启
@@ -515,9 +561,17 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         real_epoch  = (t_real / t_cnt_r).item() if t_cnt_r.item() > 0 else 0.0
         total_epoch = float(w_sim*sim_epoch + w_real*real_epoch)
 
+        # ---- validation (Stage-2: real) ----
+        use_val_split = bool(getattr(cfg, "use_val_split", False))
+        val_real_epoch = None
+        if use_val_split:
+            val_real_epoch = _eval_loss(model, val_dl, crit_s2, device, forward_high=True)
+
+        metric_s2 = float(val_real_epoch) if (val_real_epoch is not None) else float(total_epoch)
+
         if is_main_process():
             prev_lr2 = _cur_lr(opt2)
-        sched2.step(total_epoch)
+        sched2.step(metric_s2)
         if is_main_process():
             now_lr2 = _cur_lr(opt2)
             if now_lr2 < prev_lr2:
@@ -549,7 +603,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 print(f"  ⏺️ Saved checkpoint: {save_path.name}")
 
         if total_epoch < best_total - cfg.early_stop_min_delta:
-            best_total = total_epoch; no_improve = 0
+            best_total = metric_s2; no_improve = 0
             if is_main_process():
                 torch.save({
                     'fold': fold, 'stage': 2, 'epoch': epoch + 1,
@@ -580,8 +634,11 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                         'loss_history_real':  real_hist,
                         'lr_history': lr_hist_s2,
                     }, out_dir / f'checkpoint_stage2_fold{fold}_earlystop_epoch{epoch+1}.pth')
+                    print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
+                      f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
+                      + (f'val_real={metric_s2:.6f} ' if (val_real_epoch is not None) else '')
+                      + f'lr={_cur_lr(opt2):.3e}', flush=True)
                 break
-
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -598,26 +655,17 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     model.eval()
     if cfg.use_hungarian_loss:
         crit_eval = MaskedHungarianMSE(mean=mean_real, std=std_real,
-                                       w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                                       w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
-                                       w_cos_theta=w_s2_cos_theta)
+                                    w_alpha=w_s2_alpha, w_omega=w_s2_omega,
+                                    w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
+                                    w_cos_theta=w_s2_cos_theta)
     else:
         crit_eval = MaskedMSE(mean=mean_real, std=std_real,
-                              w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                              w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
-                              w_cos_theta=w_s2_cos_theta)
-    with torch.no_grad():
-        vsum, vcnt = 0.0, 0
-        for H, M, e, c, mask, yN in val_dl:
-            H = H.to(device, non_blocking=True)
-            M = M.to(device, non_blocking=True)
-            e = e.to(device, non_blocking=True)
-            c = c.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-            for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
-            _, outH = model(H, M, e, c) 
-            loss = crit_eval(outH, yN, mask)
-            bs = H.size(0)
-            vsum += loss.item() * bs; vcnt += bs
-        vloss = vsum / max(1, vcnt)
+                            w_alpha=w_s2_alpha, w_omega=w_s2_omega,
+                            w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
+                            w_cos_theta=w_s2_cos_theta)
+
+    vloss = _eval_loss(model, val_dl, crit_eval, device, forward_high=True)
+    if vloss is None:
+        vloss = float('nan')
+
     return vloss, best_total, sim_hist, real_hist, total_hist
