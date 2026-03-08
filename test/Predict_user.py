@@ -5,7 +5,7 @@ import configparser
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
@@ -34,17 +34,17 @@ from functools import lru_cache
 
 
 @lru_cache(maxsize=None)
-def _load_channel_freq_ranges(csv_path: Path) -> Dict[str, List[Tuple[float, float] | None]]:
+def _load_channel_freq_ranges(csv_path: Path) -> Dict[str, List[Optional[Tuple[float, float]]]]:
     """读取通道频率范围表（csv）。每行格式：channel, r1, r2, r3
     其中 r? 形如 '0-20'，允许为空。返回 {channel: [ (fmin,fmax) or None ] * 3 }。
     """
     df = pd.read_csv(csv_path, header=None, dtype=str, encoding="utf-8-sig")
-    mp: Dict[str, List[Tuple[float, float] | None]] = {}
+    mp: Dict[str, List[Optional[Tuple[float, float]]]] = {}
     for _, row in df.iterrows():
         ch = (row.iloc[0] or "").strip()
         if not ch:
             continue
-        ranges: List[Tuple[float, float] | None] = []
+        ranges: List[Optional[Tuple[float, float]]] = []
         for k in range(1, 4):
             val = ""
             if k < len(row):
@@ -72,7 +72,7 @@ def _select_modes_by_freq_ranges(
     alpha_all: np.ndarray,
     omega_all: np.ndarray,
     rho_all: np.ndarray,
-    ranges: List[Tuple[float, float] | None],
+    ranges: List[Optional[Tuple[float, float]]],
 ) -> Tuple[List[int], List[str], List[str]]:
     """按 ranges（最多3个频率段）筛选模态：
     - 每个频率段至多取 1 个模态（rho 最大）
@@ -456,7 +456,9 @@ def save_response_dat(
     resp_dir: Path,
     resp_result_dir: Path,
     model_version: str,
+    exc_table: Dict[str, List[ExcSegment]],
     exist_thresh: float = 0.5,
+    peak_win_sec: float = 0.5,
 ):
     """
     保存响应文件：一个 entry 一个文件
@@ -552,14 +554,14 @@ def save_response_dat(
     fd_path = resp_result_dir / fd_fname
     fd_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd_lines = ["ch,freq1,damp1,freq2,damp2,freq3,damp3\n"]
+    fd_lines = ["ch,freq1,damp1,pp1,freq2,damp2,pp2,freq3,damp3,pp3\n"]
     for ch in chs:
         ch_idx = int(ch)
         ch_name = channels[ch_idx]
 
         mask = outs_resp["p_exist"][ch_idx] > exist_thresh
         if not np.any(mask):
-            fd_lines.append(f"{ch_name},,,\n")
+            fd_lines.append(f"{ch_name}," + ",".join([""] * 9) + "\n")
             continue
 
         w_all = outs_resp["omega"][ch_idx, mask]
@@ -579,11 +581,51 @@ def save_response_dat(
             ranges=ranges,
         )
 
-        # 交替写入 freq,damp（3个槽位 -> 6列；空槽位用逗号占位）
+        # 交替写入 freq,damp,pp（3个槽位 -> 9列；空槽位用逗号占位）
+        fs = 1.0 / Ts
+        segs = exc_table.get(entry.kind, [])
+        seg_list = []
+        t_off = 0.0
+        for seg in segs:
+            seg_list.append((seg.f0, seg.f1, seg.dur, t_off))
+            t_off += seg.dur
+
         tail = []
         for i in range(3):
-            tail.append(freq_slots[i] if i < len(freq_slots) else "")
-            tail.append(damp_slots[i] if i < len(damp_slots) else "")
+            f_str = freq_slots[i] if i < len(freq_slots) else ""
+            d_str = damp_slots[i] if i < len(damp_slots) else ""
+
+            # 默认空 pp
+            pp_str = ""
+
+            if f_str != "":
+                try:
+                    f_hz = float(f_str)
+                except Exception:
+                    f_hz = None
+
+                if f_hz is not None and len(seg_list) > 0:
+                    idx0 = None
+                    for (f0, f1, dur, t0) in seg_list:
+                        f_lo = min(f0, f1)
+                        f_hi = max(f0, f1)
+                        if f_lo <= f_hz <= f_hi and abs(f1 - f0) > 1e-12:
+                            t_local = dur * (f_hz - f0) / (f1 - f0)
+                            t_g = t0 + t_local
+                            idx0 = int(round(t_g * fs))
+                            break
+
+                    if idx0 is not None:
+                        half = int(round(peak_win_sec * fs))
+                        i0 = max(0, idx0 - half)
+                        i1 = min(N, idx0 + half + 1)
+                        if i1 > i0:
+                            pp = float(np.max(np.abs(Y_hat[i0:i1, ch_idx])))
+                            pp_str = f"{pp:.6f}"
+
+            tail.append(f_str)
+            tail.append(d_str)
+            tail.append(pp_str)
 
         fd_lines.append(f"{ch_name}," + ",".join(tail) + "\n")
 
@@ -814,7 +856,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("==> Loading ckpt...")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
 
     model = MFDNN(cfg).to(device)
@@ -859,7 +904,7 @@ def main():
         if u.size == 0:
             print(f"  [WARN] u(t) 长度为 0，跳过 RESP 保存：{entry.raw}")
         else:
-            save_response_dat(entry, Ts, u, outs_resp, csv_path, resp_dir, resp_result_dir, model_version, exist_thresh)
+            save_response_dat(entry, Ts, u, outs_resp, csv_path, resp_dir, resp_result_dir, model_version, exc_table, exist_thresh)
 
         # ---------- B) HF/HG：固定 M 扫 H_axis（裁剪通道） ----------
         chs_plot = channels_for_exc_plot(entry.exc_id)

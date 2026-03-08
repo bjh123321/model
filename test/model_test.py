@@ -124,8 +124,8 @@ def compute_spectrum(x, fs, window=False, mode="amplitude"):
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
-data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.80\1_H8.23_M0.80_方向舵对称_1-45Hz_幅值0.3.txt")
-# data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523标准\H8.23\M0.90\1_H8.23_M0.90_方向舵对称_1-45Hz_幅值0.3.txt")
+# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据-ReConstr\H8d23-ReConstr\20250624_H8d23_M1d05-ReConstr\H8d23_M1d05_FXD_同_幅值0d6-ReConstr.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\南航仿真\20250523标准\H8.23\M1.05\1_H8.23_M1.05_方向舵对称_1-45Hz_幅值0.3.txt")
 
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H8.23\M1.4\H8.23_M1.4_方向舵对称_幅值0.6.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.6.txt")
@@ -133,10 +133,11 @@ data_file = Path(r"D:\BaiduSyncdisk\项目\项目数据\南航数据\35\20250523
 # cur_dir = Path(__file__).parents[2] / "surrogate_model"
 # checkpoint_dir = "outputs_pzk"
 
-cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-checkpoint_dir = Path(r"outputs_pzk_from_opt_dev_full_final_sim0.2real1lossweight_LHF6_pcgrad")
+# cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
+cur_dir = Path(r"D:\BaiduSyncdisk\Code\Python\MX_XGD")
+checkpoint_dir = Path(r"XGD_mx_20260130_v1")
 
-checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
+checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
@@ -144,13 +145,13 @@ checkpoint_file = "checkpoint_stage1_fold0_epoch5000.pth"
 
 
 H = 8.23          # 高度
-M = 1.4        # 马赫数
+M = 1.05        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 21    # 响应通道
+ch_id  = 13    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 # col_y =17
-fs = 256
+fs = 512
 Ts = 1.0 / 512
 
 df = pd.read_table(data_file, sep=r"[,\t ]+", engine="python")
@@ -169,7 +170,7 @@ out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-# loss = ckpt.get("loss_history_real", None)
+loss = ckpt.get("loss_history_real", None)
 # print(min(loss))
 
 # region
@@ -271,15 +272,15 @@ B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exi
 y_hat = lfilter(B, A, u)
 
 
-# plt.figure()
-# plt.plot(loss, label="Loss")
-# plt.xlim(100, 5000)
-# plt.ylim(0, 0.2)
-# plt.xlabel("Epochs")
-# plt.ylabel("Loss")
-# plt.title("Training Loss History")
-# plt.legend()
-# plt.grid()
+plt.figure()
+plt.plot(loss, label="Loss")
+plt.xlim(0, 5000)
+plt.ylim(0, 0.2)
+plt.xlabel("Epochs")
+plt.ylabel("Loss")
+plt.title("Training Loss History")
+plt.legend()
+plt.grid()
 
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
 ax1.plot(t, y/20, label="仿真信号")
@@ -310,7 +311,7 @@ for i, signal in enumerate(signals):
     ax.plot(f, S, label=label_names[i])
     ax.legend()
 
-plt.xlim(0, 30)
+plt.xlim(0, 60)
 ax2.set_xlabel("频率/Hz")
 
 plt.subplots_adjust(hspace=0)
