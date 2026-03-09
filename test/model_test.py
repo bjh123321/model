@@ -124,8 +124,8 @@ def compute_spectrum(x, fs, window=False, mode="amplitude"):
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
-# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据-ReConstr\H8d23-ReConstr\20250624_H8d23_M1d05-ReConstr\H8d23_M1d05_FXD_同_幅值0d6-ReConstr.txt")
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\南航仿真\20250523标准\H8.23\M1.05\1_H8.23_M1.05_方向舵对称_1-45Hz_幅值0.3.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据-ReConstr\H8d23-ReConstr\20250624_H8d23_M1d05-ReConstr\H8d23_M1d05_FXD_同_幅值0d6-ReConstr.txt")
+# data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\南航仿真\20250523标准\H8.23\M1.05\1_H8.23_M1.05_方向舵对称_1-45Hz_幅值0.3.txt")
 
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H8.23\M1.4\H8.23_M1.4_方向舵对称_幅值0.6.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H11\M0.95\H11_M0.95_方向舵对称_幅值0.6.txt")
@@ -137,7 +137,7 @@ data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\南航仿真\2025052
 cur_dir = Path(r"D:\BaiduSyncdisk\Code\Python\MX_XGD")
 checkpoint_dir = Path(r"XGD_mx_20260130_v1")
 
-checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
+checkpoint_file = "XGD_mx_20260130_v1.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
@@ -147,7 +147,7 @@ checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 H = 8.23          # 高度
 M = 1.05        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 13    # 响应通道
+ch_id  = 17    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 # col_y =17
