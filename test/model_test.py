@@ -124,7 +124,7 @@ def compute_spectrum(x, fs, window=False, mode="amplitude"):
 
 # ==== 配置区域 ====
 real = True  # 是否使用真实响应网络
-data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据-ReConstr\H8d23-ReConstr\20250624_H8d23_M1d05-ReConstr\H8d23_M1d05_FXD_同_幅值0d6-ReConstr.txt")
+data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据\H8d23\20250919_H8d23_M1d4\H8d23_M1d4_FXD_同_幅值0d6.txt")
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\南航仿真\20250523标准\H8.23\M1.05\1_H8.23_M1.05_方向舵对称_1-45Hz_幅值0.3.txt")
 
 # data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据35A\H8.23\M1.4\H8.23_M1.4_方向舵对称_幅值0.6.txt")
@@ -134,20 +134,20 @@ data_file = Path(r"D:\BaiduSyncdisk\项目\试飞数据\35A\试飞数据-ReConst
 # checkpoint_dir = "outputs_pzk"
 
 # cur_dir = Path(r'D:\BaiduSyncdisk\Code\Python\traindata\35')
-cur_dir = Path(r"D:\BaiduSyncdisk\Code\Python\MX_XGD")
-checkpoint_dir = Path(r"XGD_mx_20260130_v1")
+cur_dir = Path(r"D:\BaiduSyncdisk\项目\项目材料\代理模型二期\20260202沈阳联合办公\GeneralParameter\J35_001_none\MX_XGD")
+checkpoint_dir = Path(r"XGD_mx_20260201_v2")
 
-checkpoint_file = "XGD_mx_20260130_v1.pth"
+checkpoint_file = "XGD_mx_20260201_v2.pth"
 # checkpoint_file = "checkpoint_stage1_fold0_epoch5000_lhf.pth"
 
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000.pth"
 # checkpoint_file = "checkpoint_stage2_fold0_epoch5000_inc.pth"
 
 
-H = 8.23          # 高度
-M = 1.05        # 马赫数
+H = 8.23         # 高度
+M = 1.4        # 马赫数
 exc_id = 0      # 激励方式
-ch_id  = 17    # 响应通道
+ch_id  = 14    # 响应通道
 col_u = 0      # 激励
 col_y = ch_id + 2
 # col_y =17
@@ -165,12 +165,12 @@ cfg = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 ckpt_path = cur_dir / checkpoint_dir / checkpoint_file
 in_norm_path  = cur_dir / checkpoint_dir / "Normalizer_Input_Sim.pth"
-out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
+# out_norm_path = cur_dir / checkpoint_dir / "Normalizer_Real_Fold0.pth"
 # ==== 加载 ====
 print("==> Loading ckpt...")
 ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 state = ckpt.get("model_state_dict", ckpt)
-loss = ckpt.get("loss_history_real", None)
+# loss = ckpt.get("loss_history_real", None)
 # print(min(loss))
 
 # region
@@ -272,21 +272,21 @@ B, A = build_BA_from_residues(alpha, omega, rho, theta, Ts, p_exist=p_exist, exi
 y_hat = lfilter(B, A, u)
 
 
-plt.figure()
-plt.plot(loss, label="Loss")
-plt.xlim(0, 5000)
-plt.ylim(0, 0.2)
-plt.xlabel("Epochs")
-plt.ylabel("Loss")
-plt.title("Training Loss History")
-plt.legend()
-plt.grid()
+# plt.figure()
+# plt.plot(loss, label="Loss")
+# plt.xlim(0, 5000)
+# plt.ylim(0, 0.2)
+# plt.xlabel("Epochs")
+# plt.ylabel("Loss")
+# plt.title("Training Loss History")
+# plt.legend()
+# plt.grid()
 
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, sharey=True)
-ax1.plot(t, y/20, label="仿真信号")
+ax1.plot(t, y, label="仿真信号")
 ax1.legend()
 
-ax2.plot(t, y_hat/20, label='预测信号')
+ax2.plot(t, y_hat, label='预测信号')
 ax2.legend()
 ax2.set_xlabel("时间/s")
 plt.subplots_adjust(hspace=0)
