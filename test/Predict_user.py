@@ -5,7 +5,7 @@ import configparser
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
@@ -15,6 +15,8 @@ from surrogate_model.config import Config
 from surrogate_model.models.blocks import MFDNN
 from surrogate_model.data.normalizer import Normalizer
 from residue_pred import build_BA_from_residues
+# from Error import calc_relative_error
+from pp_utils import build_exc_seg_list, calc_pp_for_freq
 
 
 def get_exe_dir():
@@ -32,19 +34,18 @@ def get_exe_dir():
 
 from functools import lru_cache
 
-
 @lru_cache(maxsize=None)
-def _load_channel_freq_ranges(csv_path: Path) -> Dict[str, List[Tuple[float, float] | None]]:
+def _load_channel_freq_ranges(csv_path: Path) -> Dict[str, List[Optional[Tuple[float, float]]]]:
     """读取通道频率范围表（csv）。每行格式：channel, r1, r2, r3
     其中 r? 形如 '0-20'，允许为空。返回 {channel: [ (fmin,fmax) or None ] * 3 }。
     """
     df = pd.read_csv(csv_path, header=None, dtype=str, encoding="utf-8-sig")
-    mp: Dict[str, List[Tuple[float, float] | None]] = {}
+    mp: Dict[str, List[Optional[Tuple[float, float]]]] = {}
     for _, row in df.iterrows():
         ch = (row.iloc[0] or "").strip()
         if not ch:
             continue
-        ranges: List[Tuple[float, float] | None] = []
+        ranges: List[Optional[Tuple[float, float]]] = []
         for k in range(1, 4):
             val = ""
             if k < len(row):
@@ -72,7 +73,7 @@ def _select_modes_by_freq_ranges(
     alpha_all: np.ndarray,
     omega_all: np.ndarray,
     rho_all: np.ndarray,
-    ranges: List[Tuple[float, float] | None],
+    ranges: List[Optional[Tuple[float, float]]],
 ) -> Tuple[List[int], List[str], List[str]]:
     """按 ranges（最多3个频率段）筛选模态：
     - 每个频率段至多取 1 个模态（rho 最大）
@@ -453,10 +454,11 @@ def save_response_dat(
     u: np.ndarray,
     outs_resp: Dict[str, np.ndarray],
     csv_path: Path,
-    resp_dir: Path,
-    resp_result_dir: Path,
+    out_root: Path, 
     model_version: str,
+    exc_table: Dict[str, List[ExcSegment]],
     exist_thresh: float = 0.5,
+    peak_win_sec: float = 1,
 ):
     """
     保存响应文件：一个 entry 一个文件
@@ -465,7 +467,10 @@ def save_response_dat(
       HH, MM, SS, MS, <34个通道预测>
     其中通道表头使用全局 channels 列表中的 34 个字符串；分隔符为逗号。
     """
-    resp_dir.mkdir(parents=True, exist_ok=True)
+    resp_dir = out_root / "PR_XGD"
+    resp_result_dir = out_root / "RESULT_PR_XGD"
+    # resp_error_dir = out_root / "ERROR_PR_XGD"
+    # result_cg_dir = out_root.parents[2] / "RESULT_CG"
 
     C_full = 34
     if len(channels) != C_full:
@@ -542,8 +547,8 @@ def save_response_dat(
     fmt = ["%d", "%d", "%d", "%d"] + ["%.10e"] * C_full
     np.savetxt(fpath, data, fmt=fmt, delimiter=",", header=header, comments="")
 
-    # 同步输出：用于生成该响应的频率/阻尼参数（按激励方式选择通道）
-    # 每行：ch,freq1,damp1,freq2,damp2,...
+    # 同步输出：用于生成该响应的频率/阻尼/峰峰值参数（按激励方式选择通道）
+    # 每行：ch,freq1,damp1,pp1,freq2,damp2,pp2...
     chs = channels_for_exc_plot(entry.exc_id)
     if chs.size == 0:
         chs = np.arange(C_full, dtype=int)
@@ -552,14 +557,14 @@ def save_response_dat(
     fd_path = resp_result_dir / fd_fname
     fd_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fd_lines = ["ch,freq1,damp1,freq2,damp2,freq3,damp3\n"]
+    fd_lines = ["ch,freq1,damp1,pp1,freq2,damp2,pp2,freq3,damp3,pp3\n"]
     for ch in chs:
         ch_idx = int(ch)
         ch_name = channels[ch_idx]
 
         mask = outs_resp["p_exist"][ch_idx] > exist_thresh
         if not np.any(mask):
-            fd_lines.append(f"{ch_name},,,\n")
+            fd_lines.append(f"{ch_name}," + ",".join([""] * 9) + "\n")
             continue
 
         w_all = outs_resp["omega"][ch_idx, mask]
@@ -579,17 +584,109 @@ def save_response_dat(
             ranges=ranges,
         )
 
-        # 交替写入 freq,damp（3个槽位 -> 6列；空槽位用逗号占位）
+        # 交替写入 freq,damp,pp（3个槽位 -> 9列；空槽位用逗号占位）
+        segs = exc_table.get(entry.kind, [])
+        seg_list = build_exc_seg_list(segs)
+
         tail = []
         for i in range(3):
-            tail.append(freq_slots[i] if i < len(freq_slots) else "")
-            tail.append(damp_slots[i] if i < len(damp_slots) else "")
+            f_str = freq_slots[i] if i < len(freq_slots) else ""
+            d_str = damp_slots[i] if i < len(damp_slots) else ""
+
+            pp_str = ""
+            if f_str != "":
+                try:
+                    f_hz = float(f_str)
+                    pp_str = calc_pp_for_freq(
+                        y=Y_hat[:, ch_idx],
+                        f_hz=f_hz,
+                        Ts=Ts,
+                        seg_list=seg_list,
+                        peak_win_sec=peak_win_sec,
+                    )
+                except Exception:
+                    pp_str = ""
+
+            tail.append(f_str)
+            tail.append(d_str)
+            tail.append(pp_str)
 
         fd_lines.append(f"{ch_name}," + ",".join(tail) + "\n")
 
     with open(fd_path, "w", encoding="utf-8") as f:
         f.writelines(fd_lines)
 
+    # error_fname = f"ERROR_PR_{entry.exc_name}_{entry.kind}_{entry.amp_tag}_{entry.H_tag}_{entry.M_tag}_{model_version}.dat"
+    # error_path = resp_error_dir / error_fname
+    # error_path.parent.mkdir(parents=True, exist_ok=True)
+    # calc_relative_error(fd_path, result_cg_dir, error_path)
+
+
+
+
+def _build_yhat_and_slot_strings(
+    alpha_row: np.ndarray,
+    omega_row: np.ndarray,
+    rho_row: np.ndarray,
+    sin_row: np.ndarray,
+    cos_row: np.ndarray,
+    p_exist_row: np.ndarray,
+    ch_name: str,
+    csv_path: Path,
+    u: np.ndarray,
+    Ts: float,
+    exist_thresh: float = 0.5,
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    """对单个扫描点/单个通道：
+    1) 按存在性与频段范围筛选槽位；
+    2) 重构该通道时域响应 y_hat；
+    3) 返回 y_hat、freq_slots、damp_slots。
+    """
+    y_hat = np.zeros((u.shape[0],), dtype=np.float64)
+    freq_slots = ["", "", ""]
+    damp_slots = ["", "", ""]
+
+    mask = p_exist_row > exist_thresh
+    if not np.any(mask):
+        return y_hat, freq_slots, damp_slots
+
+    a_all = alpha_row[mask]
+    w_all = omega_row[mask]
+    r_all = rho_row[mask]
+    th_all = np.arctan2(sin_row[mask], cos_row[mask])
+    p_all = p_exist_row[mask]
+    freqs_all = w_all / (2 * np.pi)
+
+    fr_map = _load_channel_freq_ranges(csv_path)
+    ranges = fr_map.get(ch_name, [None, None, None])
+
+    chosen_idx, freq_slots, damp_slots = _select_modes_by_freq_ranges(
+        freqs_all=freqs_all,
+        alpha_all=a_all,
+        omega_all=w_all,
+        rho_all=r_all,
+        ranges=ranges,
+    )
+    if not chosen_idx:
+        return y_hat, freq_slots, damp_slots
+
+    a_sel = a_all[chosen_idx]
+    w_sel = w_all[chosen_idx]
+    r_sel = r_all[chosen_idx]
+    th_sel = th_all[chosen_idx]
+    p_sel = p_all[chosen_idx]
+
+    B, A = build_BA_from_residues(
+        a_sel,
+        w_sel,
+        r_sel,
+        th_sel,
+        Ts,
+        p_exist=p_sel,
+        exist_thresh=exist_thresh,
+    )
+    y_hat = lfilter(B, A, u)
+    return y_hat, freq_slots, damp_slots
 
 def save_HF_HG_for_entry(
     entry: TableEntry,
@@ -598,13 +695,20 @@ def save_HF_HG_for_entry(
     csv_path: Path,
     hf_dir: Path,
     hg_dir: Path,
+    ha_dir: Path,
     model_version: str,
+    Ts: float,
+    exc_table: Dict[str, List[ExcSegment]],
+    u: np.ndarray,
+    exist_thresh: float = 0.5,
+    peak_win_sec: float = 1,
 ):
     """
     文件每行：H_km, M, ch, freqs... 或 damping...
     """
     hf_dir.mkdir(parents=True, exist_ok=True)
     hg_dir.mkdir(parents=True, exist_ok=True)
+    ha_dir.mkdir(parents=True, exist_ok=True)
 
     chs = channels_for_exc_plot(entry.exc_id)
     if chs.size == 0:
@@ -620,11 +724,16 @@ def save_HF_HG_for_entry(
 
     hf_path = hf_dir / f"HF_PR_{M_tag}_{exc_name}_{model_version}.dat"
     hg_path = hg_dir / f"HG_PR_{M_tag}_{exc_name}_{model_version}.dat"
+    ha_path = ha_dir / f"HA_PR_{M_tag}_{exc_name}_{model_version}.dat"
 
     hf_lines = ["H_km,M,ch,freqs...\n"]
     hg_lines = ["H_km,M,ch,damping...\n"]
+    ha_lines = ["H_km,M,ch,pp...\n"]
 
     nC = len(chs)
+
+    segs = exc_table.get(entry.kind, [])
+    seg_list = build_exc_seg_list(segs)
 
     for iH, H in enumerate(H_axis):
         for iC, ch in enumerate(chs):
@@ -632,40 +741,48 @@ def save_HF_HG_for_entry(
             ch_idx = int(ch)
             ch_name = channels[ch_idx] if 0 <= ch_idx < len(channels) else f"C{ch_idx:02d}"
 
-            mask = p_ex[row] > 0.5
-
-            if not np.any(mask):
-                hf_lines.append(f"{H:.2f},{entry.M:.2f},{ch_name},,,\n")
-                hg_lines.append(f"{H:.2f},{entry.M:.2f},{ch_name},,,\n")
-                continue
-
-            w_all = omega[row, mask]
-            a_all = alpha[row, mask]
-            r_all = rho[row, mask]
-
-            freqs_all = w_all / (2 * np.pi)
-
-            # 按通道频率范围(csv)筛选：每个频段最多取 1 个（rho 最大）
-            fr_map = _load_channel_freq_ranges(csv_path)
-            ranges = fr_map.get(ch_name, [None, None, None])
-
-            _, freq_slots, damp_slots = _select_modes_by_freq_ranges(
-                freqs_all=freqs_all,
-                alpha_all=a_all,
-                omega_all=w_all,
-                rho_all=r_all,
-                ranges=ranges,
+            y_hat, freq_slots, damp_slots = _build_yhat_and_slot_strings(
+                alpha_row=alpha[row],
+                omega_row=omega[row],
+                rho_row=rho[row],
+                sin_row=outs_hscan["sin_theta"][row],
+                cos_row=outs_hscan["cos_theta"][row],
+                p_exist_row=p_ex[row],
+                ch_name=ch_name,
+                csv_path=csv_path,
+                u=u,
+                Ts=Ts,
+                exist_thresh=exist_thresh,
             )
 
-            # 固定输出 3 列（按 csv 列索引占位）
+            pp_slots = ["", "", ""]
+            for i in range(3):
+                f_str = freq_slots[i]
+                if f_str == "":
+                    continue
+                try:
+                    f_hz = float(f_str)
+                    pp_slots[i] = calc_pp_for_freq(
+                        y=y_hat,
+                        f_hz=f_hz,
+                        Ts=Ts,
+                        seg_list=seg_list,
+                        peak_win_sec=peak_win_sec,
+                    )
+                except Exception:
+                    pp_slots[i] = ""
+
             hf_lines.append(f"{H:.2f},{entry.M:.2f},{ch_name}," + ",".join(freq_slots) + "\n")
             hg_lines.append(f"{H:.2f},{entry.M:.2f},{ch_name}," + ",".join(damp_slots) + "\n")
+            ha_lines.append(f"{H:.2f},{entry.M:.2f},{ch_name}," + ",".join(pp_slots) + "\n")
 
 
     with open(hf_path, "w", encoding="utf-8") as f:
         f.writelines(hf_lines)
     with open(hg_path, "w", encoding="utf-8") as f:
         f.writelines(hg_lines)
+    with open(ha_path, "w", encoding="utf-8") as f:
+        f.writelines(ha_lines)
 
 
 def save_VF_VG_for_entry(
@@ -675,7 +792,13 @@ def save_VF_VG_for_entry(
     csv_path: Path,
     vf_dir: Path,
     vg_dir: Path,
+    va_dir: Path,
     model_version: str,
+    Ts: float,
+    exc_table: Dict[str, List[ExcSegment]],
+    u: np.ndarray,
+    exist_thresh: float = 0.5,
+    peak_win_sec: float = 1,
 ):
     """
     固定 H=entry.H_km 扫 M_axis；通道 = channels_for_exc_plot(entry.exc_id)
@@ -684,6 +807,7 @@ def save_VF_VG_for_entry(
     """
     vf_dir.mkdir(parents=True, exist_ok=True)
     vg_dir.mkdir(parents=True, exist_ok=True)
+    va_dir.mkdir(parents=True, exist_ok=True)
 
     chs = channels_for_exc_plot(entry.exc_id)
     if chs.size == 0:
@@ -699,11 +823,16 @@ def save_VF_VG_for_entry(
 
     vf_path = vf_dir / f"VF_PR_{H_tag}_{exc_name}_{model_version}.dat"
     vg_path = vg_dir / f"VG_PR_{H_tag}_{exc_name}_{model_version}.dat"
+    va_path = va_dir / f"VA_PR_{H_tag}_{exc_name}_{model_version}.dat"
 
     vf_lines = ["H_km,M,ch,freqs...\n"]
     vg_lines = ["H_km,M,ch,damping...\n"]
+    va_lines = ["H_km,M,ch,pp...\n"]
 
     nC = len(chs)
+
+    segs = exc_table.get(entry.kind, [])
+    seg_list = build_exc_seg_list(segs)
 
     for iM, M in enumerate(M_axis):
         for iC, ch in enumerate(chs):
@@ -711,39 +840,48 @@ def save_VF_VG_for_entry(
             ch_idx = int(ch)
             ch_name = channels[ch_idx] if 0 <= ch_idx < len(channels) else f"C{ch_idx:02d}"
 
-            mask = p_ex[row] > 0.5
-            if not np.any(mask):
-                vf_lines.append(f"{entry.H_km:.2f},{M:.2f},{ch_name},,,\n")
-                vg_lines.append(f"{entry.H_km:.2f},{M:.2f},{ch_name},,,\n")
-                continue
-
-            w_all = omega[row, mask]
-            a_all = alpha[row, mask]
-            r_all = rho[row, mask]
-
-            freqs_all = w_all / (2 * np.pi)
-
-            # 按通道频率范围(csv)筛选：每个频段最多取 1 个（rho 最大）
-            fr_map = _load_channel_freq_ranges(csv_path)
-            ranges = fr_map.get(ch_name, [None, None, None])
-
-            _, freq_slots, damp_slots = _select_modes_by_freq_ranges(
-                freqs_all=freqs_all,
-                alpha_all=a_all,
-                omega_all=w_all,
-                rho_all=r_all,
-                ranges=ranges,
+            y_hat, freq_slots, damp_slots = _build_yhat_and_slot_strings(
+                alpha_row=alpha[row],
+                omega_row=omega[row],
+                rho_row=rho[row],
+                sin_row=outs_mscan["sin_theta"][row],
+                cos_row=outs_mscan["cos_theta"][row],
+                p_exist_row=p_ex[row],
+                ch_name=ch_name,
+                csv_path=csv_path,
+                u=u,
+                Ts=Ts,
+                exist_thresh=exist_thresh,
             )
 
-            # 固定输出 3 列（按 csv 列索引占位）
+            pp_slots = ["", "", ""]
+            for i in range(3):
+                f_str = freq_slots[i]
+                if f_str == "":
+                    continue
+                try:
+                    f_hz = float(f_str)
+                    pp_slots[i] = calc_pp_for_freq(
+                        y=y_hat,
+                        f_hz=f_hz,
+                        Ts=Ts,
+                        seg_list=seg_list,
+                        peak_win_sec=peak_win_sec,
+                    )
+                except Exception:
+                    pp_slots[i] = ""
+
             vf_lines.append(f"{entry.H_km:.2f},{M:.2f},{ch_name}," + ",".join(freq_slots) + "\n")
             vg_lines.append(f"{entry.H_km:.2f},{M:.2f},{ch_name}," + ",".join(damp_slots) + "\n")
+            va_lines.append(f"{entry.H_km:.2f},{M:.2f},{ch_name}," + ",".join(pp_slots) + "\n")
 
 
     with open(vf_path, "w", encoding="utf-8") as f:
         f.writelines(vf_lines)
     with open(vg_path, "w", encoding="utf-8") as f:
         f.writelines(vg_lines)
+    with open(va_path, "w", encoding="utf-8") as f:
+        f.writelines(va_lines)
 
 def main():
     fs = 512
@@ -768,29 +906,29 @@ def main():
     paths_map = load_paths_ini(paths_ini_path)
 
     # ===== 模型文件路径 =====
-    model_dir = Path(paths_map.get("MX_XGD", "")).expanduser()
+    model_dir = base_dir.parents[1] / "MX_XGD"
 
     ckpt_path = model_dir / model_version / (model_version + ".pth")
     in_norm_path =  model_dir / "Normalizer_Input.pth"
-    exc_table_xlsx = model_dir / "激励类型.xlsx"
+    exc_table_xlsx = base_dir.parents[1] / "CONFIG" / "SIGNALTYPE" / "signal_type.xlsx"
 
     # ==== 任务单路径 =====
-    config_dir = Path(paths_map.get("CONFIG", "")).expanduser()
+    config_dir = base_dir.parents[1] / "CONFIG"
     task_ini_path = config_dir / task_ini
 
     # 激励类型表：默认放在 PR 目录下（PR/XGD 的上一级），文件名固定“激励类型.xlsx”
-    pr_dir = Path(paths_map.get("PR_XGD", "")).expanduser()
+    pr_dir = Path(paths_map.get("PR_XGD"))
 
     # 输出：预测响应
     out_root = pr_dir / model_version
-    resp_dir = out_root / "PR_XGD"
-    resp_result_dir = out_root / "RESULT_PR_XGD"
 
     # 输出：VF/VG/HF/HG 分别走路径 ini 里对应目录（若缺失则回退到 out_root/hfg 或 out_root/vfg）
     vf_dir = out_root / "VF_PR_XGD"
     vg_dir = out_root / "VG_PR_XGD"
     hf_dir = out_root / "HF_PR_XGD"
     hg_dir = out_root / "HG_PR_XGD"
+    ha_dir = out_root / "HA_PR_XGD"
+    va_dir = out_root / "VA_PR_XGD"
 
     # ===== mesh 轴范围（用于 H-scan / M-scan）=====
     H_min, H_max, dH = 1.00, 12.00, 0.1
@@ -814,7 +952,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("==> Loading ckpt...")
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    try:
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    except TypeError:
+        ckpt = torch.load(ckpt_path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
 
     model = MFDNN(cfg).to(device)
@@ -859,7 +1000,7 @@ def main():
         if u.size == 0:
             print(f"  [WARN] u(t) 长度为 0，跳过 RESP 保存：{entry.raw}")
         else:
-            save_response_dat(entry, Ts, u, outs_resp, csv_path, resp_dir, resp_result_dir, model_version, exist_thresh)
+            save_response_dat(entry, Ts, u, outs_resp, csv_path, out_root, model_version, exc_table, exist_thresh)
 
         # ---------- B) HF/HG：固定 M 扫 H_axis（裁剪通道） ----------
         chs_plot = channels_for_exc_plot(entry.exc_id)
@@ -876,7 +1017,11 @@ def main():
                 H_all=Hs, M_all=Ms, exc_all=excs, ch_all=chs,
                 batch_size=20000
             )
-            save_HF_HG_for_entry(entry, H_axis, outs_hscan, csv_path, hf_dir, hg_dir, model_version)
+            save_HF_HG_for_entry(
+                entry, H_axis, outs_hscan, csv_path,
+                hf_dir, hg_dir, ha_dir, model_version,
+                Ts, exc_table, u, exist_thresh
+            )
         else:
             print(f"  [WARN] exc_id={entry.exc_id} 无 plot 通道，跳过 HF/HG")
 
@@ -894,7 +1039,11 @@ def main():
                 H_all=Hs, M_all=Ms, exc_all=excs, ch_all=chs,
                 batch_size=20000
             )
-            save_VF_VG_for_entry(entry, M_axis, outs_mscan, csv_path, vf_dir, vg_dir, model_version)
+            save_VF_VG_for_entry(
+                entry, M_axis, outs_mscan, csv_path,
+                vf_dir, vg_dir, va_dir, model_version,
+                Ts, exc_table, u, exist_thresh
+            )
         else:
             print(f"  [WARN] exc_id={entry.exc_id} 无 plot 通道，跳过 VF/VG")
 
@@ -931,5 +1080,3 @@ def main():
     udp_sender()
 if __name__ == "__main__":
     main()
-
-# %%

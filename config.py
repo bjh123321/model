@@ -33,10 +33,10 @@ class Config:
     val_ratio: float = 0.2
     val_seed: int = 42
 
-    epochs_stage1: int = 10000
-    epochs_stage2: int = 10000
-    early_stop_patience_s1: int = 1000
-    early_stop_patience_s2: int = 1000
+    epochs_stage1: int = 3000
+    epochs_stage2: int = 3000
+    early_stop_patience_s1: int = 500
+    early_stop_patience_s2: int = 500
     early_stop_min_delta: float = 1e-6
 
     # Optim

@@ -22,10 +22,10 @@ class Normalizer:
         import torch as _torch
         import numpy as _np
         try:
-            d = _torch.load(path, map_location='cpu', weights_only=True)
+            d = _torch.load(path, map_location='cpu')
         except Exception:
             # 兼容旧文件（含 numpy 对象）
-            d = _torch.load(path, map_location='cpu', weights_only=True)
+            d = _torch.load(path, map_location='cpu')
 
         mean = d.get('mean')
         std  = d.get('std')

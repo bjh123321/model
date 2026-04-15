@@ -114,8 +114,7 @@ def _load_stage1_low_from_fold0(model_core: nn.Module, ckpt_dir: Path) -> bool:
     """
     # [Added] 尝试候选文件（按优先级）
     candidates = [
-        ckpt_dir / 'best_stage1_fold0.pth',
-        ckpt_dir / 'checkpoint_stage1_fold0_epoch10000.pth',  # 可能存在的文件名
+        ckpt_dir / 'base.pth',
     ]
     # 兜底：扫描目录中任何以 best_stage1_fold0 开头或 checkpoint_stage1_fold0 开头的文件
     for p in list(candidates) + sorted(ckpt_dir.glob('best_stage1_fold0*.pth')) + sorted(ckpt_dir.glob('checkpoint_stage1_fold0*.pth')):
@@ -185,6 +184,17 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     std_sim   = torch.tensor(norm_sim.std,   dtype=torch.float32, device=device)
     mean_real = torch.tensor(norm_real.mean, dtype=torch.float32, device=device)
     std_real  = torch.tensor(norm_real.std,  dtype=torch.float32, device=device)
+
+    # [Changed] 训练过程中需要读取归一化参数，但不在 out_dir 中保留归一化文件（按你的部署需求）。
+    if is_main_process():
+        for _p in out_dir.glob('Normalizer_*.pth'):
+            try:
+                _p.unlink()
+            except Exception:
+                pass
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
 
     # 等权
     w_s1_alpha = w_s1_omega = w_s1_rho = w_s1_sin_theta = w_s1_cos_theta = 1.0
@@ -314,16 +324,6 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             if is_main_process():
                 print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
                       f'sim_loss={epoch_loss_w:.6f} lr={_cur_lr(opt1):.3e}', flush=True)
-                if (epoch + 1) % 100 == 0:
-                    torch.save({
-                        'fold': fold, 'stage': 1, 'epoch': epoch + 1,
-                        'model_state_dict': model_core.state_dict(),
-                        'optimizer_state_dict': opt1.state_dict(),
-                        'loss': float(epoch_loss_w),
-                        'loss_history': loss_hist,
-                        'lr_history': lr_hist,
-                    }, out_dir / f'checkpoint_stage1_fold{fold}_epoch{epoch+1}.pth')
-
             if is_main_process() and comp_count > 0:
                 avg = {k: v/comp_count for k, v in comp_accum.items()}
                 print(
@@ -334,29 +334,12 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 )
 
             if epoch_loss_w < best_sim - cfg.early_stop_min_delta:
-                best_sim = metric_s1; no_improve = 0
-                if is_main_process():
-                    torch.save({
-                        'fold': fold, 'stage': 1, 'epoch': epoch + 1,
-                        'model_state_dict': model_core.state_dict(),
-                        'optimizer_state_dict': opt1.state_dict(),
-                        'loss': float(epoch_loss_w),
-                        'loss_history': loss_hist,
-                        'lr_history': lr_hist,
-                    }, out_dir / f'best_stage1_fold{fold}.pth')
+                best_sim = metric_s1; no_improve = 0            
             else:
                 no_improve += 1
                 if no_improve >= cfg.early_stop_patience_s1:
                     if is_main_process():
-                        print('  Early stop Stage1')
-                        torch.save({
-                            'fold': fold, 'stage': 1, 'epoch': epoch + 1,
-                            'model_state_dict': model_core.state_dict(),
-                            'optimizer_state_dict': opt1.state_dict(),
-                            'loss': float(epoch_loss_w),
-                            'loss_history': loss_hist,
-                            'lr_history': lr_hist,
-                        }, out_dir / f'checkpoint_stage1_fold{fold}_earlystop_epoch{epoch+1}.pth')
+                        print('  Early stop Stage1')                        
                         print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
                         f'sim_loss={epoch_loss_w:.6f}' + (f' val_loss={metric_s1:.6f}' if (val_loss_w is not None) else '')
                         + f' lr={_cur_lr(opt1):.3e}', flush=True)
@@ -586,54 +569,13 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
                 f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
                 f'lr={_cur_lr(opt2):.3e}', flush=True)
-            if (epoch + 1) % 1000 == 0:
-                save_path = out_dir / f'checkpoint_stage2_fold{fold}_epoch{epoch+1}.pth'
-                torch.save({
-                    'fold': fold, 'stage': 2, 'epoch': epoch + 1,
-                    'model_state_dict': model_core.state_dict(),
-                    'optimizer_state_dict': opt2.state_dict(),
-                    'loss_total': float(total_epoch),
-                    'loss_sim':   float(sim_epoch),
-                    'loss_real':  float(real_epoch),
-                    'loss_history_total': total_hist,
-                    'loss_history_sim':   sim_hist,
-                    'loss_history_real':  real_hist,
-                    'lr_history': lr_hist_s2,
-                }, save_path)
-                print(f"  ⏺️ Saved checkpoint: {save_path.name}")
-
         if total_epoch < best_total - cfg.early_stop_min_delta:
-            best_total = metric_s2; no_improve = 0
-            if is_main_process():
-                torch.save({
-                    'fold': fold, 'stage': 2, 'epoch': epoch + 1,
-                    'model_state_dict': model_core.state_dict(),
-                    'optimizer_state_dict': opt2.state_dict(),
-                    'loss_total': float(total_epoch),
-                    'loss_sim':   float(sim_epoch),
-                    'loss_real':  float(real_epoch),
-                    'loss_history_total': total_hist,
-                    'loss_history_sim':   sim_hist,
-                    'loss_history_real':  real_hist,
-                    'lr_history': lr_hist_s2,
-                }, out_dir / f'best_stage2_fold{fold}.pth')
+            best_total = metric_s2; no_improve = 0        
         else:
             no_improve += 1
             if no_improve >= cfg.early_stop_patience_s2:
                 if is_main_process():
-                    print('  Early stop Stage2')
-                    torch.save({
-                        'fold': fold, 'stage': 2, 'epoch': epoch + 1,
-                        'model_state_dict': model_core.state_dict(),
-                        'optimizer_state_dict': opt2.state_dict(),
-                        'loss_total': float(total_epoch),
-                        'loss_sim':   float(sim_epoch),
-                        'loss_real':  float(real_epoch),
-                        'loss_history_total': total_hist,
-                        'loss_history_sim':   sim_hist,
-                        'loss_history_real':  real_hist,
-                        'lr_history': lr_hist_s2,
-                    }, out_dir / f'checkpoint_stage2_fold{fold}_earlystop_epoch{epoch+1}.pth')
+                    print('  Early stop Stage2')                    
                     print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
                       f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
                       + (f'val_real={metric_s2:.6f} ' if (val_real_epoch is not None) else '')
@@ -644,8 +586,23 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         dist.barrier()
 
     if is_main_process():
+        # 只在 Stage-2 训练结束后保存一个最终 checkpoint（文件名 = out_dir 最后一级目录 + .pth）
         save_path = out_dir / (out_dir.name + '.pth')
-        torch.save(model_core.state_dict(), save_path)
+        final_epoch = int(locals().get('epoch', -1)) + 1  # 若 epochs_stage2=0，则为 0
+        torch.save({
+            'fold': fold,
+            'stage': 2,
+            'epoch': final_epoch,
+            'model_state_dict': model_core.state_dict(),
+            'optimizer_state_dict': opt2.state_dict(),
+            'loss_total': float(total_hist[-1]) if len(total_hist) > 0 else float('nan'),
+            'loss_sim':   float(sim_hist[-1])   if len(sim_hist)   > 0 else float('nan'),
+            'loss_real':  float(real_hist[-1])  if len(real_hist)  > 0 else float('nan'),
+            'loss_history_total': total_hist,
+            'loss_history_sim':   sim_hist,
+            'loss_history_real':  real_hist,
+            'lr_history': lr_hist_s2,
+        }, save_path)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

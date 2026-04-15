@@ -69,6 +69,7 @@ def main():
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     model_version = lines[1].strip()
+    real_dataset_path = lines[2].strip()
 
     base_dir_parent = base_dir.parents[1]
     parser = argparse.ArgumentParser()
@@ -80,8 +81,8 @@ def main():
                         help='Set to 1 to train stage 2 on every fold, 0 to train once')
     parser.add_argument('--embed_excitation_dim', type=int, default=4)
     parser.add_argument('--embed_channel_dim', type=int, default=12)
-    parser.add_argument('--epochs_s1', type=int, default=5000)
-    parser.add_argument('--epochs_s2', type=int, default=5000)
+    parser.add_argument('--epochs_s1', type=int, default=2000)
+    parser.add_argument('--epochs_s2', type=int, default=2000)
     parser.add_argument('--batch_sim', type=int, default=256)
     parser.add_argument('--batch_real', type=int, default=64)
     parser.add_argument('--num_workers', type=int, default=8)
@@ -105,7 +106,6 @@ def main():
 
 
     sim_dataset_path = base_dir / "sim_dataset.txt"
-    real_dataset_path = base_dir / "real_dataset.txt"
     
     # Read data
     sim_rows  = read_variable_txt(sim_dataset_path)
@@ -145,7 +145,7 @@ def main():
         # 配置参数
         HOST = 'localhost'
         PORT = 12345
-        MESSAGE = "XGD_CONSTRUCTION_EXE_FINISHED"
+        MESSAGE = "XGD_GENERATION_EXE_FINISHED"
 
         # 创建UDP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
