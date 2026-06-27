@@ -1,9 +1,9 @@
 from __future__ import annotations
-from typing import List, Dict, Tuple
+from typing import List
 import torch
 from torch.utils.data import Dataset
-from .io import ParsedRow
-from .normalizer import Normalizer
+from surrogate_model.data.io import ParsedRow
+from surrogate_model.data.normalizer import Normalizer
 
 class ModalDataset(Dataset):
     def __init__(self, parsed: List[ParsedRow], K_max: int, input_norm: Normalizer, output_norm: Normalizer):

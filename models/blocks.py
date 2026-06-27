@@ -3,7 +3,7 @@ from typing import List, Dict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from ..config import Config
+from surrogate_model.config import Config
 
 class MLP(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, hidden: list, dropout: float=0.0):
@@ -282,7 +282,7 @@ class AdaptationHead(nn.Module):
                 if isinstance(m, LoRALinear):
                     nn.init.zeros_(m.base.weight)
                     nn.init.zeros_(m.base.bias)
-                    nn.init.zeros_(m.lora_A)
+                    nn.init.normal_(m.lora_A, std=1e-3)
                     nn.init.zeros_(m.lora_B)
                 elif isinstance(m, nn.Linear):
                     nn.init.zeros_(m.weight)
@@ -317,7 +317,7 @@ class ParamPZK(nn.Module):
         super().__init__()
     def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres):
         alpha = -F.softplus(u_alpha)
-        omega =  F.sigmoid(u_omega)
+        omega = torch.sigmoid(u_omega)
         rho  =  u_rho
         norm = torch.sqrt(u_sin_theta.pow(2) + u_cos_theta.pow(2) + 1e-8)  # 防止除0
         sin_theta = u_sin_theta / norm

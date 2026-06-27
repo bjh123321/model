@@ -14,9 +14,10 @@ from scipy.signal import lfilter
 from surrogate_model.config import Config
 from surrogate_model.models.blocks import MFDNN
 from surrogate_model.data.normalizer import Normalizer
-from residue_pred import build_BA_from_residues
+from surrogate_model.data.xlsx_utils import load_signal_type_rows
+from surrogate_model.test.residue_pred import build_BA_from_residues
 # from Error import calc_relative_error
-from pp_utils import build_exc_seg_list, calc_pp_for_freq
+from surrogate_model.test.pp_utils import build_exc_seg_list, calc_pp_for_freq
 
 
 def get_exe_dir():
@@ -123,17 +124,17 @@ channels = ["LW1", "LW2", "LW3", "LAI", "RW1", "RW2", "RW3", "RAI",
 
 def channels_for_exc_plot(exc_id: int) -> np.ndarray:
     """
-    按你给的规则：
-      exc 0/1 -> 前 8 个通道: 0..7
-      exc 2/3 -> 通道 8..19 (12个)
-      exc 4/5 -> 通道 20..27 (8个)
+    与训练数据的激励编号保持一致：
+      0/1 -> FXD -> 8..19
+      2/3 -> PW  -> 20..27
+      4/5 -> JFY -> 0..7
     """
     if exc_id in (0, 1):
         return np.arange(8, 20, dtype=np.int64)
     if exc_id in (2, 3):
-        return np.arange(0, 8, dtype=np.int64)
-    if exc_id in (4, 5):
         return np.arange(20, 28, dtype=np.int64)
+    if exc_id in (4, 5):
+        return np.arange(0, 8, dtype=np.int64)
     return np.arange(0, 0, dtype=np.int64)
 
 
@@ -285,27 +286,13 @@ class ExcSegment:
 
 
 def load_excitation_table(xlsx_path: str, sheet_name: str = "Sheet1") -> Dict[str, List[ExcSegment]]:
-    """
-    Excel 列名要求：
-      第1列：激励种类（A/B/AB...）——列名可以是 Unnamed: 0（默认）
-      幅值 / 开始频率 / 结束频率 / 时长
-    """
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
-    kind_col = df.columns[0]
-
-    amp_col = "幅值"
-    f0_col = "开始频率"
-    f1_col = "结束频率"
-    dur_col = "时长"
-
     table: Dict[str, List[ExcSegment]] = {}
-    for _, row in df.iterrows():
-        kind = str(row[kind_col]).strip()
+    for kind, amp, f0, f1, dur in load_signal_type_rows(Path(xlsx_path)):
         seg = ExcSegment(
-            amp_base=float(row[amp_col]),
-            f0=float(row[f0_col]),
-            f1=float(row[f1_col]),
-            dur=float(row[dur_col]),
+            amp_base=float(amp),
+            f0=float(f0),
+            f1=float(f1),
+            dur=float(dur),
         )
         table.setdefault(kind, []).append(seg)
     return table
@@ -444,6 +431,30 @@ def run_infer_batched(
     return outs
 
 
+def load_response_output_header(header_path: Path) -> List[str]:
+    with open(header_path, "r", encoding="utf-8-sig") as f:
+        line = f.readline().strip()
+    header = [col.strip() for col in line.split(",") if col.strip()]
+    if not header:
+        raise ValueError(f"表头文件为空: {header_path}")
+    return header
+
+
+def prediction_file_name(prefix: str, entry: TableEntry, model_version: str) -> str:
+    return (
+        f"{prefix}_PR_{entry.exc_name}_{entry.kind}_{entry.amp_tag}_"
+        f"{entry.H_tag}_{entry.M_tag}_{model_version}.dat"
+    )
+
+
+def _path_from_config(cp: configparser.ConfigParser, paths_ini_path: Path, section: str) -> Path:
+    key = f"path_{section}".lower()
+    try:
+        return Path(cp[section][key])
+    except KeyError:
+        raise KeyError(f"配置文件 {paths_ini_path} 中缺少 [{section}] 部分或 {key} 键") from None
+
+
 # ============================================================
 # 5) 文件写入：RESP / HFHG / VFVG
 # ============================================================
@@ -457,6 +468,7 @@ def save_response_dat(
     out_root: Path, 
     model_version: str,
     exc_table: Dict[str, List[ExcSegment]],
+    response_output_header: List[str],
     exist_thresh: float = 0.5,
     peak_win_sec: float = 1,
 ):
@@ -468,7 +480,9 @@ def save_response_dat(
     其中通道表头使用全局 channels 列表中的 34 个字符串；分隔符为逗号。
     """
     resp_dir = out_root / "PR_XGD"
+    resp_dir.mkdir(parents=True, exist_ok=True)
     resp_result_dir = out_root / "RESULT_PR_XGD"
+    resp_result_dir.mkdir(parents=True, exist_ok=True)
     # resp_error_dir = out_root / "ERROR_PR_XGD"
     # result_cg_dir = out_root.parents[2] / "RESULT_CG"
 
@@ -539,12 +553,31 @@ def save_response_dat(
     fname = f"PR_{entry.exc_name}_{entry.kind}_{entry.amp_tag}_{entry.H_tag}_{entry.M_tag}_{model_version}.dat"
     fpath = resp_dir / fname
 
-    header_cols = ["HH", "MM", "SS", "MS"] + list(channels)
+    header_cols = response_output_header
     header = ",".join(header_cols)
 
-    data = np.column_stack([HH, MM, SS, MS, Y_hat])
+    data = np.empty((N, len(header_cols)), dtype=object)
+    data[:, :] = 0.0
 
-    fmt = ["%d", "%d", "%d", "%d"] + ["%.10e"] * C_full
+    col_index = {name: idx for idx, name in enumerate(header_cols)}
+    time_idx = col_index.get("TIME")
+    if time_idx is not None:
+        data[:, time_idx] = [
+            f"{hh:02d}:{mm:02d}:{ss:02d}:{ms:03d}"
+            for hh, mm, ss, ms in zip(HH, MM, SS, MS)
+        ]
+    else:
+        for name, values in (("HH", HH), ("MM", MM), ("SS", SS), ("MS", MS)):
+            idx = col_index.get(name)
+            if idx is not None:
+                data[:, idx] = values
+
+    for ch_idx, ch_name in enumerate(channels):
+        target_idx = col_index.get(ch_name)
+        if target_idx is not None:
+            data[:, target_idx] = Y_hat[:, ch_idx]
+
+    fmt = ["%s" if col == "TIME" else "%.10e" for col in header_cols]
     np.savetxt(fpath, data, fmt=fmt, delimiter=",", header=header, comments="")
 
     # 同步输出：用于生成该响应的频率/阻尼/峰峰值参数（按激励方式选择通道）
@@ -719,16 +752,13 @@ def save_HF_HG_for_entry(
     rho = outs_hscan["rho"]
     p_ex = outs_hscan["p_exist"]
 
-    M_tag = format_M_tag(entry.M)
-    exc_name = entry.exc_name
+    hf_path = hf_dir / prediction_file_name("HF", entry, model_version)
+    hg_path = hg_dir / prediction_file_name("HG", entry, model_version)
+    ha_path = ha_dir / prediction_file_name("HA", entry, model_version)
 
-    hf_path = hf_dir / f"HF_PR_{M_tag}_{exc_name}_{model_version}.dat"
-    hg_path = hg_dir / f"HG_PR_{M_tag}_{exc_name}_{model_version}.dat"
-    ha_path = ha_dir / f"HA_PR_{M_tag}_{exc_name}_{model_version}.dat"
-
-    hf_lines = ["H_km,M,ch,freqs...\n"]
-    hg_lines = ["H_km,M,ch,damping...\n"]
-    ha_lines = ["H_km,M,ch,pp...\n"]
+    hf_lines = ["H,M,响应,wn_1,wn_2,wn_3\n"]
+    hg_lines = ["H,M,响应,zeta_1,zeta_2,zeta_3\n"]
+    ha_lines = ["H,M,响应,t_val_1,t_val_2,t_val_3\n"]
 
     nC = len(chs)
 
@@ -818,16 +848,13 @@ def save_VF_VG_for_entry(
     rho = outs_mscan["rho"]
     p_ex = outs_mscan["p_exist"]
 
-    H_tag = format_H_tag(entry.H_km)
-    exc_name = entry.exc_name
+    vf_path = vf_dir / prediction_file_name("VF", entry, model_version)
+    vg_path = vg_dir / prediction_file_name("VG", entry, model_version)
+    va_path = va_dir / prediction_file_name("VA", entry, model_version)
 
-    vf_path = vf_dir / f"VF_PR_{H_tag}_{exc_name}_{model_version}.dat"
-    vg_path = vg_dir / f"VG_PR_{H_tag}_{exc_name}_{model_version}.dat"
-    va_path = va_dir / f"VA_PR_{H_tag}_{exc_name}_{model_version}.dat"
-
-    vf_lines = ["H_km,M,ch,freqs...\n"]
-    vg_lines = ["H_km,M,ch,damping...\n"]
-    va_lines = ["H_km,M,ch,pp...\n"]
+    vf_lines = ["H,M,响应,wn_1,wn_2,wn_3\n"]
+    vg_lines = ["H,M,响应,zeta_1,zeta_2,zeta_3\n"]
+    va_lines = ["H,M,响应,t_val_1,t_val_2,t_val_3\n"]
 
     nC = len(chs)
 
@@ -887,40 +914,45 @@ def main():
     fs = 512
     Ts = 1.0 / fs
     omegaN = np.pi * fs
-    exist_thresh = 0.5
+    exist_thresh = 0.2
 
     base_dir = get_exe_dir()
     user_input_path = base_dir / "user_input.dat"
     csv_path = base_dir / "模态频率范围.csv"
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
+    if len(lines) < 4:
+        raise ValueError("user_input.dat 至少需要 4 行：路径配置ini、模型版本、任务单文件名、输出文件夹名")
 
     # 拿到路径ini的路径
     paths_ini_path = Path(lines[0].strip()).expanduser()
+    cp = configparser.ConfigParser()
+    cp.read(paths_ini_path, encoding="utf-8")
     # 拿到模型版本
     model_version = lines[1].strip()
     # 拿到任务单名字
     task_ini = lines[2].strip()
-
-    # 拿到路径ini
-    paths_map = load_paths_ini(paths_ini_path)
+    output_folder = lines[3].strip()
 
     # ===== 模型文件路径 =====
-    model_dir = base_dir.parents[1] / "MX_XGD"
+    model_dir = _path_from_config(cp, paths_ini_path, "MX_XGD")
 
     ckpt_path = model_dir / model_version / (model_version + ".pth")
     in_norm_path =  model_dir / "Normalizer_Input.pth"
-    exc_table_xlsx = base_dir.parents[1] / "CONFIG" / "SIGNALTYPE" / "signal_type.xlsx"
+    data_header_dir = _path_from_config(cp, paths_ini_path, "DataHeader")
+    response_output_header = load_response_output_header(data_header_dir / "sc.dat")
+
+    signaltype_dir = _path_from_config(cp, paths_ini_path, "SignalType")
+    exc_table_xlsx = signaltype_dir / "signal_type.xlsx"
 
     # ==== 任务单路径 =====
-    config_dir = base_dir.parents[1] / "CONFIG"
-    task_ini_path = config_dir / task_ini
+    task_dir = _path_from_config(cp, paths_ini_path, "Task")
+    task_ini_path = task_dir / task_ini
 
-    # 激励类型表：默认放在 PR 目录下（PR/XGD 的上一级），文件名固定“激励类型.xlsx”
-    pr_dir = Path(paths_map.get("PR_XGD"))
+    pr_dir = _path_from_config(cp, paths_ini_path, "PR_XGD")
 
     # 输出：预测响应
-    out_root = pr_dir / model_version
+    out_root = pr_dir / output_folder
 
     # 输出：VF/VG/HF/HG 分别走路径 ini 里对应目录（若缺失则回退到 out_root/hfg 或 out_root/vfg）
     vf_dir = out_root / "VF_PR_XGD"
@@ -939,12 +971,12 @@ def main():
     # ===== 你必须补全这个映射：exc_name -> exc_id(0..5) =====
     # 例子里你说：FXD_FDC 对应激励方式1（这里我先写成 0，你自己改成正确的）
     EXC_NAME_TO_ID = {
-        "FXD_DC": 0,
-        "FXD_FDC": 1,
-        "JFY_DC":  2,
-        "JFY_FDC": 3,
-        "PW_DC":  4,
-        "PW_FDC": 5,
+        "FXD_FDC": 0,
+        "FXD_DC":  1,
+        "PW_FDC":  2,
+        "PW_DC":   3,
+        "JFY_FDC": 4,
+        "JFY_DC":  5,
     }
 
     # ===== 加载模型 =====
@@ -965,6 +997,8 @@ def main():
     model.eval()
 
     in_norm = Normalizer.load(in_norm_path)
+    if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
+        raise RuntimeError(f"Normalizer_Input.pth 应为二维 [H, M]，当前 mean={in_norm.mean}, std={in_norm.std}")
 
     # ===== 读取 ini → entries =====
     sortie_num, entries = load_task_from_ini(task_ini_path, EXC_NAME_TO_ID)
@@ -972,6 +1006,15 @@ def main():
 
     # ===== 激励表 =====
     exc_table = load_excitation_table(exc_table_xlsx)
+    exc_kinds = sorted(exc_table.keys())
+    print(f"Signal type file = {exc_table_xlsx}")
+    print(f"Signal type kinds = {exc_kinds}")
+    missing_kinds = sorted({entry.kind for entry in entries if entry.kind not in exc_table})
+    if missing_kinds:
+        raise KeyError(
+            f"任务单中的激励种类不在激励表中: {missing_kinds}; "
+            f"激励表文件: {exc_table_xlsx}; 已读取种类: {exc_kinds}"
+        )
 
     date = datetime.now().strftime("%Y%m%d")
 
@@ -1000,7 +1043,10 @@ def main():
         if u.size == 0:
             print(f"  [WARN] u(t) 长度为 0，跳过 RESP 保存：{entry.raw}")
         else:
-            save_response_dat(entry, Ts, u, outs_resp, csv_path, out_root, model_version, exc_table, exist_thresh)
+            save_response_dat(
+                entry, Ts, u, outs_resp, csv_path, out_root, model_version,
+                exc_table, response_output_header, exist_thresh
+            )
 
         # ---------- B) HF/HG：固定 M 扫 H_axis（裁剪通道） ----------
         chs_plot = channels_for_exc_plot(entry.exc_id)

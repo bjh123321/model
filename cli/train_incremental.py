@@ -1,98 +1,83 @@
-# surrogate_model/cli/train_incremental.py
+from __future__ import annotations
+
 import argparse
-from pathlib import Path
-import sys
-import torch
-from torch.utils.data import DataLoader, Dataset
 import configparser
+import socket
+import sys
+import warnings
+from pathlib import Path
 from typing import Dict
 
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+
 from surrogate_model.config import Config
-from surrogate_model.models.blocks import MFDNN, LoRALinear
-from surrogate_model.losses.masked_mse import MaskedHungarianMSE
-from surrogate_model.data.normalizer import Normalizer
-from surrogate_model.data.io import parse_rows_to_struct
 from surrogate_model.data.OE_BATCH_PROCESS import batch_process
 from surrogate_model.data.build_replay_data import build_replay_data
+from surrogate_model.data.io import parse_rows_to_struct
+from surrogate_model.data.normalizer import Normalizer
+from surrogate_model.losses.masked_mse import MaskedHungarianMSE
+from surrogate_model.models.blocks import MFDNN
 
 
-def load_paths_ini(paths_ini: str) -> Dict[str, str]:
-    cp = configparser.ConfigParser()
-    cp.read(paths_ini, encoding="utf-8")
-
-    out: Dict[str, str] = {}
-    for sec in cp.sections():
-        kv = [(k, v) for k, v in cp[sec].items() if k.lower().startswith("path_")]
-        if not kv:
-            continue
-        _, v = kv[0]
-        out[sec.strip()] = str(v).strip()
-    return out
-
-
-def get_exe_dir():
+def get_exe_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
-    else:
-        return Path(__file__).resolve().parent
+    return Path(__file__).resolve().parent
 
 
-# ===========================
-# 只对 alpha, omega, rho 做 z-score，sin/cos 不变
-# ===========================
-def normlizer(pred: torch.Tensor, mean, std):
+def _path_from_ini(cp: configparser.ConfigParser, paths_ini_path: Path, section: str) -> Path:
+    key = f"path_{section}".lower()
+    try:
+        return Path(cp[section][key])
+    except KeyError:
+        raise KeyError(f"{paths_ini_path} is missing [{section}] / {key}") from None
+
+
+def normalize_target(pred: torch.Tensor, mean, std):
     mean_t = torch.as_tensor(mean, dtype=pred.dtype, device=pred.device)
     std_t = torch.as_tensor(std, dtype=pred.dtype, device=pred.device)
 
     core = pred[..., :3]
     others = pred[..., 3:]
+    assert mean_t.numel() == 3 and std_t.numel() == 3, "out_norm.mean/std must have length 3"
 
-    assert mean_t.numel() == 3 and std_t.numel() == 3, "out_norm.mean/std 应该是长度 3"
     view_shape = [1] * (core.ndim - 1) + [3]
-    mean_t = mean_t.view(*view_shape)
-    std_t = std_t.view(*view_shape)
-
-    core_n = (core - mean_t) / std_t
+    core_n = (core - mean_t.view(*view_shape)) / std_t.view(*view_shape).clamp_min(1e-8)
     return torch.cat([core_n, others], dim=-1)
 
 
-# ===========================
-# 增量学习用数据集：直接从 txt 读 + parse_rows_to_struct
-# ===========================
 class RealIncrementalDataset(Dataset):
-    def __init__(self, txt_path: str, in_norm: Normalizer, out_norm: Normalizer):
+    def __init__(self, txt_path: Path, in_norm: Normalizer, out_norm: Normalizer):
         super().__init__()
-        self.txt_path = txt_path
+        self.txt_path = Path(txt_path)
 
         rows_float = []
-        with open(txt_path, "r", encoding="utf-8") as f:
+        with open(self.txt_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.replace(",", " ").split()
-                vals = [float(x) for x in parts]
-                rows_float.append(vals)
+                rows_float.append([float(x) for x in line.replace(",", " ").split()])
 
         if not rows_float:
-            raise RuntimeError(f"[RealIncrementalDataset] 文件 {txt_path} 为空或无法解析")
+            raise RuntimeError(f"[RealIncrementalDataset] {self.txt_path} is empty or cannot be parsed")
 
         parsed, _ = parse_rows_to_struct(rows_float)
-        N = len(parsed)
-        if N == 0:
-            raise RuntimeError(f"[RealIncrementalDataset] parse_rows_to_struct 结果为空：{txt_path}")
+        if not parsed:
+            raise RuntimeError(f"[RealIncrementalDataset] parse_rows_to_struct returned no rows: {self.txt_path}")
 
         H = torch.tensor([p.H for p in parsed], dtype=torch.float32)
         M = torch.tensor([p.M for p in parsed], dtype=torch.float32)
         exc = torch.tensor([p.exc_id for p in parsed], dtype=torch.long)
         chn = torch.tensor([p.ch_id for p in parsed], dtype=torch.long)
 
-        H = ((H - in_norm.mean[0]) / in_norm.std[0]).unsqueeze(-1)
-        M = ((M - in_norm.mean[1]) / in_norm.std[1]).unsqueeze(-1)
+        H = ((H - float(in_norm.mean[0])) / max(float(in_norm.std[0]), 1e-12)).unsqueeze(-1)
+        M = ((M - float(in_norm.mean[1])) / max(float(in_norm.std[1]), 1e-12)).unsqueeze(-1)
 
         alpha_list, omega_list, rho_list = [], [], []
         sin_list, cos_list, mask_list = [], [], []
-
         for p in parsed:
             alpha_list.append(torch.from_numpy(p.alpha.copy()).float())
             omega_list.append(torch.from_numpy(p.omega.copy()).float())
@@ -109,7 +94,7 @@ class RealIncrementalDataset(Dataset):
         mask = torch.stack(mask_list, dim=0)
 
         y_phys = torch.stack([alpha, omega, rho, sin_t, cos_t], dim=-1)
-        yN = normlizer(y_phys, out_norm.mean, out_norm.std)
+        yN = normalize_target(y_phys, out_norm.mean, out_norm.std)
 
         self.H = H
         self.M = M
@@ -139,20 +124,12 @@ class RealIncrementalDataset(Dataset):
         }
 
 
-# ===========================
-# 冻结全部，只开放 NHF(AdaptationHead) 内的 LoRA 参数
-# ===========================
 @torch.no_grad()
-def freeze_all_and_open_adaptation_lora(model: MFDNN):
+def freeze_all_and_open_adaptation(model: MFDNN):
     for p in model.parameters():
         p.requires_grad_(False)
-
-    for m in model.adaptation.modules():
-        if isinstance(m, LoRALinear):
-            m.lora_A.requires_grad_(True)
-            m.lora_B.requires_grad_(True)
-            for p in m.base.parameters():
-                p.requires_grad_(False)
+    for p in model.adaptation.parameters():
+        p.requires_grad_(True)
 
 
 def count_trainable_params(model: torch.nn.Module) -> int:
@@ -163,15 +140,95 @@ def list_trainable_param_names(model: torch.nn.Module):
     return [name for name, p in model.named_parameters() if p.requires_grad]
 
 
-# ===========================
-# KD loss（teacher-student 一致性约束）
-# ===========================
-def kd_loss_fn(new: dict, old: dict, w=1.0):
+@torch.no_grad()
+def snapshot_adaptation_params(module: nn.Module) -> Dict[str, torch.Tensor]:
+    return {name: param.detach().clone() for name, param in module.named_parameters()}
+
+
+def adaptation_anchor_loss(module: nn.Module, ref_state: Dict[str, torch.Tensor]) -> torch.Tensor:
+    loss = None
+    for name, param in module.named_parameters():
+        ref = ref_state[name].to(device=param.device, dtype=param.dtype)
+        term = (param - ref).pow(2).mean()
+        loss = term if loss is None else (loss + term)
+    if loss is None:
+        return torch.zeros((), device=next(module.parameters()).device)
+    return loss
+
+
+def build_adaptation_param_groups(model: MFDNN, lr_base: float, lr_lora: float, lr_embed: float):
+    base_params = []
+    lora_params = []
+    embed_params = []
+    unmatched = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if not name.startswith("adaptation."):
+            raise RuntimeError(f"Non-adaptation parameter unexpectedly trainable: {name}")
+        if ".mlp." in name and ".base." in name:
+            base_params.append(param)
+        elif ".mlp." in name and ".lora_" in name:
+            lora_params.append(param)
+        elif name.startswith("adaptation.emb_") or name.startswith("adaptation.mod."):
+            embed_params.append(param)
+        else:
+            unmatched.append(name)
+
+    if unmatched:
+        raise RuntimeError(f"Unmatched trainable adaptation parameters: {unmatched}")
+    if not base_params:
+        raise RuntimeError("Optimizer base group is empty")
+    if not lora_params:
+        raise RuntimeError("Optimizer lora group is empty")
+    if not embed_params:
+        warnings.warn("Optimizer embed group is empty", RuntimeWarning)
+
+    groups = [
+        {"params": base_params, "lr": lr_base, "name": "base"},
+        {"params": lora_params, "lr": lr_lora, "name": "lora"},
+    ]
+    if embed_params:
+        groups.append({"params": embed_params, "lr": lr_embed, "name": "embed"})
+    return groups
+
+
+def kd_loss_fn(new: dict, old: dict, w: float = 1.0):
     keys = ["alpha", "omega", "rho", "sin_theta", "cos_theta"]
     loss = 0.0
-    for k in keys:
-        loss = loss + ((new[k] - old[k]) ** 2).mean()
+    for key in keys:
+        loss = loss + ((new[key] - old[key]) ** 2).mean()
     return loss * w
+
+
+def _batch_to_device(batch, device):
+    yN = {
+        "alpha": batch["yN"]["alpha"].to(device),
+        "omega": batch["yN"]["omega"].to(device),
+        "rho": batch["yN"]["rho"].to(device),
+        "sin_theta": batch["yN"]["sin_theta"].to(device),
+        "cos_theta": batch["yN"]["cos_theta"].to(device),
+    }
+    return (
+        batch["H"].to(device),
+        batch["M"].to(device),
+        batch["exc"].to(device),
+        batch["chn"].to(device),
+        yN,
+        batch["mask"].to(device),
+    )
+
+
+def _send_finished_udp():
+    host, port, message = "localhost", 12345, "XGD_CORRECTION_EXE_FINISHED"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(message.encode("utf-8"), (host, port))
+    except Exception as exc:
+        print(f"[WARN] UDP notification failed: {exc}")
+    finally:
+        sock.close()
 
 
 def main():
@@ -179,33 +236,39 @@ def main():
     user_input_path = base_dir / "user_input.dat"
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
+    if len(lines) < 3:
+        raise ValueError("user_input.dat needs at least 3 lines: paths.ini, base_model_version, new_model_version")
 
-    paths_ini = Path(lines[0].strip()).expanduser()
-    paths_map = load_paths_ini(paths_ini)
+    paths_ini_path = Path(lines[0].strip()).expanduser()
+    cp = configparser.ConfigParser()
+    cp.read(paths_ini_path, encoding="utf-8")
+
+    data_dir = _path_from_ini(cp, paths_ini_path, "CG")
+    model_dir = _path_from_ini(cp, paths_ini_path, "MX_XGD")
 
     model_version = lines[1].strip()
     new_model_version = lines[2].strip()
 
-    model_dir = base_dir.parents[1] / "MX_XGD"
-
     base_ckpt_path = model_dir / model_version / (model_version + ".pth")
-    new_txt_path = base_dir / "new_data.txt"
     replay_txt_path = base_dir / "replay_data.txt"
-    save_ckpt_path = model_dir / new_model_version / (new_model_version + ".pth")
-    save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-    data_dir = Path(paths_map["CG"])
     new_data_out = base_dir / "new_data.txt"
     selected_list = base_dir / "selected_CG_path.txt"
+    save_ckpt_path = model_dir / new_model_version / (new_model_version + ".pth")
+    save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
 
-    build_replay_data(base_dir)
+    build_replay_data(base_dir, model_dir)
     batch_process(data_dir, new_data_out, selected_list)
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch_size", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--lr_base", type=float, default=3e-5)
+    ap.add_argument("--lr_lora", type=float, default=1e-4)
+    ap.add_argument("--lr_embed", type=float, default=2e-4)
     ap.add_argument("--beta_kd", type=float, default=0.2)
     ap.add_argument("--gamma_replay", type=float, default=0.2)
+    ap.add_argument("--lambda_anchor", type=float, default=1e-3)
+    ap.add_argument("--warmup_epochs", type=int, default=10)
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -220,25 +283,29 @@ def main():
     student.load_state_dict(state, strict=False)
     teacher.load_state_dict(state, strict=False)
 
-    freeze_all_and_open_adaptation_lora(student)
+    freeze_all_and_open_adaptation(student)
+    adapt_ref_state = snapshot_adaptation_params(student.adaptation)
 
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad_(False)
 
     trainable_names = list_trainable_param_names(student)
+    bad_trainables = [name for name in trainable_names if not name.startswith("adaptation.")]
+    if bad_trainables:
+        raise RuntimeError(f"Trainable parameters outside adaptation: {bad_trainables}")
     print(f"[INFO] trainable params: {count_trainable_params(student)}")
-    print("[INFO] 仅微调 NHF(AdaptationHead) 的 LoRA 参数:")
+    print("[INFO] Fine-tuning adaptation parameters:")
     for name in trainable_names:
         print(f"  - {name}")
 
-    in_norm_path = model_dir / "Normalizer_Input.pth"
-    out_norm_path = model_dir / "Normalizer_Output.pth"
-    in_norm = Normalizer.load(in_norm_path)
-    out_norm = Normalizer.load(out_norm_path)
+    in_norm = Normalizer.load(model_dir / "Normalizer_Input.pth")
+    out_norm = Normalizer.load(model_dir / "Normalizer_Output.pth")
 
-    ds_new = RealIncrementalDataset(new_txt_path, in_norm, out_norm)
+    if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
+        raise RuntimeError(f"Normalizer_Input.pth must be 2D [H, M], got mean={in_norm.mean}, std={in_norm.std}")
 
+    ds_new = RealIncrementalDataset(new_data_out, in_norm, out_norm)
     ds_replay = None
     if replay_txt_path.exists() and replay_txt_path.stat().st_size > 0:
         ds_replay = RealIncrementalDataset(replay_txt_path, in_norm, out_norm)
@@ -251,36 +318,24 @@ def main():
     crit = MaskedHungarianMSE(mean=mean_t, std=std_t)
 
     opt = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
-        lr=args.lr,
+        build_adaptation_param_groups(
+            student,
+            lr_base=args.lr_base,
+            lr_lora=args.lr_lora,
+            lr_embed=args.lr_embed,
+        ),
         weight_decay=1e-4,
     )
 
     for epoch in range(1, args.epochs + 1):
         student.train()
         it_replay = iter(dl_replay) if dl_replay is not None else None
-
-        sum_new = 0.0
-        sum_kd = 0.0
-        sum_rep = 0.0
-        sum_total = 0.0
+        warm = min(float(epoch) / float(max(args.warmup_epochs, 1)), 1.0)
+        sum_new = sum_kd = sum_rep = sum_anchor = sum_total = 0.0
         n_steps = 0
 
         for batch in dl_new:
-            H = batch["H"].to(device)
-            M = batch["M"].to(device)
-            e = batch["exc"].to(device)
-            c = batch["chn"].to(device)
-
-            yN = {
-                "alpha": batch["yN"]["alpha"].to(device),
-                "omega": batch["yN"]["omega"].to(device),
-                "rho": batch["yN"]["rho"].to(device),
-                "sin_theta": batch["yN"]["sin_theta"].to(device),
-                "cos_theta": batch["yN"]["cos_theta"].to(device),
-            }
-            mask = batch["mask"].to(device)
-
+            H, M, e, c, yN, mask = _batch_to_device(batch, device)
             _, outH_new = student(H, M, e, c)
             loss_new = crit(outH_new, yN, mask)
 
@@ -294,78 +349,41 @@ def main():
                     it_replay = iter(dl_replay)
                     batch_r = next(it_replay)
 
-                Hr = batch_r["H"].to(device)
-                Mr = batch_r["M"].to(device)
-                er = batch_r["exc"].to(device)
-                cr = batch_r["chn"].to(device)
-                yNr = {
-                    "alpha": batch_r["yN"]["alpha"].to(device),
-                    "omega": batch_r["yN"]["omega"].to(device),
-                    "rho": batch_r["yN"]["rho"].to(device),
-                    "sin_theta": batch_r["yN"]["sin_theta"].to(device),
-                    "cos_theta": batch_r["yN"]["cos_theta"].to(device),
-                }
-                maskr = batch_r["mask"].to(device)
-
+                Hr, Mr, er, cr, yNr, maskr = _batch_to_device(batch_r, device)
                 with torch.no_grad():
                     _, outH_old = teacher(Hr, Mr, er, cr)
                 _, outH_new_r = student(Hr, Mr, er, cr)
                 loss_kd = kd_loss_fn(outH_new_r, outH_old, w=args.beta_kd)
                 loss_rep = crit(outH_new_r, yNr, maskr) * args.gamma_replay
 
-            loss = loss_new + loss_kd + loss_rep
+            loss_anchor = adaptation_anchor_loss(student.adaptation, adapt_ref_state) * args.lambda_anchor
+            loss = loss_new + warm * loss_kd + warm * loss_rep + loss_anchor
 
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
             sum_new += float(loss_new.detach().item())
             sum_kd += float(loss_kd.detach().item())
             sum_rep += float(loss_rep.detach().item())
+            sum_anchor += float(loss_anchor.detach().item())
             sum_total += float(loss.detach().item())
             n_steps += 1
 
-        avg_new = sum_new / max(n_steps, 1)
-        avg_kd = sum_kd / max(n_steps, 1)
-        avg_rep = sum_rep / max(n_steps, 1)
-        avg_total = sum_total / max(n_steps, 1)
-
         if epoch % 10 == 0 or epoch == 1 or epoch == args.epochs:
+            denom = max(n_steps, 1)
             print(
                 f"[inc] epoch {epoch}/{args.epochs} "
-                f"loss_total={avg_total:.4f} "
-                f"loss_new={avg_new:.4f} "
-                f"kd={avg_kd:.4f} "
-                f"rep={avg_rep:.4f}"
+                f"loss_total={sum_total / denom:.4f} "
+                f"loss_new={sum_new / denom:.4f} "
+                f"kd={sum_kd / denom:.4f} "
+                f"rep={sum_rep / denom:.4f} "
+                f"anchor={sum_anchor / denom:.4f}"
             )
 
-    save_path = save_ckpt_path or (str(Path(base_ckpt_path).with_suffix("")) + "_inc.pth")
-    torch.save({"model_state_dict": student.state_dict()}, save_path)
-    print(f"[OK] Incremental (NHF-LoRA+Replay+KD) saved to: {save_path}")
-
-    import socket
-
-    def udp_sender():
-        HOST = 'localhost'
-        PORT = 12345
-        MESSAGE = "XGD_CORRECTION_EXE_FINISHED"
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        try:
-            print("UDP发送端已启动")
-            print(f"目标地址: {HOST}:{PORT}")
-            print(f"发送内容: {MESSAGE}")
-            print("\n正在发送...")
-            sock.sendto(MESSAGE.encode('utf-8'), (HOST, PORT))
-            print("消息发送成功！")
-        except Exception as e:
-            print(f"发送失败: {e}")
-        finally:
-            sock.close()
-            print("发送端已关闭")
-
-    udp_sender()
+    torch.save({"model_state_dict": student.state_dict()}, save_ckpt_path)
+    print(f"[OK] Incremental checkpoint saved to: {save_ckpt_path}")
+    _send_finished_udp()
 
 
 if __name__ == "__main__":

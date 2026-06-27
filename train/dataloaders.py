@@ -6,18 +6,53 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from sklearn.model_selection import KFold
-from ..config import Config
-from ..data.io import ParsedRow
-from ..data.normalizer import (
+from surrogate_model.config import Config
+from surrogate_model.data.io import ParsedRow
+from surrogate_model.data.normalizer import (
+    Normalizer,
     compute_input_normalizer_sim,
     compute_output_normalizer_masked,
 )
-from ..data.datasets import ModalDataset, collate_modal
-from ..utils.dist_utils import is_main_process
+from surrogate_model.data.datasets import ModalDataset, collate_modal
+from surrogate_model.utils.dist_utils import is_main_process
 
 
 def _ddp_ready() -> bool:
     return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+
+
+def _split_real_by_height_max_mach(real_parsed: List[ParsedRow], cfg: Config):
+    heights = [float(h) for h in getattr(cfg, "val_heights", [3.0, 8.23])]
+    h_tol = float(getattr(cfg, "val_height_tol", 1e-6))
+    m_tol = float(getattr(cfg, "val_mach_tol", 1e-6))
+    val_indices = set()
+    split_info = []
+
+    for target_h in heights:
+        h_indices = [
+            i for i, p in enumerate(real_parsed)
+            if abs(float(p.H) - target_h) <= h_tol
+        ]
+        if not h_indices:
+            raise RuntimeError(
+                f"No real samples found for validation height H={target_h:g}. "
+                f"Available heights: {sorted({float(p.H) for p in real_parsed})}"
+            )
+        max_m = max(float(real_parsed[i].M) for i in h_indices)
+        hm_indices = [
+            i for i in h_indices
+            if abs(float(real_parsed[i].M) - max_m) <= m_tol
+        ]
+        val_indices.update(hm_indices)
+        split_info.append((target_h, max_m, len(hm_indices)))
+
+    real_train = [p for i, p in enumerate(real_parsed) if i not in val_indices]
+    real_val = [p for i, p in enumerate(real_parsed) if i in val_indices]
+    if not real_train:
+        raise RuntimeError("Validation split consumed all real samples; no real training data remains.")
+    if not real_val:
+        raise RuntimeError("Validation split produced no real validation samples.")
+    return real_train, real_val, split_info
 
 
 def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow], cfg: Config,
@@ -36,9 +71,11 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     use_val_split = bool(getattr(cfg, "use_val_split", False))
     val_ratio = float(getattr(cfg, "val_ratio", 0.2))
     seed = int(getattr(cfg, "val_seed", 42))
+    val_strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
+    use_height_max_mach_val = use_val_split and val_strategy == "height_max_mach"
 
     # --- Sim split (给 Stage-1 用) ---
-    if use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
+    if (not use_height_max_mach_val) and use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
         rng = np.random.default_rng(seed)
         idx = np.arange(len(sim_parsed))
         rng.shuffle(idx)
@@ -53,7 +90,19 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
 
     # --- Real split (给 Stage-2 & final validation 用) ---
     if use_val_split:
-        if kfold > 1 and len(real_parsed) > 1:
+        if use_height_max_mach_val:
+            real_train, real_val, split_info = _split_real_by_height_max_mach(real_parsed, cfg)
+            if is_main_process():
+                detail = ", ".join(
+                    f"H={h:g}, maxM={m:g}, val_rows={n}"
+                    for h, m, n in split_info
+                )
+                print(
+                    f"[VAL] real split by height max Mach: {detail}; "
+                    f"train_rows={len(real_train)}, val_rows={len(real_val)}",
+                    flush=True,
+                )
+        elif kfold > 1 and len(real_parsed) > 1:
             kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
             indices = list(range(len(real_parsed)))
             train_idx, val_idx = list(kf.split(indices))[fold_idx]
@@ -145,4 +194,8 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         **_dl_kwargs
     )
 
-    return sim_dl, real_dl, sim_val_dl, val_dl, len(sim_ds), len(real_tr)
+    return (
+        sim_dl, real_dl, sim_val_dl, val_dl,
+        len(sim_ds), len(real_tr),
+        out_norm_sim, out_norm_real, in_norm_sim,
+    )

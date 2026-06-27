@@ -1,34 +1,54 @@
 from __future__ import annotations
-import os, json
-from pathlib import Path
+
+import os
 from itertools import cycle
+from pathlib import Path
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-import torch.nn.utils
-from ..config import Config
-from ..models.blocks import MFDNN
-from ..losses.masked_mse import MaskedMSE, MaskedHungarianMSE
-from ..utils.dist_utils import is_main_process, dist_mean_scalar
-from ..data.normalizer import Normalizer
-from .dataloaders import build_dataloaders
-from ..utils.pcgrad import (
-    maybe_no_sync, clone_grads, zero_grads, pcgrad_two_tasks,
-    set_grads, allreduce_grads_inplace
+import torch.nn as nn
+
+from surrogate_model.config import Config
+from surrogate_model.losses.masked_mse import MaskedHungarianMSE, MaskedMSE
+from surrogate_model.models.blocks import LoRALinear, MFDNN
+from surrogate_model.train.dataloaders import build_dataloaders
+from surrogate_model.utils.dist_utils import dist_mean_scalar, is_main_process
+from surrogate_model.utils.pcgrad import (
+    allreduce_grads_inplace,
+    clone_grads,
+    maybe_no_sync,
+    pcgrad_two_tasks,
+    set_grads,
+    zero_grads,
 )
 
 
-
 def _cur_lr(optimizer):
-    return optimizer.param_groups[0]['lr']
+    return optimizer.param_groups[0]["lr"]
+
+
+def _select_device(args) -> torch.device:
+    requested = str(getattr(args, "device", "auto")).lower()
+    if requested not in {"auto", "cuda", "cpu"}:
+        raise ValueError(f"Unsupported device option: {requested}")
+    if requested == "cpu":
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Device was set to cuda, but torch.cuda.is_available() is False.")
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
+        return torch.device("cuda", local_rank)
+    return torch.device("cpu")
+
 
 def _eval_loss(model, dl, crit, device, forward_high: bool):
-    """在给定 DataLoader 上计算平均损失；DDP 场景下做 all-reduce。"""
     if dl is None:
         return None
     model.eval()
-    vsum, vcnt = 0.0, 0
+    use_cuda = device.type == "cuda"
+    value_sum, value_count = 0.0, 0
     with torch.no_grad():
         for H, M, e, c, mask, yN in dl:
             H = H.to(device, non_blocking=True)
@@ -36,229 +56,217 @@ def _eval_loss(model, dl, crit, device, forward_high: bool):
             e = e.to(device, non_blocking=True)
             c = c.to(device, non_blocking=True)
             mask = mask.to(device, non_blocking=True)
-            for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
-            if forward_high:
-                _, out = model(H, M, e, c)
-            else:
-                out, _ = model(H, M, e, c)
-            loss = crit(out, yN, mask)
-            bs = H.size(0)
-            vsum += float(loss.item()) * bs
-            vcnt += bs
+            for k in yN:
+                yN[k] = yN[k].to(device, non_blocking=True)
 
-    t_sum = torch.tensor(vsum, device=device)
-    t_cnt = torch.tensor(vcnt, device=device, dtype=torch.float32)
+            if use_cuda:
+                with torch.amp.autocast(device_type="cuda"):
+                    outL, outH = model(H, M, e, c)
+                    out = outH if forward_high else outL
+                    loss = crit(out, yN, mask)
+            else:
+                outL, outH = model(H, M, e, c)
+                out = outH if forward_high else outL
+                loss = crit(out, yN, mask)
+
+            bs = H.size(0)
+            value_sum += float(loss.item()) * bs
+            value_count += bs
+
+    t_sum = torch.tensor(value_sum, device=device)
+    t_count = torch.tensor(value_count, device=device, dtype=torch.float32)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(t_cnt, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t_count, op=dist.ReduceOp.SUM)
 
-    if t_cnt.item() <= 0:
+    if t_count.item() <= 0:
         return None
-    return (t_sum / t_cnt).item()
+    return (t_sum / t_count).item()
 
-def _mse_per_param_z(pred, yN, mask, mean, std):
-    P = torch.stack([pred['alpha'], pred['omega'], pred['rho']], dim=1)  # [B,3,K]
-    P1 = torch.stack([pred['sin_theta'], pred['cos_theta']], dim=1)      # [B,2,K]
-    TN = torch.stack([yN['alpha'], yN['omega'], yN['rho'], yN['sin_theta'], yN['cos_theta']], dim=1)  # [B,5,K]
-
-    PN = (P - mean.view(1,3,1)) / (std.view(1,3,1).clamp_min(1e-8))
-    PN = torch.cat([PN, P1], dim=1)  # [B,5,K]
-
-    m = (mask > 0.5).float().unsqueeze(1)
-    denom = m.sum(dim=(0,2)).clamp_min(1.0)
-
-    err = (PN - TN).pow(2) * m
-    mse_ch = err.sum(dim=(0,2)) / denom  # [5]
-
-    out = {
-        'alpha': mse_ch[0].item(),
-        'omega': mse_ch[1].item(),
-        'rho'  : mse_ch[2].item(),
-        'sin_theta': mse_ch[3].item(),
-        'cos_theta': mse_ch[4].item()
-    }
-
-
-    if 'u_pres' in pred:
-        logits = pred['u_pres']
-        target = (mask > 0.5).float()
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, target, reduction='none').mean().item()
-    else:
-        p = pred.get('p_exist', torch.sigmoid(torch.zeros_like(mask)))
-        p = p.clamp(1e-6, 1-1e-6)
-        target = (mask > 0.5).float()
-        bce = -(target*torch.log(p) + (1-target)*torch.log(1-p)).mean().item()
-
-        pred_cnt = (torch.sigmoid(pred['u_pres']) if 'u_pres' in pred else pred.get('p_exist', 0.0)).sum(dim=1)
-        true_cnt = (mask > 0.5).float().sum(dim=1)
-        card = (pred_cnt - true_cnt).pow(2).mean().item()
-        out['bce'] = bce
-        out['card'] = card
-
-    return out
 
 def _accum_stat(stat_accum: dict, new_stat: dict):
-    for k, v in new_stat.items():
-        stat_accum[k] = stat_accum.get(k, 0.0) + float(v)
+    for key, value in new_stat.items():
+        stat_accum[key] = stat_accum.get(key, 0.0) + float(value)
+
+
+def _crit_part_stats(crit) -> dict:
+    stat = {}
+    reg = getattr(crit, "last_reg_stats", None)
+    cls = getattr(crit, "last_cls_stats", None)
+    if reg:
+        stat.update(reg)
+    if cls:
+        stat.update(cls)
+    if stat:
+        stat["cls_weighted"] = (
+            float(getattr(crit, "pres_w", 0.0)) * float(stat.get("bce", 0.0))
+            + float(getattr(crit, "card_w", 0.0)) * float(stat.get("card", 0.0))
+        )
+    return stat
+
 
 def _make_weights(std_np: np.ndarray):
     eps = 1e-8
     w = 1.0 / ((np.asarray(std_np, dtype=np.float64) ** 2) + eps)
     w = w / (w.mean() + eps)
-    return float(w[0]), float(w[1]), float(w[2]), float(w[3])  # 未使用，保留接口
+    return float(w[0]), float(w[1]), float(w[2]), float(w[3])
+
 
 def _load_stage1_low_from_fold0(model_core: nn.Module, ckpt_dir: Path) -> bool:
-    """
-    从 fold0 的最佳/收敛 checkpoint 加载 low.* 权重。全部 rank 都应调用，保证 DDP 同步。
-    返回是否加载成功。
-    """
-    # [Added] 尝试候选文件（按优先级）
     candidates = [
-        ckpt_dir / 'base.pth',
+        ckpt_dir / "base.pth",
+        *sorted(ckpt_dir.glob("best_stage1_fold0*.pth")),
+        *sorted(ckpt_dir.glob("checkpoint_stage1_fold0*.pth")),
     ]
-    # 兜底：扫描目录中任何以 best_stage1_fold0 开头或 checkpoint_stage1_fold0 开头的文件
-    for p in list(candidates) + sorted(ckpt_dir.glob('best_stage1_fold0*.pth')) + sorted(ckpt_dir.glob('checkpoint_stage1_fold0*.pth')):
-        if is_main_process():
-            print("[DEBUG] candidate:", p, "exists:", p.exists())
-        if p.exists():
-            try:
-                state = torch.load(p, map_location='cpu').get('model_state_dict', None)
-                if state is None:
-                    continue
-                # 仅抽取 low.* 参数
-                low_state = {k: v for k, v in state.items() if k.startswith('low.')}
-                missing, unexpected = model_core.load_state_dict(low_state, strict=False)
-                # 允许 high 层未加载；只要 low.* 正常覆盖即可
-                if is_main_process():
-                    print(f"  [S1] Reuse fold0 low.* from: {p.name} (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
-                return True
-            except Exception as ex:
-                if is_main_process():
-                    print(f"  [S1] Failed loading {p.name}: {ex}", flush=True)
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            state = torch.load(path, map_location="cpu")
+            state = state.get("model_state_dict", state)
+            low_state = {k: v for k, v in state.items() if k.startswith("low.")}
+            if not low_state:
+                continue
+            missing, unexpected = model_core.load_state_dict(low_state, strict=False)
+            if is_main_process():
+                print(
+                    f"  [S1] Reuse low.* from {path.name} "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})",
+                    flush=True,
+                )
+            return True
+        except Exception as exc:
+            if is_main_process():
+                print(f"  [S1] Failed loading {path.name}: {exc}", flush=True)
     if is_main_process():
-        print("  [S1] No fold0 checkpoint found for reuse; will train Stage-1 on this fold.", flush=True)
+        print("  [S1] No reusable low.* checkpoint found; will train Stage-1.", flush=True)
     return False
 
+
+def _is_low_train_layer(module: nn.Module) -> bool:
+    return isinstance(module, (nn.Linear, LoRALinear))
+
+
+def _set_stage2_low_tail_trainable(model_core: nn.Module, cfg: Config):
+    for p in model_core.low.parameters():
+        p.requires_grad_(False)
+
+    tail_layers = max(0, int(getattr(cfg, "stage2_unfreeze_low_tail_layers", 0)))
+    if tail_layers <= 0:
+        return []
+
+    low_mlp = getattr(model_core.low, "mlp", None)
+    if low_mlp is None:
+        return []
+
+    train_layers = [m for m in low_mlp if _is_low_train_layer(m)]
+    selected = train_layers[-tail_layers:]
+    for layer in selected:
+        for p in layer.parameters():
+            p.requires_grad_(True)
+    return selected
+
+
+def _build_criteria(cfg: Config, mean_sim, std_sim, mean_real, std_real):
+    cls = MaskedHungarianMSE if cfg.use_hungarian_loss else MaskedMSE
+    common = dict(
+        w_alpha=1.0,
+        w_omega=1.0,
+        w_rho=1.0,
+        w_sin_theta=1.0,
+        w_cos_theta=1.0,
+        presence_weight=cfg.presence_loss_weight,
+        cardinality_weight=cfg.cardinality_loss_weight,
+    )
+    return cls(mean=mean_sim, std=std_sim, **common), cls(mean=mean_real, std=std_real, **common)
+
+
 def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    device = torch.device('cuda', local_rank) if torch.cuda.is_available() else torch.device('cpu')
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device = _select_device(args)
+    if is_main_process():
+        if device.type == "cuda":
+            print(f"[Device] Using GPU: {torch.cuda.get_device_name(device)} ({device})", flush=True)
+        else:
+            print("[Device] Using CPU.", flush=True)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    sim_dl, real_dl, sim_val_dl, val_dl, N_sim, N_real = build_dataloaders(
-        sim_parsed, real_parsed, cfg, args.kfold, fold, device, out_dir
-    )
-
+    (
+        sim_dl,
+        real_dl,
+        sim_val_dl,
+        val_dl,
+        _n_sim,
+        _n_real,
+        out_norm_sim,
+        out_norm_real,
+        in_norm_deploy,
+    ) = build_dataloaders(sim_parsed, real_parsed, cfg, args.kfold, fold, device, out_dir)
 
     def _maybe_set_epoch(dl, epoch: int):
-        # dl.sampler 可能为 None（非DDP），也可能不是 DistributedSampler
         sampler = getattr(dl, "sampler", None)
         if sampler is not None and hasattr(sampler, "set_epoch"):
             sampler.set_epoch(epoch)
 
-
-    # excitation vocab size
-    max_exc = 0
-    for p in (sim_parsed + real_parsed):
-        if p.exc_id > max_exc:
-            max_exc = p.exc_id
-    cfg.embed_excitation_num = int(max_exc + 1)
+    if sim_parsed or real_parsed:
+        cfg.embed_excitation_num = max(int(p.exc_id) for p in (sim_parsed + real_parsed)) + 1
 
     model_core = MFDNN(cfg).to(device)
-    for name, p in model_core.named_parameters():
+    for name, param in model_core.named_parameters():
         if not name.startswith("low."):
-            p.requires_grad = False
+            param.requires_grad_(False)
+
     if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1 and device.type == "cuda":
         model = nn.parallel.DistributedDataParallel(
-            model_core, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+            model_core,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
         )
     else:
-        model = model_core  # 单进程/CPU/非DDP：直接用原模型
+        model = model_core
 
+    mean_sim = torch.tensor(out_norm_sim.mean, dtype=torch.float32, device=device)
+    std_sim = torch.tensor(out_norm_sim.std, dtype=torch.float32, device=device)
+    mean_real = torch.tensor(out_norm_real.mean, dtype=torch.float32, device=device)
+    std_real = torch.tensor(out_norm_real.std, dtype=torch.float32, device=device)
+    crit_s1, crit_s2 = _build_criteria(cfg, mean_sim, std_sim, mean_real, std_real)
 
-    norm_sim  = Normalizer.load(out_dir / 'Normalizer_Output_Sim.pth')
-    norm_real = Normalizer.load(out_dir / f'Normalizer_Output_Real_Fold{fold}.pth')
+    stage1_once = bool(getattr(args, "stage1_once", 1))
+    did_reuse = stage1_once and _load_stage1_low_from_fold0(model_core, out_dir)
 
-    mean_sim  = torch.tensor(norm_sim.mean,  dtype=torch.float32, device=device)
-    std_sim   = torch.tensor(norm_sim.std,   dtype=torch.float32, device=device)
-    mean_real = torch.tensor(norm_real.mean, dtype=torch.float32, device=device)
-    std_real  = torch.tensor(norm_real.std,  dtype=torch.float32, device=device)
-
-    # [Changed] 训练过程中需要读取归一化参数，但不在 out_dir 中保留归一化文件（按你的部署需求）。
-    if is_main_process():
-        for _p in out_dir.glob('Normalizer_*.pth'):
-            try:
-                _p.unlink()
-            except Exception:
-                pass
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-
-
-    # 等权
-    w_s1_alpha = w_s1_omega = w_s1_rho = w_s1_sin_theta = w_s1_cos_theta = 1.0
-    w_s2_alpha = w_s2_omega = w_s2_rho = w_s2_sin_theta = w_s2_cos_theta = 1.0
-
-    pres_w = cfg.presence_loss_weight
-    card_w = cfg.cardinality_loss_weight
-
-    if cfg.use_hungarian_loss:
-        crit_s1 = MaskedHungarianMSE(mean=mean_sim, std=std_sim,
-                                     w_alpha=w_s1_alpha, w_omega=w_s1_omega,
-                                     w_rho=w_s1_rho, w_sin_theta=w_s1_sin_theta, w_cos_theta=w_s1_cos_theta,
-                                     presence_weight=pres_w, cardinality_weight=card_w)
-        crit_s2 = MaskedHungarianMSE(mean=mean_real, std=std_real,
-                                     w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                                     w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta, w_cos_theta=w_s2_cos_theta,
-                                     presence_weight=pres_w, cardinality_weight=card_w)
-    else:
-        crit_s1 = MaskedMSE(mean=mean_sim, std=std_sim,
-                            w_alpha=w_s1_alpha, w_omega=w_s1_omega,
-                            w_rho=w_s1_rho, w_sin_theta=w_s1_sin_theta, w_cos_theta=w_s1_cos_theta,
-                            presence_weight=pres_w, cardinality_weight=card_w)
-        crit_s2 = MaskedMSE(mean=mean_real, std=std_real,
-                            w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                            w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta, w_cos_theta=w_s2_cos_theta,
-                            presence_weight=pres_w, cardinality_weight=card_w)
-
-    # [Added] 是否复用 fold0 的 Stage-1（low.*）结果
-    stage1_once = bool(getattr(args, 'stage1_once', 1))  # 主程序已设置：1 表示 S1 只训练一次
-    reuse_stage1 = stage1_once
-
-    # ============ Stage 1 ============ #
-    # [Changed]：当 reuse_stage1=True 时，跳过训练并加载 fold0 的 low.* 权重
-    did_reuse = False
-    if reuse_stage1:
-        did_reuse = _load_stage1_low_from_fold0(model_core, out_dir)
+    use_cuda = device.type == "cuda"
+    loss_hist_s1: list[float] = []
+    lr_hist_s1: list[float] = []
 
     if not did_reuse:
-        # 常规 S1 训练
-        for p in model_core.lin.parameters(): p.requires_grad_(False)
-        for p in model_core.adaptation.parameters(): p.requires_grad_(False)
+        for p in model_core.lin.parameters():
+            p.requires_grad_(False)
+        for p in model_core.adaptation.parameters():
+            p.requires_grad_(False)
 
         opt1 = torch.optim.AdamW(model_core.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
-        use_cuda = (device.type == 'cuda')
-        scaler = torch.amp.GradScaler('cuda') if use_cuda else None
-
-        pat1   = getattr(cfg, 'lr_patience_s1', 20)
-        fac1   = getattr(cfg, 'lr_factor_s1', 0.5)
-        minlr1 = getattr(cfg, 'lr_min_s1', 1e-6)
-        thr    = getattr(cfg, 'early_stop_min_delta', 0.0)
+        scaler1 = torch.amp.GradScaler("cuda") if use_cuda else None
         sched1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt1, mode='min', factor=fac1, patience=pat1,
-            threshold=thr, threshold_mode='abs', cooldown=0,
-            min_lr=minlr1, eps=1e-12
+            opt1,
+            mode="min",
+            factor=getattr(cfg, "lr_factor_s1", 0.5),
+            patience=getattr(cfg, "lr_patience_s1", 20),
+            threshold=getattr(cfg, "early_stop_min_delta", 0.0),
+            threshold_mode="abs",
+            min_lr=getattr(cfg, "lr_min_s1", 1e-6),
+            eps=1e-12,
         )
 
-        best_sim = float('inf'); no_improve = 0
-        loss_hist = []; lr_hist = []
-
+        best_sim = float("inf")
+        no_improve = 0
         for epoch in range(cfg.epochs_stage1):
             model.train()
             _maybe_set_epoch(sim_dl, epoch)
-            sum_loss = 0.0; seen = 0
-            comp_accum = {}; comp_count = 0
+            sum_loss, seen = 0.0, 0
+            comp_accum, comp_count = {}, 0
 
             for H, M, e, c, mask, yN in sim_dl:
                 H = H.to(device, non_blocking=True)
@@ -266,363 +274,385 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 e = e.to(device, non_blocking=True)
                 c = c.to(device, non_blocking=True)
                 mask = mask.to(device, non_blocking=True)
-                for k in yN: yN[k] = yN[k].to(device, non_blocking=True)
+                for k in yN:
+                    yN[k] = yN[k].to(device, non_blocking=True)
 
                 opt1.zero_grad(set_to_none=True)
                 if use_cuda:
-                    with torch.amp.autocast(device_type='cuda'):
+                    with torch.amp.autocast(device_type="cuda"):
                         outL, _ = model(H, M, e, c)
                         loss = crit_s1(outL, yN, mask)
-                    with torch.no_grad():
-                        stat = {}
-                        if getattr(crit_s1, "last_reg_stats", None):
-                            stat.update(crit_s1.last_reg_stats)
-                        if getattr(crit_s1, "last_cls_stats", None):
-                            stat.update(crit_s1.last_cls_stats)
-                        if stat:
-                            _accum_stat(comp_accum, stat)
-                            comp_count += 1
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(opt1)
+                    stat = _crit_part_stats(crit_s1)
+                    if stat:
+                        _accum_stat(comp_accum, stat)
+                        comp_count += 1
+                    scaler1.scale(loss).backward()
+                    scaler1.unscale_(opt1)
                     torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
-                    scaler.step(opt1); scaler.update()
+                    scaler1.step(opt1)
+                    scaler1.update()
                 else:
                     outL, _ = model(H, M, e, c)
                     loss = crit_s1(outL, yN, mask)
-                    with torch.no_grad():
-                        stat = _mse_per_param_z(outL, yN, mask, mean_sim, std_sim)
-                        _accum_stat(comp_accum, stat); comp_count += 1
+                    stat = _crit_part_stats(crit_s1)
+                    if stat:
+                        _accum_stat(comp_accum, stat)
+                        comp_count += 1
+                    loss.backward()
                     torch.nn.utils.clip_grad_norm_(model_core.low.parameters(), max_norm=1.0)
-                    loss.backward(); opt1.step()
+                    opt1.step()
 
                 bs = H.size(0)
-                sum_loss += loss.item() * bs; seen += bs
+                sum_loss += float(loss.item()) * bs
+                seen += bs
 
             epoch_loss = sum_loss / max(1, seen)
             epoch_loss_w = dist_mean_scalar(epoch_loss, device)
-            loss_hist.append(float(epoch_loss_w))
-            lr_hist.append(_cur_lr(opt1))
+            loss_hist_s1.append(float(epoch_loss_w))
+            lr_hist_s1.append(_cur_lr(opt1))
 
-            # ---- validation (Stage-1: sim) ----
-            use_val_split = bool(getattr(cfg, "use_val_split", False))
             val_loss_w = None
-            if use_val_split:
+            if bool(getattr(cfg, "use_val_split", False)):
                 val_loss = _eval_loss(model, sim_val_dl, crit_s1, device, forward_high=False)
                 if val_loss is not None:
                     val_loss_w = dist_mean_scalar(val_loss, device)
-
             metric_s1 = float(val_loss_w) if val_loss_w is not None else float(epoch_loss_w)
 
             if is_main_process():
                 prev_lr = _cur_lr(opt1)
             sched1.step(metric_s1)
             if is_main_process():
-                now_lr = _cur_lr(opt1)
-                if now_lr < prev_lr:
-                    print(f"  [S1] LR reduced: {prev_lr:.3e} -> {now_lr:.3e}")
-
-            if is_main_process():
-                print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
-                      f'sim_loss={epoch_loss_w:.6f} lr={_cur_lr(opt1):.3e}', flush=True)
-            if is_main_process() and comp_count > 0:
-                avg = {k: v/comp_count for k, v in comp_accum.items()}
+                val_text = f" val_sim={float(val_loss_w):.6f}" if val_loss_w is not None else ""
                 print(
-                    f"[S1 z-MSE-H] alpha={avg['alpha']:.4f}, "
-                    f"omega={avg['omega']:.4f}, rho={avg['rho']:.4f}, "
-                    f"sin_theta={avg['sin_theta']:.4f}, cos_theta={avg['cos_theta']:.4f}; "
-                    f"BCE={avg.get('bce', 0.0):.4f}, CARD={avg.get('card', 0.0):.4f}"
+                    f"[Fold {fold + 1}] S1 Epoch {epoch + 1}/{cfg.epochs_stage1} "
+                    f"sim_loss={epoch_loss_w:.6f}{val_text} lr={_cur_lr(opt1):.3e}",
+                    flush=True,
                 )
+                if _cur_lr(opt1) < prev_lr:
+                    print(f"  [S1] LR reduced: {prev_lr:.3e} -> {_cur_lr(opt1):.3e}", flush=True)
+                if comp_count > 0:
+                    avg = {k: v / comp_count for k, v in comp_accum.items()}
+                    print(
+                        f"[S1 parts] alpha={avg.get('alpha', 0.0):.4f}, "
+                        f"omega={avg.get('omega', 0.0):.4f}, rho={avg.get('rho', 0.0):.4f}, "
+                        f"sin_theta={avg.get('sin_theta', 0.0):.4f}, "
+                        f"cos_theta={avg.get('cos_theta', 0.0):.4f}, "
+                        f"BCE={avg.get('bce', 0.0):.4f}, CARD={avg.get('card', 0.0):.4f}",
+                        flush=True,
+                    )
 
-            if epoch_loss_w < best_sim - cfg.early_stop_min_delta:
-                best_sim = metric_s1; no_improve = 0            
+            if metric_s1 < best_sim - cfg.early_stop_min_delta:
+                best_sim = metric_s1
+                no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= cfg.early_stop_patience_s1:
                     if is_main_process():
-                        print('  Early stop Stage1')                        
-                        print(f'[Fold {fold+1}] S1 Epoch {epoch+1}/{cfg.epochs_stage1} '
-                        f'sim_loss={epoch_loss_w:.6f}' + (f' val_loss={metric_s1:.6f}' if (val_loss_w is not None) else '')
-                        + f' lr={_cur_lr(opt1):.3e}', flush=True)
+                        print("  Early stop Stage1", flush=True)
                     break
-    else:
-        # 复用时依然需要把 high 层在 S1 期间禁用梯度（保持与常规路径一致），然后在 S2 再开启
-        for p in model_core.lin.parameters(): p.requires_grad_(False)
-        for p in model_core.adaptation.parameters(): p.requires_grad_(False)
+
         if is_main_process():
-            print(f"[Fold {fold+1}] S1 skipped (reuse fold0).", flush=True)
+            torch.save(
+                {
+                    "fold": fold,
+                    "stage": 1,
+                    "epoch": int(locals().get("epoch", -1)) + 1,
+                    "model_state_dict": model_core.state_dict(),
+                    "optimizer_state_dict": opt1.state_dict(),
+                    "loss_sim": float(loss_hist_s1[-1]) if loss_hist_s1 else float("nan"),
+                    "loss_history_sim": loss_hist_s1,
+                    "lr_history": lr_hist_s1,
+                },
+                out_dir / "base.pth",
+            )
+    elif is_main_process():
+        print(f"[Fold {fold + 1}] S1 skipped (reuse fold0).", flush=True)
 
-    # ============ Stage 2 ============ #
-    crit_s1.pres_w = 0.0  # 存在头完全以真实数据为准
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if is_main_process():
+        in_norm_deploy.save(out_dir.parent / "Normalizer_Input.pth")
+        out_norm_real.save(out_dir.parent / "Normalizer_Output.pth")
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    crit_s1.pres_w = 0.0
     crit_s1.card_w = 0.0
-    for p in model_core.lin.parameters(): p.requires_grad_(True)
-    for p in model_core.adaptation.parameters(): p.requires_grad_(True)
-    opt2 = torch.optim.Adam(model_core.parameters(), lr=cfg.lr_high_adam)
 
-    pat2   = getattr(cfg, 'lr_patience_s2', 20)
-    fac2   = getattr(cfg, 'lr_factor_s2', 0.5)
-    minlr2 = getattr(cfg, 'lr_min_s2', 1e-6)
-    thr    = getattr(cfg, 'early_stop_min_delta', 0.0)
+    freeze_low_stage2 = bool(getattr(cfg, "freeze_low_stage2", True))
+    low_tail_layers = _set_stage2_low_tail_trainable(model_core, cfg) if freeze_low_stage2 else []
+    if not freeze_low_stage2:
+        for p in model_core.low.parameters():
+            p.requires_grad_(True)
+    for p in model_core.lin.parameters():
+        p.requires_grad_(True)
+    for p in model_core.adaptation.parameters():
+        p.requires_grad_(True)
+
+    low_params = [p for p in model_core.low.parameters() if p.requires_grad]
+    high_params = [
+        p for p in list(model_core.lin.parameters()) + list(model_core.adaptation.parameters())
+        if p.requires_grad
+    ]
+    param_groups = [{"params": high_params, "lr": cfg.lr_high_adam, "name": "high"}]
+    if low_params:
+        param_groups.append(
+            {
+                "params": low_params,
+                "lr": float(getattr(cfg, "lr_low_stage2", cfg.lr_high_adam * 0.1)),
+                "name": "low_tail" if freeze_low_stage2 else "low",
+            }
+        )
+    opt2 = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+    if is_main_process():
+        group_text = ", ".join(
+            f"{group.get('name', 'group')}={sum(p.numel() for p in group['params'])}@{group['lr']:.3e}"
+            for group in param_groups
+        )
+        print(
+            f"[S2] freeze_low={freeze_low_stage2}; low_tail_layers={len(low_tail_layers)}; {group_text}",
+            flush=True,
+        )
+
+    use_sim_grad_stage2 = any(p.requires_grad for p in model_core.low.parameters())
     sched2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt2, mode='min', factor=fac2, patience=pat2,
-        threshold=thr, threshold_mode='abs', cooldown=0,
-        min_lr=minlr2, eps=1e-12
+        opt2,
+        mode="min",
+        factor=getattr(cfg, "lr_factor_s2", 0.5),
+        patience=getattr(cfg, "lr_patience_s2", 20),
+        threshold=getattr(cfg, "early_stop_min_delta", 0.0),
+        threshold_mode="abs",
+        min_lr=getattr(cfg, "lr_min_s2", 1e-6),
+        eps=1e-12,
     )
 
-    # 固定两任务权重（可调）
     w_sim, w_real = 0.2, 1.0
-    best_total = float('inf'); no_improve = 0
+    best_metric = float("inf")
+    best_state_dict = None
+    best_epoch_s2 = 0
+    no_improve = 0
     sim_iter = None
-    total_hist, sim_hist, real_hist = [], [], []
-    lr_hist_s2 = []
-
-    use_cuda = (device.type == 'cuda')
-    scaler2 = torch.amp.GradScaler('cuda') if use_cuda else None
-
-    # ====== PCGrad helpers（就地定义即可）======
-    from contextlib import contextmanager
-
-    @contextmanager
-    def _maybe_no_sync(module):
-        no_sync = getattr(module, "no_sync", None)
-        if callable(no_sync):
-            with module.no_sync():
-                yield
-        else:
-            yield
-
-    def _clone_grads(params):
-        out = []
-        for p in params:
-            out.append(None if p.grad is None else p.grad.detach().clone())
-        return out
-
-    def _zero_grads(params):
-        for p in params: p.grad = None
-
-    def _pcgrad_two_tasks(g1, g2):
-        out = []
-        for a, b in zip(g1, g2):
-            if a is None and b is None: out.append(None); continue
-            if a is None: out.append(b); continue
-            if b is None: out.append(a); continue
-            va, vb = a.view(-1), b.view(-1)
-            dot = torch.dot(va, vb)
-            if dot < 0:
-                denom = vb.norm()**2 + 1e-12
-                a = a - (dot / denom) * b
-            out.append(a + b)
-        return out
-
-    def _set_grads(params, grads):
-        for p, g in zip(params, grads):
-            p.grad = None if g is None else g
-
-    def _allreduce_grads_inplace(params):
-        if not (dist.is_available() and dist.is_initialized()):
-            return
-        world = dist.get_world_size()
-        for p in params:
-            if p.grad is None: continue
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-            if world > 1: p.grad.div_(world)
-    # ===========================================
+    total_hist, sim_hist, real_hist, val_hist, lr_hist_s2 = [], [], [], [], []
+    scaler2 = torch.amp.GradScaler("cuda") if use_cuda else None
 
     for epoch in range(cfg.epochs_stage2):
         model.train()
+        if freeze_low_stage2 and not use_sim_grad_stage2:
+            model_core.low.eval()
         _maybe_set_epoch(real_dl, epoch)
         _maybe_set_epoch(sim_dl, epoch)
         if sim_iter is None:
             sim_iter = cycle(sim_dl)
 
         sum_sim, sum_real, cnt_sim, cnt_real = 0.0, 0.0, 0, 0
-        params = list(model_core.parameters())
+        real_part_accum, real_part_count = {}, 0
+        params = [p for p in model_core.parameters() if p.requires_grad]
 
         for H_r, M_r, e_r, c_r, mask_r, yNr in real_dl:
             H_s, M_s, e_s, c_s, mask_s, yNs = next(sim_iter)
 
-            H_r = H_r.to(device, non_blocking=True); M_r = M_r.to(device, non_blocking=True)
-            e_r = e_r.to(device, non_blocking=True); c_r = c_r.to(device, non_blocking=True)
+            H_r = H_r.to(device, non_blocking=True)
+            M_r = M_r.to(device, non_blocking=True)
+            e_r = e_r.to(device, non_blocking=True)
+            c_r = c_r.to(device, non_blocking=True)
             mask_r = mask_r.to(device, non_blocking=True)
-            for k in yNr: yNr[k] = yNr[k].to(device, non_blocking=True)
+            for k in yNr:
+                yNr[k] = yNr[k].to(device, non_blocking=True)
 
-            H_s = H_s.to(device, non_blocking=True); M_s = M_s.to(device, non_blocking=True)
-            e_s = e_s.to(device, non_blocking=True); c_s = c_s.to(device, non_blocking=True)
+            H_s = H_s.to(device, non_blocking=True)
+            M_s = M_s.to(device, non_blocking=True)
+            e_s = e_s.to(device, non_blocking=True)
+            c_s = c_s.to(device, non_blocking=True)
             mask_s = mask_s.to(device, non_blocking=True)
-            for k in yNs: yNs[k] = yNs[k].to(device, non_blocking=True)
+            for k in yNs:
+                yNs[k] = yNs[k].to(device, non_blocking=True)
 
             opt2.zero_grad(set_to_none=True)
 
-            # ---------- 前向（一次完成两个任务的前向） ----------
             if use_cuda:
-                with torch.amp.autocast(device_type='cuda'):
+                with torch.amp.autocast(device_type="cuda"):
                     _, outH_r = model(H_r, M_r, e_r, c_r)
                     loss_real = crit_s2(outH_r, yNr, mask_r)
-                    outL_s, _ = model(H_s, M_s, e_s, c_s)
+                    real_stat = _crit_part_stats(crit_s2)
+                    if use_sim_grad_stage2:
+                        outL_s = model_core.forward_low(H_s, M_s, e_s, c_s)
+                    else:
+                        with torch.no_grad():
+                            outL_s = model_core.forward_low(H_s, M_s, e_s, c_s)
                     loss_sim = crit_s1(outL_s, yNs, mask_s)
             else:
                 _, outH_r = model(H_r, M_r, e_r, c_r)
                 loss_real = crit_s2(outH_r, yNr, mask_r)
-                outL_s, _ = model(H_s, M_s, e_s, c_s)
+                real_stat = _crit_part_stats(crit_s2)
+                if use_sim_grad_stage2:
+                    outL_s = model_core.forward_low(H_s, M_s, e_s, c_s)
+                else:
+                    with torch.no_grad():
+                        outL_s = model_core.forward_low(H_s, M_s, e_s, c_s)
                 loss_sim = crit_s1(outL_s, yNs, mask_s)
 
-            # ---------- 计算两项梯度并做 PCGrad 合并（只在最后 unscale_ 一次） ----------
-            if use_cuda:
-                # ---------- 计算两项梯度并做 PCGrad（在“未缩放 FP32”空间），再缩放回去 ----------
-                if not torch.isfinite(loss_real):
-                    print("[WARN] loss_real is not finite. Skip step.", flush=True)
-                    continue
+            if not torch.isfinite(loss_real):
+                print("[WARN] loss_real is not finite. Skip step.", flush=True)
+                continue
 
-                # 1) 逐任务 backward（保持缩放），先取“缩放后的梯度副本”
-                with _maybe_no_sync(model_core):
+            if not use_sim_grad_stage2:
+                if use_cuda:
+                    scaler2.scale(w_real * loss_real).backward()
+                    scaler2.unscale_(opt2)
+                    torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                    scaler2.step(opt2)
+                    scaler2.update()
+                else:
+                    (w_real * loss_real).backward()
+                    torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+                    opt2.step()
+            elif use_cuda:
+                with maybe_no_sync(model):
                     scaler2.scale(w_sim * loss_sim).backward(retain_graph=True)
-                g_sim_scaled = _clone_grads(params)
-
-                _zero_grads(params)
-                with _maybe_no_sync(model_core):
+                g_sim_scaled = clone_grads(params)
+                zero_grads(params)
+                with maybe_no_sync(model):
                     scaler2.scale(w_real * loss_real).backward(retain_graph=True)
-                g_real_scaled = _clone_grads(params)
+                g_real_scaled = clone_grads(params)
 
-                # 2) 获取当前缩放因子，并把两份梯度还原到“未缩放 FP32”
-                cur_scale = scaler2.get_scale()
-                g_sim  = [None if g is None else (g.float() / cur_scale) for g in g_sim_scaled]
-                g_real = [None if g is None else (g.float() / cur_scale) for g in g_real_scaled]
+                scale = scaler2.get_scale()
+                g_sim = [None if g is None else (g.float() / scale) for g in g_sim_scaled]
+                g_real = [None if g is None else (g.float() / scale) for g in g_real_scaled]
+                g_comb = pcgrad_two_tasks(g_sim, g_real)
 
-                # 3) 在未缩放空间做 PCGrad
-                g_comb = _pcgrad_two_tasks(g_sim, g_real)   # 现在是 FP32 未缩放梯度
-
-                # 4) 手动全局范数裁剪（未缩放空间）
-                max_norm = 1.0
                 total_sq = 0.0
-                for g in g_comb:
-                    if g is not None: total_sq += g.pow(2).sum()
+                for grad in g_comb:
+                    if grad is not None:
+                        total_sq += grad.pow(2).sum()
                 total_norm = total_sq.sqrt()
-                clip_coef = (max_norm / (total_norm + 1e-12)).clamp(max=1.0)
+                clip_coef = (1.0 / (total_norm + 1e-12)).clamp(max=1.0)
                 if clip_coef < 1.0:
-                    for i, g in enumerate(g_comb):
-                        if g is not None: g_comb[i] = g * clip_coef
+                    g_comb = [None if g is None else g * clip_coef for g in g_comb]
 
-                # 5) 乘回缩放因子，写回 .grad
-                g_comb_scaled = [None if g is None else (g * cur_scale) for g in g_comb]
-                _set_grads(params, g_comb_scaled)
-
-                # 6) （DDP）规约，然后直接 scaler.step/update（不调用 unscale_）
-                _allreduce_grads_inplace(params)
+                set_grads(params, [None if g is None else g * scale for g in g_comb])
+                allreduce_grads_inplace(params)
                 scaler2.step(opt2)
                 scaler2.update()
-
             else:
-                # CPU/无 AMP 分支保持原逻辑即可
-                with _maybe_no_sync(model_core):
+                with maybe_no_sync(model):
                     (w_sim * loss_sim).backward(retain_graph=True)
-                g_sim = _clone_grads(params)
-
-                _zero_grads(params)
-                with _maybe_no_sync(model_core):
+                g_sim = clone_grads(params)
+                zero_grads(params)
+                with maybe_no_sync(model):
                     (w_real * loss_real).backward(retain_graph=True)
-                g_real = _clone_grads(params)
-
-                g_comb = _pcgrad_two_tasks(g_sim, g_real)
-                _set_grads(params, g_comb)
-                _allreduce_grads_inplace(params)
-                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=1.0)
+                g_real = clone_grads(params)
+                set_grads(params, pcgrad_two_tasks(g_sim, g_real))
+                allreduce_grads_inplace(params)
+                torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 opt2.step()
 
+            bs_r, bs_s = H_r.size(0), H_s.size(0)
+            sum_real += float(loss_real.item()) * bs_r
+            cnt_real += bs_r
+            sum_sim += float(loss_sim.item()) * bs_s
+            cnt_sim += bs_s
+            if real_stat:
+                _accum_stat(real_part_accum, real_stat)
+                real_part_count += 1
 
-            bs_r = H_r.size(0); bs_s = H_s.size(0)
-            sum_real += loss_real.item() * bs_r; cnt_real += bs_r
-            sum_sim  += loss_sim.item()  * bs_s; cnt_sim  += bs_s
-
-        t_sim   = torch.tensor(sum_sim, device=device)
-        t_cnt_s = torch.tensor(cnt_sim,  device=device, dtype=torch.float32)
-        t_real  = torch.tensor(sum_real, device=device)
+        t_sim = torch.tensor(sum_sim, device=device)
+        t_cnt_s = torch.tensor(cnt_sim, device=device, dtype=torch.float32)
+        t_real = torch.tensor(sum_real, device=device)
         t_cnt_r = torch.tensor(cnt_real, device=device, dtype=torch.float32)
-        if dist.is_initialized():
-            dist.all_reduce(t_sim, op=dist.ReduceOp.SUM);   dist.all_reduce(t_cnt_s, op=dist.ReduceOp.SUM)
-            dist.all_reduce(t_real, op=dist.ReduceOp.SUM);  dist.all_reduce(t_cnt_r, op=dist.ReduceOp.SUM)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(t_sim, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t_cnt_s, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t_real, op=dist.ReduceOp.SUM)
+            dist.all_reduce(t_cnt_r, op=dist.ReduceOp.SUM)
 
-        sim_epoch   = (t_sim  / t_cnt_s).item() if t_cnt_s.item() > 0 else 0.0
-        real_epoch  = (t_real / t_cnt_r).item() if t_cnt_r.item() > 0 else 0.0
-        total_epoch = float(w_sim*sim_epoch + w_real*real_epoch)
+        sim_epoch = (t_sim / t_cnt_s).item() if t_cnt_s.item() > 0 else 0.0
+        real_epoch = (t_real / t_cnt_r).item() if t_cnt_r.item() > 0 else 0.0
+        total_epoch = float(w_sim * sim_epoch + w_real * real_epoch)
 
-        # ---- validation (Stage-2: real) ----
-        use_val_split = bool(getattr(cfg, "use_val_split", False))
         val_real_epoch = None
-        if use_val_split:
+        if bool(getattr(cfg, "use_val_split", False)):
             val_real_epoch = _eval_loss(model, val_dl, crit_s2, device, forward_high=True)
-
-        metric_s2 = float(val_real_epoch) if (val_real_epoch is not None) else float(total_epoch)
+        metric_s2 = float(val_real_epoch) if val_real_epoch is not None else float(total_epoch)
 
         if is_main_process():
             prev_lr2 = _cur_lr(opt2)
         sched2.step(metric_s2)
-        if is_main_process():
-            now_lr2 = _cur_lr(opt2)
-            if now_lr2 < prev_lr2:
-                print(f"  [S2] LR reduced: {prev_lr2:.3e} -> {now_lr2:.3e}")
+        if is_main_process() and _cur_lr(opt2) < prev_lr2:
+            print(f"  [S2] LR reduced: {prev_lr2:.3e} -> {_cur_lr(opt2):.3e}", flush=True)
 
         sim_hist.append(float(sim_epoch))
         real_hist.append(float(real_epoch))
         total_hist.append(float(total_epoch))
+        val_hist.append(float(val_real_epoch) if val_real_epoch is not None else float("nan"))
         lr_hist_s2.append(_cur_lr(opt2))
 
         if is_main_process():
-            print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
-                f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
-                f'lr={_cur_lr(opt2):.3e}', flush=True)
-        if total_epoch < best_total - cfg.early_stop_min_delta:
-            best_total = metric_s2; no_improve = 0        
+            val_text = f" val_real={float(val_real_epoch):.6f}" if val_real_epoch is not None else " val_real=nan"
+            print(
+                f"[Fold {fold + 1}] S2 Epoch {epoch + 1}/{cfg.epochs_stage2} "
+                f"total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f}"
+                f"{val_text} lr={_cur_lr(opt2):.3e}",
+                flush=True,
+            )
+            if real_part_count > 0:
+                avg = {k: v / real_part_count for k, v in real_part_accum.items()}
+                print(
+                    f"[S2 train-real parts] alpha={avg.get('alpha', 0.0):.4f}, "
+                    f"omega={avg.get('omega', 0.0):.4f}, rho={avg.get('rho', 0.0):.4f}, "
+                    f"sin_theta={avg.get('sin_theta', 0.0):.4f}, "
+                    f"cos_theta={avg.get('cos_theta', 0.0):.4f}, "
+                    f"BCE={avg.get('bce', 0.0):.4f}, CARD={avg.get('card', 0.0):.4f}, "
+                    f"CLSw={avg.get('cls_weighted', 0.0):.4f}",
+                    flush=True,
+                )
+
+        if metric_s2 < best_metric - cfg.early_stop_min_delta:
+            best_metric = metric_s2
+            best_epoch_s2 = epoch + 1
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
+            no_improve = 0
         else:
             no_improve += 1
             if no_improve >= cfg.early_stop_patience_s2:
                 if is_main_process():
-                    print('  Early stop Stage2')                    
-                    print(f'[Fold {fold+1}] S2 Epoch {epoch+1}/{cfg.epochs_stage2} '
-                      f'total={total_epoch:.6f} sim={sim_epoch:.6f} real={real_epoch:.6f} '
-                      + (f'val_real={metric_s2:.6f} ' if (val_real_epoch is not None) else '')
-                      + f'lr={_cur_lr(opt2):.3e}', flush=True)
+                    print("  Early stop Stage2", flush=True)
                 break
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
+    if best_state_dict is not None:
+        model_core.load_state_dict(best_state_dict)
 
     if is_main_process():
-        # 只在 Stage-2 训练结束后保存一个最终 checkpoint（文件名 = out_dir 最后一级目录 + .pth）
-        save_path = out_dir / (out_dir.name + '.pth')
-        final_epoch = int(locals().get('epoch', -1)) + 1  # 若 epochs_stage2=0，则为 0
-        torch.save({
-            'fold': fold,
-            'stage': 2,
-            'epoch': final_epoch,
-            'model_state_dict': model_core.state_dict(),
-            'optimizer_state_dict': opt2.state_dict(),
-            'loss_total': float(total_hist[-1]) if len(total_hist) > 0 else float('nan'),
-            'loss_sim':   float(sim_hist[-1])   if len(sim_hist)   > 0 else float('nan'),
-            'loss_real':  float(real_hist[-1])  if len(real_hist)  > 0 else float('nan'),
-            'loss_history_total': total_hist,
-            'loss_history_sim':   sim_hist,
-            'loss_history_real':  real_hist,
-            'lr_history': lr_hist_s2,
-        }, save_path)
+        save_path = out_dir / (out_dir.name + ".pth")
+        torch.save(
+            {
+                "fold": fold,
+                "stage": 2,
+                "epoch": int(locals().get("epoch", -1)) + 1,
+                "best_epoch": best_epoch_s2,
+                "best_metric": float(best_metric),
+                "model_state_dict": model_core.state_dict(),
+                "optimizer_state_dict": opt2.state_dict(),
+                "loss_total": float(total_hist[-1]) if total_hist else float("nan"),
+                "loss_sim": float(sim_hist[-1]) if sim_hist else float("nan"),
+                "loss_real": float(real_hist[-1]) if real_hist else float("nan"),
+                "loss_val_real": float(val_hist[-1]) if val_hist else float("nan"),
+                "loss_history_total": total_hist,
+                "loss_history_sim": sim_hist,
+                "loss_history_real": real_hist,
+                "loss_history_val_real": val_hist,
+                "lr_history": lr_hist_s2,
+            },
+            save_path,
+        )
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
-
-    # ============ Validation ============ #
-    model.eval()
-    if cfg.use_hungarian_loss:
-        crit_eval = MaskedHungarianMSE(mean=mean_real, std=std_real,
-                                    w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                                    w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
-                                    w_cos_theta=w_s2_cos_theta)
-    else:
-        crit_eval = MaskedMSE(mean=mean_real, std=std_real,
-                            w_alpha=w_s2_alpha, w_omega=w_s2_omega,
-                            w_rho=w_s2_rho, w_sin_theta=w_s2_sin_theta,
-                            w_cos_theta=w_s2_cos_theta)
-
+    eval_cls = MaskedHungarianMSE if cfg.use_hungarian_loss else MaskedMSE
+    crit_eval = eval_cls(mean=mean_real, std=std_real)
     vloss = _eval_loss(model, val_dl, crit_eval, device, forward_high=True)
     if vloss is None:
-        vloss = float('nan')
-
-    return vloss, best_total, sim_hist, real_hist, total_hist
+        vloss = float("nan")
+    return vloss, best_metric, sim_hist, real_hist, total_hist

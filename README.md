@@ -1,37 +1,32 @@
-# mfdnn_pzk
+# surrogate_model
 
-Modularized refactor of the original monolithic training script for PZK‑parameter MFDNN.
+Python package for the PZK surrogate model.
 
-## Layout
-```
-surrogate_model/
-  ├── __init__.py
-  ├── config.py
-  ├── utils/
-  │   └── dist_utils.py
-  ├── data/
-  │   ├── io.py
-  │   ├── normalizer.py
-  │   └── datasets.py
-  ├── models/
-  │   └── blocks.py
-  ├── losses/
-  │   └── masked_mse.py
-  ├── train/
-  │   ├── dataloaders.py
-  │   └── loops.py
-  └── cli/
-      ├── train_pzk.py
-  │   └── model_test.py
-```
+## Install
 
-## Run (single node, multi‑GPU)
+From this repository root:
+
 ```bash
-torchrun --nproc_per_node=2 -m mfdnn_pzk.cli.train_pzk \
-  --sim_txt /path/to/sim_dataset_new.txt \  --real_txt /path/to/real_dataset_new.txt \  --out_dir ./outputs_pzk \  --kfold 5 --K_max 8 --embed_dim 16 \  --epochs_s1 2000 --epochs_s2 2000 \  --batch_sim 1024 --batch_real 256
+python -m pip install -e .
 ```
 
-## Notes
-- Functionality mirrors the original script (two‑stage training, masked loss, K‑fold on REAL only, DDP, checkpoints, early stop, validation).
-- Normalizers are saved/loaded from `out_dir`, same filenames as before.
-- Keep your data format unchanged — parsing & normalization logic is identical.
+## Recommended Commands
+
+```bash
+python -m surrogate_model.cli.train
+python -m surrogate_model.cli.train_incremental
+python -m surrogate_model.test.Predict_user
+```
+
+The legacy training entry remains available:
+
+```bash
+python -m surrogate_model.cli.train_pzk
+```
+
+## Data And Model Contract
+
+- Input txt rows keep the base format: `H, M, exc_id, ch_id, Re, Im, rho, theta ...`
+- Model forward remains `model(Hn, Mn, exc_t, ch_t)`.
+- `Normalizer_Input.pth` is for two input features: `[H, M]`.
+- Prediction output directories include `PR_XGD`, `RESULT_PR_XGD`, `HF_PR_XGD`, `HG_PR_XGD`, `HA_PR_XGD`, `VF_PR_XGD`, `VG_PR_XGD`, and `VA_PR_XGD`.

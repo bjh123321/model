@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
 
-from .envelop import compute_spectrum, envelope_rms_tv
-from .OE import OEModel
+from surrogate_model.data.envelop import compute_spectrum, envelope_rms_tv
+from surrogate_model.data.OE import OEModel
 
 
 # =========================

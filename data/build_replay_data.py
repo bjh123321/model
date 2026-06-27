@@ -177,9 +177,10 @@ def pick_replay_groups_for_target(
     return use_pool[:MAX_GROUPS_PER_SELECTED]
 
 
-def build_replay_data(base_dir: Path) -> None:
+def build_replay_data(base_dir: Path, model_dir: Path | None = None) -> None:
+    base_dir = Path(base_dir)
     selected_list_file = base_dir / "selected_CG_path.txt"
-    real_dataset_file = base_dir.parent / "GENERATION" / "real_dataset.txt"
+    real_dataset_file = Path(model_dir) / "real_dataset.txt" if model_dir is not None else base_dir.parent / "GENERATION" / "real_dataset.txt"
     replay_out_file = base_dir / "replay_data.txt"
 
     targets = load_selected_targets(selected_list_file)
@@ -226,7 +227,7 @@ def build_replay_data(base_dir: Path) -> None:
 
 
 def main():
-    base_dir = ""
+    base_dir = Path.cwd()
     build_replay_data(base_dir)
 
 

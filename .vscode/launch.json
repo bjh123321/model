@@ -1,0 +1,36 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Train surrogate model",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surrogate_model.cli.train",
+            "python": "${config:python.defaultInterpreterPath}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "args": [
+                "--device",
+                "auto"
+            ]
+        },
+        {
+            "name": "Predict user data",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surrogate_model.test.Predict_user",
+            "python": "${config:python.defaultInterpreterPath}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Incremental fine-tune",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "surrogate_model.cli.train_incremental",
+            "python": "${config:python.defaultInterpreterPath}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        }
+    ]
+}

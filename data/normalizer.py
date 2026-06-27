@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import List
 import numpy as np
 import torch
-from .io import ParsedRow
+from surrogate_model.data.io import ParsedRow
 
 @dataclass
 class Normalizer:
@@ -77,7 +77,7 @@ def compute_output_normalizer_masked(parsed: List[ParsedRow]) -> Normalizer:
 
 if __name__ == '__main__':
     # 简单测试
-    from .io import read_variable_txt, parse_rows_to_struct
+    from surrogate_model.data.io import read_variable_txt, parse_rows_to_struct
     from pathlib import Path
     sim_txt = Path(__file__).parent / 'sim_dataset_new.txt'
     sim_rows  = read_variable_txt(sim_txt)

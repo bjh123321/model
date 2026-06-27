@@ -8,7 +8,7 @@ from surrogate_model.data.normalizer import Normalizer
 import matplotlib.pyplot as plt
 from scipy.signal import lfilter
 import pandas as pd
-from residue_pred import build_BA_from_residues
+from surrogate_model.test.residue_pred import build_BA_from_residues
 import argparse
 
 
