@@ -43,14 +43,48 @@ def _ddp_setup() -> tuple[bool, int, int]:
     return True, rank, world_size
 
 
-def _path_from_ini(paths_ini_path: Path, section: str) -> Path:
+def _path_from_ini(paths_ini_path: Path, section: str) -> Path | None:
     cp = configparser.ConfigParser()
+    if not paths_ini_path.exists():
+        return None
     cp.read(paths_ini_path, encoding="utf-8")
     key = f"path_{section}".lower()
-    try:
-        return Path(cp[section][key])
-    except KeyError:
-        raise KeyError(f"{paths_ini_path} is missing [{section}] / {key}") from None
+    if not cp.has_section(section) or key not in cp[section]:
+        return None
+    return Path(cp[section][key])
+
+
+def _default_model_dir(base_dir: Path, paths_ini_path: Path) -> Path:
+    model_dir = _path_from_ini(paths_ini_path, "MX_XGD")
+    if model_dir is not None:
+        return model_dir
+    fallback = base_dir.parents[1] / "MX_XGD"
+    print(
+        f"[WARN] {paths_ini_path} does not define [MX_XGD]/path_mx_xgd; "
+        f"using legacy default: {fallback}",
+        flush=True,
+    )
+    return fallback
+
+
+def _resolve_real_dataset_path(base_dir: Path, raw_value: str) -> Path:
+    candidate = Path(raw_value).expanduser()
+    if candidate.exists():
+        return candidate
+    local_real = base_dir / "real_dataset.txt"
+    if local_real.exists():
+        print(
+            f"[WARN] user_input.dat line 3 is not an existing dataset path: {raw_value!r}; "
+            f"using local dataset: {local_real}",
+            flush=True,
+        )
+        return local_real
+    raise FileNotFoundError(
+        "Real dataset file was not found. For base training, user_input.dat line 3 "
+        f"must be a real_dataset.txt path, or {local_real} must exist. "
+        "If this user_input.dat is for model correction, run "
+        "`python -m surrogate_model.cli.train_incremental` instead."
+    )
 
 
 def _enable_fast_cuda(args) -> torch.device:
@@ -92,8 +126,8 @@ def main():
 
     paths_ini_path = Path(lines[0].strip()).expanduser()
     model_version = lines[1].strip()
-    real_dataset_path = Path(lines[2].strip()).expanduser()
-    model_dir = _path_from_ini(paths_ini_path, "MX_XGD")
+    real_dataset_path = _resolve_real_dataset_path(base_dir, lines[2].strip())
+    model_dir = _default_model_dir(base_dir, paths_ini_path)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--out_dir", type=str, default=str(model_dir / model_version))
