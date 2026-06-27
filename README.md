@@ -18,12 +18,6 @@ python -m surrogate_model.cli.train_incremental
 python -m surrogate_model.test.Predict_user
 ```
 
-The legacy training entry remains available:
-
-```bash
-python -m surrogate_model.cli.train_pzk
-```
-
 ## Data And Model Contract
 
 - Input txt rows keep the base format: `H, M, exc_id, ch_id, Re, Im, rho, theta ...`
