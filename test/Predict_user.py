@@ -1,4 +1,5 @@
 # %%
+import argparse
 import re
 import sys
 import configparser
@@ -385,6 +386,7 @@ def run_infer_batched(
     exc_all: np.ndarray,
     ch_all: np.ndarray,
     batch_size: int = 20000,
+    predict_output: str = "high",
 ):
     """
     输入：
@@ -410,8 +412,14 @@ def run_infer_batched(
         exc_t = torch.tensor(exc_all[s:e], dtype=torch.long, device=device)
         ch_t = torch.tensor(ch_all[s:e], dtype=torch.long, device=device)
 
-        outL, outH = model(Hn, Mn, exc_t, ch_t)
-        out = outH  # 你一直用 outH
+        model_out = model(Hn, Mn, exc_t, ch_t)
+        if isinstance(model_out, tuple):
+            outL, outH = model_out
+            out = outL if predict_output == "low" else outH
+        else:
+            if predict_output != "low":
+                raise RuntimeError("Model returned a single output; use --predict_output low for this checkpoint.")
+            out = model_out
 
         alpha = out["alpha"].detach().cpu().numpy()
         omega = out["omega"].detach().cpu().numpy() * omegaN
@@ -911,6 +919,23 @@ def save_VF_VG_for_entry(
         f.writelines(va_lines)
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model_path",
+        "--ckpt_path",
+        dest="model_path",
+        type=str,
+        default=None,
+        help="Optional checkpoint path. Defaults to MX_XGD/model_version/model_version.pth from user_input.dat.",
+    )
+    parser.add_argument(
+        "--predict_output",
+        choices=["high", "low"],
+        default="high",
+        help="Use high-fidelity or low-fidelity model output for prediction. Default: high.",
+    )
+    args, _unknown = parser.parse_known_args()
+
     fs = 512
     Ts = 1.0 / fs
     omegaN = np.pi * fs
@@ -937,7 +962,7 @@ def main():
     # ===== 模型文件路径 =====
     model_dir = _path_from_config(cp, paths_ini_path, "MX_XGD")
 
-    ckpt_path = model_dir / model_version / (model_version + ".pth")
+    ckpt_path = Path(args.model_path).expanduser() if args.model_path else model_dir / model_version / (model_version + ".pth")
     in_norm_path =  model_dir / "Normalizer_Input.pth"
     out_norm_path = model_dir / "Normalizer_Output.pth"
     data_header_dir = _path_from_config(cp, paths_ini_path, "DataHeader")
@@ -986,7 +1011,8 @@ def main():
     out_norm = Normalizer.load(out_norm_path)
     cfg.residue_target = getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar"))
 
-    print("==> Loading ckpt...")
+    print(f"==> Loading ckpt: {ckpt_path}")
+    print(f"==> Prediction output: {args.predict_output}")
     try:
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     except TypeError:
@@ -1038,7 +1064,8 @@ def main():
         outs_resp = run_infer_batched(
             model=model, in_norm=in_norm, omegaN=omegaN, device=device,
             H_all=H_all, M_all=M_all, exc_all=exc_all, ch_all=ch_all,
-            batch_size=4096
+            batch_size=4096,
+            predict_output=args.predict_output,
         )
 
         # 2) 生成激励 u(t)
@@ -1064,7 +1091,8 @@ def main():
             outs_hscan = run_infer_batched(
                 model=model, in_norm=in_norm, omegaN=omegaN, device=device,
                 H_all=Hs, M_all=Ms, exc_all=excs, ch_all=chs,
-                batch_size=20000
+                batch_size=20000,
+                predict_output=args.predict_output,
             )
             save_HF_HG_for_entry(
                 entry, H_axis, outs_hscan, csv_path,
@@ -1086,7 +1114,8 @@ def main():
             outs_mscan = run_infer_batched(
                 model=model, in_norm=in_norm, omegaN=omegaN, device=device,
                 H_all=Hs, M_all=Ms, exc_all=excs, ch_all=chs,
-                batch_size=20000
+                batch_size=20000,
+                predict_output=args.predict_output,
             )
             save_VF_VG_for_entry(
                 entry, M_axis, outs_mscan, csv_path,

@@ -42,8 +42,23 @@ def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
     fs = 512
     omegaN = math.pi * fs
     K_list, ch_list, exc_list = [], [], []
-    for r in rows:
+
+    def _modal_tail(r: List[float]) -> List[float]:
         tail = r[4:]
+        if len(tail) % 4 == 0:
+            return tail
+        if len(tail) >= 6 and (len(tail) - 2) % 4 == 0:
+            # Some real datasets include two per-row metadata fields before
+            # the modal tuples.  The modal tuples are still
+            # (sigma/Re, omega/Im, rho, theta).
+            return tail[2:]
+        raise ValueError(
+            f"Unexpected row width: total_cols={len(r)}, modal_tail_cols={len(tail)}. "
+            "Expected 4 + 4*K or 4 + 2 + 4*K columns."
+        )
+
+    for r in rows:
+        tail = _modal_tail(r)
         K_list.append(len(tail) // 4)
         exc_list.append(int(round(r[2])))
         ch_list.append(int(round(r[3])))
@@ -58,7 +73,7 @@ def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
         H, M = float(r[0]), float(r[1])
         exc_id = int(round(r[2]))
         ch_id = int(round(r[3]))
-        tail = r[4:]
+        tail = _modal_tail(r)
         K_all = len(tail) // 4
         
         valid_idx = []
@@ -68,7 +83,11 @@ def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
             rk  = float(tail[4*k + 2])
             thk   = float(tail[4*k + 3])
             # 判定该模态是否为“有效（非补位）”
-            if (abs(Rek) > eps) or (abs(Imk) > eps) or (abs(rk) > eps) or (abs(thk) > eps):
+            if (
+                np.isfinite(Rek) and np.isfinite(Imk) and np.isfinite(rk) and np.isfinite(thk)
+                and rk > eps
+                and ((abs(Rek) > eps) or (abs(Imk) > eps) or (abs(thk) > eps))
+            ):
                 valid_idx.append(k)
         K = len(valid_idx)
 

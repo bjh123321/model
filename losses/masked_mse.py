@@ -96,13 +96,10 @@ class MaskedMSE(nn.Module):
             res_mean = torch.cat([res_mean, res_mean.new_zeros(len(names) - res_mean.numel())], dim=0)
         if res_std.numel() < len(names):
             res_std = torch.cat([res_std, res_std.new_ones(len(names) - res_std.numel())], dim=0)
-        res_mean = res_mean.view(1, len(names), 1).to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
-        res_std = res_std.view(1, len(names), 1).to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype).clamp_min(1e-8)
-        pred_width = pred_n["alpha"].size(1)
-        res_mean = _match_width(res_mean, pred_width)
-        res_std = _match_width(res_std, pred_width).clamp_min(1e-8)
+        res_mean = res_mean.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
+        res_std = res_std.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype).clamp_min(1e-8)
         for i, name in enumerate(names):
-            pred_n[name] = (pred[name] - res_mean[:, i, :]) / res_std[:, i, :]
+            pred_n[name] = (pred[name] - res_mean[i]) / res_std[i]
         return pred_n
 
     def _presence_losses(self, pred, mask, assign_rows=None):

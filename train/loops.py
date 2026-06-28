@@ -647,7 +647,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         dist.barrier()
 
     eval_cls = MaskedHungarianMSE if cfg.use_hungarian_loss else MaskedMSE
-    crit_eval = eval_cls(mean=mean_real, std=std_real)
+    crit_eval = eval_cls(mean=mean_real, std=std_real, residue_target=getattr(cfg, "residue_target", "polar"))
     vloss = _eval_loss(model, val_dl, crit_eval, device, forward_high=True)
     if vloss is None:
         vloss = float("nan")
