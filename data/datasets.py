@@ -6,9 +6,18 @@ from surrogate_model.data.io import ParsedRow
 from surrogate_model.data.normalizer import Normalizer
 
 
+def _fixed_len_tensor(values, K_max: int) -> torch.Tensor:
+    out = torch.zeros((K_max,), dtype=torch.float32)
+    src = torch.as_tensor(values, dtype=torch.float32).flatten()
+    n = min(int(K_max), int(src.numel()))
+    if n > 0:
+        out[:n] = src[:n]
+    return out
+
+
 def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
-    alpha = torch.from_numpy(p.alpha.copy())
-    omega = torch.from_numpy(p.omega.copy())
+    alpha = _fixed_len_tensor(p.alpha, K_max)
+    omega = _fixed_len_tensor(p.omega, K_max)
     alpha = (alpha - float(out_norm.mean[0])) / max(float(out_norm.std[0]), 1e-8)
     omega = (omega - float(out_norm.mean[1])) / max(float(out_norm.std[1]), 1e-8)
 
@@ -16,17 +25,17 @@ def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
     if residue_target == "cartesian":
         residue = torch.stack(
             [
-                torch.from_numpy(p.residue_re.copy()),
-                torch.from_numpy(p.residue_im.copy()),
+                _fixed_len_tensor(p.residue_re, K_max),
+                _fixed_len_tensor(p.residue_im, K_max),
             ],
             dim=0,
         )
     else:
         residue = torch.stack(
             [
-                torch.from_numpy(p.rho.copy()),
-                torch.from_numpy(p.sin_theta.copy()),
-                torch.from_numpy(p.cos_theta.copy()),
+                _fixed_len_tensor(p.rho, K_max),
+                _fixed_len_tensor(p.sin_theta, K_max),
+                _fixed_len_tensor(p.cos_theta, K_max),
             ],
             dim=0,
         )
