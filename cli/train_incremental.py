@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from surrogate_model.config import Config
 from surrogate_model.data.OE_BATCH_PROCESS import batch_process
 from surrogate_model.data.build_replay_data import build_replay_data
+from surrogate_model.data.datasets import build_label_tensor
 from surrogate_model.data.io import parse_rows_to_struct
 from surrogate_model.data.normalizer import Normalizer
 from surrogate_model.losses.masked_mse import MaskedHungarianMSE
@@ -33,19 +34,6 @@ def _path_from_ini(cp: configparser.ConfigParser, paths_ini_path: Path, section:
         return Path(cp[section][key])
     except KeyError:
         raise KeyError(f"{paths_ini_path} is missing [{section}] / {key}") from None
-
-
-def normalize_target(pred: torch.Tensor, mean, std):
-    mean_t = torch.as_tensor(mean, dtype=pred.dtype, device=pred.device)
-    std_t = torch.as_tensor(std, dtype=pred.dtype, device=pred.device)
-
-    core = pred[..., :3]
-    others = pred[..., 3:]
-    assert mean_t.numel() == 3 and std_t.numel() == 3, "out_norm.mean/std must have length 3"
-
-    view_shape = [1] * (core.ndim - 1) + [3]
-    core_n = (core - mean_t.view(*view_shape)) / std_t.view(*view_shape).clamp_min(1e-8)
-    return torch.cat([core_n, others], dim=-1)
 
 
 class RealIncrementalDataset(Dataset):
@@ -76,31 +64,26 @@ class RealIncrementalDataset(Dataset):
         H = ((H - float(in_norm.mean[0])) / max(float(in_norm.std[0]), 1e-12)).unsqueeze(-1)
         M = ((M - float(in_norm.mean[1])) / max(float(in_norm.std[1]), 1e-12)).unsqueeze(-1)
 
-        alpha_list, omega_list, rho_list = [], [], []
-        sin_list, cos_list, mask_list = [], [], []
+        label_list, res_mean_list, res_std_list, mask_list = [], [], [], []
         for p in parsed:
-            alpha_list.append(torch.from_numpy(p.alpha.copy()).float())
-            omega_list.append(torch.from_numpy(p.omega.copy()).float())
-            rho_list.append(torch.from_numpy(p.rho.copy()).float())
-            sin_list.append(torch.from_numpy(p.sin_theta.copy()).float())
-            cos_list.append(torch.from_numpy(p.cos_theta.copy()).float())
+            y_norm, res_mean, res_std = build_label_tensor(p, len(p.mask), out_norm)
+            label_list.append(y_norm.float())
+            res_mean_list.append(res_mean.float())
+            res_std_list.append(res_std.float())
             mask_list.append(torch.from_numpy(p.mask.copy()).float())
 
-        alpha = torch.stack(alpha_list, dim=0)
-        omega = torch.stack(omega_list, dim=0)
-        rho = torch.stack(rho_list, dim=0)
-        sin_t = torch.stack(sin_list, dim=0)
-        cos_t = torch.stack(cos_list, dim=0)
         mask = torch.stack(mask_list, dim=0)
-
-        y_phys = torch.stack([alpha, omega, rho, sin_t, cos_t], dim=-1)
-        yN = normalize_target(y_phys, out_norm.mean, out_norm.std)
+        yN = torch.stack(label_list, dim=0)
+        res_mean = torch.stack(res_mean_list, dim=0)
+        res_std = torch.stack(res_std_list, dim=0)
 
         self.H = H
         self.M = M
         self.exc = exc
         self.chn = chn
         self.yN = yN
+        self.res_mean = res_mean
+        self.res_std = res_std
         self.mask = mask
 
     def __len__(self):
@@ -108,18 +91,31 @@ class RealIncrementalDataset(Dataset):
 
     def __getitem__(self, idx):
         yNk = self.yN[idx]
+        y_dict = {
+            "alpha": yNk[0],
+            "omega": yNk[1],
+            "residue_mean": self.res_mean[idx],
+            "residue_std": self.res_std[idx],
+        }
+        if yNk.size(0) == 5:
+            y_dict.update({
+                "rho": yNk[2],
+                "sin_theta": yNk[3],
+                "cos_theta": yNk[4],
+            })
+        elif yNk.size(0) == 4:
+            y_dict.update({
+                "residue_re": yNk[2],
+                "residue_im": yNk[3],
+            })
+        else:
+            raise RuntimeError(f"Unexpected label shape: {tuple(yNk.shape)}")
         return {
             "H": self.H[idx],
             "M": self.M[idx],
             "exc": self.exc[idx],
             "chn": self.chn[idx],
-            "yN": {
-                "alpha": yNk[:, 0],
-                "omega": yNk[:, 1],
-                "rho": yNk[:, 2],
-                "sin_theta": yNk[:, 3],
-                "cos_theta": yNk[:, 4],
-            },
+            "yN": y_dict,
             "mask": self.mask[idx],
         }
 
@@ -203,13 +199,7 @@ def kd_loss_fn(new: dict, old: dict, w: float = 1.0):
 
 
 def _batch_to_device(batch, device):
-    yN = {
-        "alpha": batch["yN"]["alpha"].to(device),
-        "omega": batch["yN"]["omega"].to(device),
-        "rho": batch["yN"]["rho"].to(device),
-        "sin_theta": batch["yN"]["sin_theta"].to(device),
-        "cos_theta": batch["yN"]["cos_theta"].to(device),
-    }
+    yN = {key: value.to(device) for key, value in batch["yN"].items()}
     return (
         batch["H"].to(device),
         batch["M"].to(device),
@@ -275,6 +265,10 @@ def main():
     cfg = Config()
     cfg.use_lora = True
 
+    in_norm = Normalizer.load(model_dir / "Normalizer_Input.pth")
+    out_norm = Normalizer.load(model_dir / "Normalizer_Output.pth")
+    cfg.residue_target = getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar"))
+
     student = MFDNN(cfg).to(device)
     teacher = MFDNN(cfg).to(device)
 
@@ -299,9 +293,6 @@ def main():
     for name in trainable_names:
         print(f"  - {name}")
 
-    in_norm = Normalizer.load(model_dir / "Normalizer_Input.pth")
-    out_norm = Normalizer.load(model_dir / "Normalizer_Output.pth")
-
     if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
         raise RuntimeError(f"Normalizer_Input.pth must be 2D [H, M], got mean={in_norm.mean}, std={in_norm.std}")
 
@@ -315,7 +306,11 @@ def main():
 
     mean_t = torch.as_tensor(out_norm.mean, dtype=torch.float32, device=device)
     std_t = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device)
-    crit = MaskedHungarianMSE(mean=mean_t, std=std_t)
+    crit = MaskedHungarianMSE(
+        mean=mean_t,
+        std=std_t,
+        residue_target=getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar")),
+    )
 
     opt = torch.optim.AdamW(
         build_adaptation_param_groups(

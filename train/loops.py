@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import os
 from itertools import cycle
 from pathlib import Path
@@ -11,7 +12,7 @@ import torch.nn as nn
 
 from surrogate_model.config import Config
 from surrogate_model.losses.masked_mse import MaskedHungarianMSE, MaskedMSE
-from surrogate_model.models.blocks import LoRALinear, MFDNN
+from surrogate_model.models.blocks import MFDNN
 from surrogate_model.train.dataloaders import build_dataloaders
 from surrogate_model.utils.dist_utils import dist_mean_scalar, is_main_process
 from surrogate_model.utils.pcgrad import (
@@ -143,28 +144,23 @@ def _load_stage1_low_from_fold0(model_core: nn.Module, ckpt_dir: Path) -> bool:
     return False
 
 
-def _is_low_train_layer(module: nn.Module) -> bool:
-    return isinstance(module, (nn.Linear, LoRALinear))
-
-
-def _set_stage2_low_tail_trainable(model_core: nn.Module, cfg: Config):
-    for p in model_core.low.parameters():
-        p.requires_grad_(False)
-
-    tail_layers = max(0, int(getattr(cfg, "stage2_unfreeze_low_tail_layers", 0)))
-    if tail_layers <= 0:
-        return []
-
-    low_mlp = getattr(model_core.low, "mlp", None)
-    if low_mlp is None:
-        return []
-
-    train_layers = [m for m in low_mlp if _is_low_train_layer(m)]
-    selected = train_layers[-tail_layers:]
-    for layer in selected:
-        for p in layer.parameters():
-            p.requires_grad_(True)
-    return selected
+def _write_train_log(path: Path, sim_hist, real_hist, total_hist, val_hist, lr_hist):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    max_len = max(len(sim_hist), len(real_hist), len(total_hist), len(val_hist), len(lr_hist), 0)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "loss_total", "loss_sim", "loss_real", "loss_val_real", "lr"])
+        for i in range(max_len):
+            writer.writerow(
+                [
+                    i + 1,
+                    total_hist[i] if i < len(total_hist) else "",
+                    sim_hist[i] if i < len(sim_hist) else "",
+                    real_hist[i] if i < len(real_hist) else "",
+                    val_hist[i] if i < len(val_hist) else "",
+                    lr_hist[i] if i < len(lr_hist) else "",
+                ]
+            )
 
 
 def _build_criteria(cfg: Config, mean_sim, std_sim, mean_real, std_real):
@@ -177,6 +173,7 @@ def _build_criteria(cfg: Config, mean_sim, std_sim, mean_real, std_real):
         w_cos_theta=1.0,
         presence_weight=cfg.presence_loss_weight,
         cardinality_weight=cfg.cardinality_loss_weight,
+        residue_target=getattr(cfg, "residue_target", "polar"),
     )
     return cls(mean=mean_sim, std=std_sim, **common), cls(mean=mean_real, std=std_real, **common)
 
@@ -211,7 +208,10 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             sampler.set_epoch(epoch)
 
     if sim_parsed or real_parsed:
-        cfg.embed_excitation_num = max(int(p.exc_id) for p in (sim_parsed + real_parsed)) + 1
+        cfg.embed_excitation_num = max(
+            int(getattr(cfg, "embed_excitation_num", 0)),
+            max(int(p.exc_id) for p in (sim_parsed + real_parsed)) + 1,
+        )
 
     model_core = MFDNN(cfg).to(device)
     for name, param in model_core.named_parameters():
@@ -371,38 +371,32 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     if is_main_process():
-        in_norm_deploy.save(out_dir.parent / "Normalizer_Input.pth")
-        out_norm_real.save(out_dir.parent / "Normalizer_Output.pth")
+        normalizer_dir = Path(getattr(args, "normalizer_dir", out_dir.parent))
+        normalizer_dir.mkdir(parents=True, exist_ok=True)
+        in_norm_deploy.save(normalizer_dir / "Normalizer_Input.pth")
+        out_norm_real.save(normalizer_dir / "Normalizer_Output.pth")
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
     crit_s1.pres_w = 0.0
     crit_s1.card_w = 0.0
 
-    freeze_low_stage2 = bool(getattr(cfg, "freeze_low_stage2", True))
-    low_tail_layers = _set_stage2_low_tail_trainable(model_core, cfg) if freeze_low_stage2 else []
-    if not freeze_low_stage2:
-        for p in model_core.low.parameters():
-            p.requires_grad_(True)
+    for p in model_core.low.parameters():
+        p.requires_grad_(True)
     for p in model_core.lin.parameters():
         p.requires_grad_(True)
     for p in model_core.adaptation.parameters():
         p.requires_grad_(True)
 
-    low_params = [p for p in model_core.low.parameters() if p.requires_grad]
-    high_params = [
-        p for p in list(model_core.lin.parameters()) + list(model_core.adaptation.parameters())
+    stage2_params = [
+        p for p in (
+            list(model_core.low.parameters())
+            + list(model_core.lin.parameters())
+            + list(model_core.adaptation.parameters())
+        )
         if p.requires_grad
     ]
-    param_groups = [{"params": high_params, "lr": cfg.lr_high_adam, "name": "high"}]
-    if low_params:
-        param_groups.append(
-            {
-                "params": low_params,
-                "lr": float(getattr(cfg, "lr_low_stage2", cfg.lr_high_adam * 0.1)),
-                "name": "low_tail" if freeze_low_stage2 else "low",
-            }
-        )
+    param_groups = [{"params": stage2_params, "lr": cfg.lr_high_adam, "name": "low_lin_adaptation"}]
     opt2 = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     if is_main_process():
         group_text = ", ".join(
@@ -410,7 +404,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             for group in param_groups
         )
         print(
-            f"[S2] freeze_low={freeze_low_stage2}; low_tail_layers={len(low_tail_layers)}; {group_text}",
+            f"[S2] low+lin+adaptation trainable; {group_text}",
             flush=True,
         )
 
@@ -437,8 +431,6 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
 
     for epoch in range(cfg.epochs_stage2):
         model.train()
-        if freeze_low_stage2 and not use_sim_grad_stage2:
-            model_core.low.eval()
         _maybe_set_epoch(real_dl, epoch)
         _maybe_set_epoch(sim_dl, epoch)
         if sim_iter is None:
@@ -624,7 +616,8 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
         model_core.load_state_dict(best_state_dict)
 
     if is_main_process():
-        save_path = out_dir / (out_dir.name + ".pth")
+        save_path = Path(getattr(args, "model_save_path", out_dir / (out_dir.name + ".pth")))
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "fold": fold,
@@ -646,6 +639,9 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             },
             save_path,
         )
+        train_log_path = getattr(args, "train_log_path", None)
+        if train_log_path:
+            _write_train_log(Path(train_log_path), sim_hist, real_hist, total_hist, val_hist, lr_hist_s2)
 
     if dist.is_available() and dist.is_initialized():
         dist.barrier()

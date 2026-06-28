@@ -939,6 +939,7 @@ def main():
 
     ckpt_path = model_dir / model_version / (model_version + ".pth")
     in_norm_path =  model_dir / "Normalizer_Input.pth"
+    out_norm_path = model_dir / "Normalizer_Output.pth"
     data_header_dir = _path_from_config(cp, paths_ini_path, "DataHeader")
     response_output_header = load_response_output_header(data_header_dir / "sc.dat")
 
@@ -982,6 +983,8 @@ def main():
     # ===== 加载模型 =====
     cfg = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_norm = Normalizer.load(out_norm_path)
+    cfg.residue_target = getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar"))
 
     print("==> Loading ckpt...")
     try:

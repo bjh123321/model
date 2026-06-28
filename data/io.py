@@ -33,6 +33,8 @@ class ParsedRow:
     rho:  np.ndarray
     sin_theta:  np.ndarray
     cos_theta: np.ndarray
+    residue_re: np.ndarray
+    residue_im: np.ndarray
     mask:  np.ndarray
 
 def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
@@ -75,6 +77,8 @@ def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
         rho  = np.zeros((K_max,), dtype=np.float32)
         sin_theta = np.zeros((K_max,), dtype=np.float32)
         cos_theta = np.zeros((K_max,), dtype=np.float32)
+        residue_re = np.zeros((K_max,), dtype=np.float32)
+        residue_im = np.zeros((K_max,), dtype=np.float32)
         mask  = np.zeros((K_max,), dtype=np.float32)
 
         for k in range(K):
@@ -90,9 +94,11 @@ def parse_rows_to_struct(rows: List[List[float]]) -> List[ParsedRow]:
             rho[k] = np.log(rh)
             sin_theta[k] = np.sin(th)
             cos_theta[k] = np.cos(th)
+            residue_re[k] = rh * np.cos(th)
+            residue_im[k] = rh * np.sin(th)
             mask[k]  = 1.0
 
-        parsed.append(ParsedRow(H, M, exc_id, ch_id, K, alpha, omega, rho, sin_theta, cos_theta, mask))
+        parsed.append(ParsedRow(H, M, exc_id, ch_id, K, alpha, omega, rho, sin_theta, cos_theta, residue_re, residue_im, mask))
     stats = {
         "K_max": K_max,
         "channel_num": channel_num,

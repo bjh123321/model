@@ -141,9 +141,8 @@ def main():
     parser.add_argument("--batch_real", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch", type=int, default=4)
-    parser.add_argument("--stage2_unfreeze_low_tail_layers", type=int, default=2)
-    parser.add_argument("--lr_low_stage2", type=float, default=5e-5)
-    parser.add_argument("--freeze_low_stage2", type=int, default=1, choices=[0, 1])
+    parser.add_argument("--residue_target", type=str, default="polar", choices=["polar", "cartesian"])
+    parser.add_argument("--val_split_strategy", type=str, default=None, choices=["height_max_mach", "height_mach_kfold", ""])
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     args, _unknown = parser.parse_known_args()
 
@@ -165,14 +164,14 @@ def main():
     cfg.batch_real = args.batch_real
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
-    cfg.stage2_unfreeze_low_tail_layers = args.stage2_unfreeze_low_tail_layers
-    cfg.lr_low_stage2 = args.lr_low_stage2
-    cfg.freeze_low_stage2 = bool(args.freeze_low_stage2)
+    cfg.residue_target = args.residue_target
+    if args.val_split_strategy is not None:
+        cfg.val_split_strategy = args.val_split_strategy
     cfg.K_max = max(sim_stats["K_max"], real_stats["K_max"])
     cfg.embed_channel_num = max(sim_stats["channel_num"], real_stats["channel_num"])
     cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
 
-    num_folds = args.kfold if bool(args.stage2_kfold) else 1
+    num_folds = args.kfold if (bool(args.stage2_kfold) or cfg.val_split_strategy == "height_mach_kfold") else 1
     setattr(args, "stage1_once", 1)
 
     for fold in range(num_folds):

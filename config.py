@@ -29,9 +29,18 @@ class Config:
     # Train/Val split
     # - False: 使用全部数据训练（不划分验证集），early-stop / LR-scheduler 依据训练损失（保持原逻辑）
     # - True : 划分训练集与验证集，每个 epoch 计算验证集损失，并以其进行 early-stop / LR-scheduler
-    use_val_split: bool = False
+    use_val_split: bool = True
     val_ratio: float = 0.2
     val_seed: int = 42
+    val_split_strategy: str = "height_max_mach"
+    val_height_tol: float = 1e-6
+    val_mach_tol: float = 1e-6
+    val_heights: List[float] = field(default_factory=lambda: [3.0, 8.23])
+
+    # Residue target:
+    # - polar: rho, sin(theta), cos(theta)
+    # - cartesian: Re, Im, converted from rho/theta in the existing data rows
+    residue_target: str = "polar"
 
     epochs_stage1: int = 3000
     epochs_stage2: int = 3000

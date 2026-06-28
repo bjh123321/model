@@ -313,17 +313,26 @@ class AdaptationHead(nn.Module):
 
 
 class ParamPZK(nn.Module):
-    def __init__(self):
+    def __init__(self, cfg=None):
         super().__init__()
+        self.cfg = cfg
     def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, u_pres):
         alpha = -F.softplus(u_alpha)
         omega = torch.sigmoid(u_omega)
+        p_exist = torch.sigmoid(u_pres)
+        if str(getattr(self.cfg, "residue_target", "polar")).lower() == "cartesian":
+            residue_re = u_rho
+            residue_im = u_sin_theta
+            mag = torch.sqrt(residue_re.pow(2) + residue_im.pow(2) + 1e-12)
+            rho = torch.log(mag.clamp_min(1e-12))
+            sin_theta = residue_im / mag
+            cos_theta = residue_re / mag
+            return alpha, omega, rho, sin_theta, cos_theta, p_exist, residue_re, residue_im
         rho  =  u_rho
         norm = torch.sqrt(u_sin_theta.pow(2) + u_cos_theta.pow(2) + 1e-8)  # 防止除0
         sin_theta = u_sin_theta / norm
         cos_theta = u_cos_theta / norm
-        p_exist = torch.sigmoid(u_pres)
-        return alpha, omega, rho, sin_theta, cos_theta, p_exist
+        return alpha, omega, rho, sin_theta, cos_theta, p_exist, None, None
 
 
 class MFDNN(nn.Module):
@@ -333,7 +342,7 @@ class MFDNN(nn.Module):
         self.low  = LowFidelityHead(cfg)
         self.lin  = LinearHFHead(cfg.K_max)
         self.adaptation = AdaptationHead(cfg)
-        self.param = ParamPZK()
+        self.param = ParamPZK(cfg)
         nout = 6
         self.register_buffer('online_gain', torch.ones(1, cfg.K_max, nout))
         self.register_buffer('online_bias', torch.zeros(1, cfg.K_max, nout))
@@ -343,13 +352,15 @@ class MFDNN(nn.Module):
 
     def forward_low(self, H, M, exc_id, ch_id):
         outL = self.low(H, M, exc_id, ch_id)
-        alpha, omega, rho, sin_theta, cos_theta, p_exist = self.param.to_physical(
+        alpha, omega, rho, sin_theta, cos_theta, p_exist, residue_re, residue_im = self.param.to_physical(
             outL['u_alpha'], outL['u_omega'], outL['u_rho'], outL['u_sin_theta'], outL['u_cos_theta'], outL['u_pres']
         )
         out = {
             **outL,
             'alpha':alpha,'omega':omega,'rho':rho,'sin_theta':sin_theta,'cos_theta':cos_theta, 'p_exist':p_exist
         }
+        if residue_re is not None and residue_im is not None:
+            out.update({'residue_re': residue_re, 'residue_im': residue_im})
 
         return out
 
@@ -376,16 +387,19 @@ class MFDNN(nn.Module):
             U = self.online_gain * U + self.online_bias
         
         # 物理域映射
-        alpha, omega, rho, sin_theta, cos_theta, p_exist = self.param.to_physical(
+        alpha, omega, rho, sin_theta, cos_theta, p_exist, residue_re, residue_im = self.param.to_physical(
             U[...,0], U[...,1], U[...,2], U[...,3], U[...,4], U[...,5]
         )
         
-        return {
+        out = {
             'alpha': alpha, 'omega': omega, 'rho': rho, 
             'sin_theta': sin_theta, 'cos_theta': cos_theta, 'p_exist': p_exist,
             'u_alpha': U[...,0], 'u_omega': U[...,1], 'u_rho': U[...,2], 
             'u_sin_theta': U[...,3], 'u_cos_theta': U[...,4], 'u_pres': U[...,5]
         }
+        if residue_re is not None and residue_im is not None:
+            out.update({'residue_re': residue_re, 'residue_im': residue_im})
+        return out
 
     # 顶层 forward：给出低保真 + 高保真输出
     def forward(self, H, M, exc_id, ch_id):

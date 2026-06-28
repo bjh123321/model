@@ -34,32 +34,62 @@ class MaskedMSE(nn.Module):
         w_cos_theta: float = 1.0,
         presence_weight: float = 0.0,
         cardinality_weight: float = 0.0,
+        residue_target: str = "polar",
     ):
         super().__init__()
-        self.register_buffer("mean", mean.view(3))
-        self.register_buffer("std", std.view(3))
+        mean = mean.flatten()
+        std = std.flatten()
+        if mean.numel() < 2 or std.numel() < 2:
+            raise ValueError("mean/std must contain at least alpha and omega statistics")
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
         self.w_alpha = w_alpha
         self.w_omega = w_omega
         self.w_rho = w_rho
         self.w_sin_theta = w_sin_theta
         self.w_cos_theta = w_cos_theta
+        self.residue_target = str(residue_target).lower()
         self.pres_w = presence_weight
         self.card_w = cardinality_weight
         self.last_reg_stats = None
         self.last_cls_stats = None
 
     def norm_pred(self, pred: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        p = torch.stack([pred["alpha"], pred["omega"], pred["rho"]], dim=1)
-        mean = self.mean.view(3, 1)
-        std = self.std.view(3, 1).clamp_min(1e-8)
+        p = torch.stack([pred["alpha"], pred["omega"]], dim=1)
+        mean = self.mean[:2].view(2, 1)
+        std = self.std[:2].view(2, 1).clamp_min(1e-8)
         pn = (p - mean) / std
         return {
             "alpha": pn[:, 0, :],
             "omega": pn[:, 1, :],
-            "rho": pn[:, 2, :],
-            "sin_theta": pred["sin_theta"],
-            "cos_theta": pred["cos_theta"],
         }
+
+    def _residue_names(self):
+        if self.residue_target == "cartesian":
+            return ["residue_re", "residue_im"]
+        return ["rho", "sin_theta", "cos_theta"]
+
+    def _residue_weights(self):
+        if self.residue_target == "cartesian":
+            return [self.w_rho, self.w_sin_theta]
+        return [self.w_rho, self.w_sin_theta, self.w_cos_theta]
+
+    def _normalized_pred_dict(self, pred, tgt):
+        pred_n = self.norm_pred(pred)
+        res_mean = tgt.get("residue_mean")
+        res_std = tgt.get("residue_std")
+        names = self._residue_names()
+        if res_mean is None or res_std is None:
+            fallback_mean = self.mean[2:2 + len(names)].view(1, len(names), 1)
+            fallback_std = self.std[2:2 + len(names)].view(1, len(names), 1).clamp_min(1e-8)
+            res_mean = fallback_mean.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
+            res_std = fallback_std.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
+        else:
+            res_mean = res_mean.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
+            res_std = res_std.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype).clamp_min(1e-8)
+        for i, name in enumerate(names):
+            pred_n[name] = (pred[name] - res_mean[:, i, :]) / res_std[:, i, :]
+        return pred_n
 
     def _presence_losses(self, pred, mask, assign_rows=None):
         if self.pres_w <= 0 and self.card_w <= 0:
@@ -105,7 +135,9 @@ class MaskedMSE(nn.Module):
             self.last_cls_stats = {"bce": float(bce.detach()), "card": float(card.detach())}
         return loss_cls
 
-    def _sort_by_omega(self, alpha, omega, rho, sin_theta, cos_theta, mask):
+    def _sort_by_omega(self, values: dict, mask):
+        alpha = values["alpha"]
+        omega = values["omega"]
         freq = torch.sqrt(alpha**2 + omega**2) / (2 * math.pi)
         if mask.shape[1] != freq.shape[1]:
             bsz, k_pred = freq.shape
@@ -121,50 +153,26 @@ class MaskedMSE(nn.Module):
         def reorder(t):
             return torch.gather(t, 1, idx)
 
-        return reorder(alpha), reorder(omega), reorder(rho), reorder(sin_theta), reorder(cos_theta), reorder(mask)
+        out = {name: reorder(tensor) for name, tensor in values.items()}
+        return out, reorder(mask)
 
     def forward(self, pred, tgt, mask):
-        pred_n = self.norm_pred(pred)
-        a_p, w_p, r_p, s_p, c_p, _ = self._sort_by_omega(
-            pred_n["alpha"],
-            pred_n["omega"],
-            pred_n["rho"],
-            pred_n["sin_theta"],
-            pred_n["cos_theta"],
-            mask,
-        )
-        a_t, w_t, r_t, s_t, c_t, m_t = self._sort_by_omega(
-            tgt["alpha"],
-            tgt["omega"],
-            tgt["rho"],
-            tgt["sin_theta"],
-            tgt["cos_theta"],
-            mask,
-        )
+        names = ["alpha", "omega", *self._residue_names()]
+        weights = [self.w_alpha, self.w_omega, *self._residue_weights()]
+        pred_n = self._normalized_pred_dict(pred, tgt)
+        pred_s, _ = self._sort_by_omega({name: pred_n[name] for name in names}, mask)
+        tgt_s, m_t = self._sort_by_omega({name: tgt[name] for name in names}, mask)
         w = m_t
         num = w.sum().clamp_min(1.0)
-        l_alpha = (a_p - a_t).pow(2)
-        l_omega = (w_p - w_t).pow(2)
-        l_rho = (r_p - r_t).pow(2)
-        l_sin_theta = (s_p - s_t).pow(2)
-        l_cos_theta = (c_p - c_t).pow(2)
-        loss_reg = (
-            self.w_alpha * (w * l_alpha).sum()
-            + self.w_omega * (w * l_omega).sum()
-            + self.w_rho * (w * l_rho).sum()
-            + self.w_sin_theta * (w * l_sin_theta).sum()
-            + self.w_cos_theta * (w * l_cos_theta).sum()
-        ) / num
+        losses = {name: (pred_s[name] - tgt_s[name]).pow(2) for name in names}
+        loss_reg = sum(weight * (w * losses[name]).sum() for name, weight in zip(names, weights)) / num
         loss_cls = self._presence_losses(pred, mask)
 
         with torch.no_grad():
             denom = float(num.detach().cpu().item())
             self.last_reg_stats = {
-                "alpha": float((w * l_alpha).sum().detach().cpu().item() / denom),
-                "omega": float((w * l_omega).sum().detach().cpu().item() / denom),
-                "rho": float((w * l_rho).sum().detach().cpu().item() / denom),
-                "sin_theta": float((w * l_sin_theta).sum().detach().cpu().item() / denom),
-                "cos_theta": float((w * l_cos_theta).sum().detach().cpu().item() / denom),
+                name: float((w * losses[name]).sum().detach().cpu().item() / denom)
+                for name in names
             }
 
         return loss_reg + loss_cls
@@ -182,6 +190,7 @@ class MaskedHungarianMSE(MaskedMSE):
         w_cos_theta: float = 1.0,
         presence_weight: float = 0.0,
         cardinality_weight: float = 0.0,
+        residue_target: str = "polar",
     ):
         super().__init__(
             mean,
@@ -193,31 +202,25 @@ class MaskedHungarianMSE(MaskedMSE):
             w_cos_theta=w_cos_theta,
             presence_weight=presence_weight,
             cardinality_weight=cardinality_weight,
+            residue_target=residue_target,
         )
 
     def forward(self, pred, tgt, mask):
         device = mask.device
-        pred_n = self.norm_pred(pred)
-        pa, po, pr = pred_n["alpha"], pred_n["omega"], pred_n["rho"]
-        ps, pc = pred_n["sin_theta"], pred_n["cos_theta"]
+        names = ["alpha", "omega", *self._residue_names()]
+        weights = [self.w_alpha, self.w_omega, *self._residue_weights()]
+        pred_n = self._normalized_pred_dict(pred, tgt)
+        pred_vals = [pred_n[name] for name in names]
+        tgt_vals = [tgt[name] for name in names]
+        pa = pred_n["alpha"]
         bsz = pa.size(0)
         k_pred = pa.size(1)
         k_tgt = mask.size(1)
 
-        tgt_stack = torch.stack(
-            [tgt["alpha"], tgt["omega"], tgt["rho"], tgt["sin_theta"], tgt["cos_theta"]],
-            dim=1,
-        )
-        ta, to, tr, ts, tc = tgt_stack[:, 0, :], tgt_stack[:, 1, :], tgt_stack[:, 2, :], tgt_stack[:, 3, :], tgt_stack[:, 4, :]
-
         with torch.no_grad():
-            cost = (
-                self.w_alpha * (pa.unsqueeze(2) - ta.unsqueeze(1)).pow(2)
-                + self.w_omega * (po.unsqueeze(2) - to.unsqueeze(1)).pow(2)
-                + self.w_rho * (pr.unsqueeze(2) - tr.unsqueeze(1)).pow(2)
-                + self.w_sin_theta * (ps.unsqueeze(2) - ts.unsqueeze(1)).pow(2)
-                + self.w_cos_theta * (pc.unsqueeze(2) - tc.unsqueeze(1)).pow(2)
-            )
+            cost = pa.new_zeros((bsz, k_pred, k_tgt))
+            for weight, p_val, t_val in zip(weights, pred_vals, tgt_vals):
+                cost = cost + weight * (p_val.unsqueeze(2) - t_val.unsqueeze(1)).pow(2)
             cost = cost.masked_fill((mask <= 0.5).unsqueeze(1), 1e6)
             cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
 
@@ -261,18 +264,18 @@ class MaskedHungarianMSE(MaskedMSE):
         if pair_cnt > 0:
             safe_rows = row_index.clamp_min(0)
             safe_cols = col_index.clamp_min(0)
-            da = torch.gather(pa, 1, safe_rows) - torch.gather(ta, 1, safe_cols)
-            do = torch.gather(po, 1, safe_rows) - torch.gather(to, 1, safe_cols)
-            dr = torch.gather(pr, 1, safe_rows) - torch.gather(tr, 1, safe_cols)
-            ds = torch.gather(ps, 1, safe_rows) - torch.gather(ts, 1, safe_cols)
-            dc = torch.gather(pc, 1, safe_rows) - torch.gather(tc, 1, safe_cols)
+            diffs = [
+                torch.gather(p_val, 1, safe_rows) - torch.gather(t_val, 1, safe_cols)
+                for p_val, t_val in zip(pred_vals, tgt_vals)
+            ]
 
             valid_f = valid_pair_mask.to(dtype=pa.dtype)
             per_sample_cnt = valid_f.sum(dim=1).clamp_min(1.0)
-            per_sample_loss = ((da.pow(2) + do.pow(2) + dr.pow(2) + ds.pow(2) + dc.pow(2)) * valid_f).sum(dim=1) / per_sample_cnt
+            per_pair = sum(weight * diff.pow(2) for weight, diff in zip(weights, diffs))
+            per_sample_loss = (per_pair * valid_f).sum(dim=1) / per_sample_cnt
             loss_reg = per_sample_loss[valid_pair_mask.any(dim=1)].mean()
         else:
-            da = do = dr = ds = dc = pa.new_zeros((bsz, k_tgt))
+            diffs = [pa.new_zeros((bsz, k_tgt)) for _ in names]
             valid_f = pa.new_zeros((bsz, k_tgt))
             loss_reg = pa.new_tensor(0.0, requires_grad=True)
 
@@ -281,19 +284,10 @@ class MaskedHungarianMSE(MaskedMSE):
             if pair_cnt > 0:
                 denom = float(pair_cnt)
                 self.last_reg_stats = {
-                    "alpha": float((da.pow(2) * valid_f).sum().detach().cpu().item() / denom),
-                    "omega": float((do.pow(2) * valid_f).sum().detach().cpu().item() / denom),
-                    "rho": float((dr.pow(2) * valid_f).sum().detach().cpu().item() / denom),
-                    "sin_theta": float((ds.pow(2) * valid_f).sum().detach().cpu().item() / denom),
-                    "cos_theta": float((dc.pow(2) * valid_f).sum().detach().cpu().item() / denom),
+                    name: float((diff.pow(2) * valid_f).sum().detach().cpu().item() / denom)
+                    for name, diff in zip(names, diffs)
                 }
             else:
-                self.last_reg_stats = {
-                    "alpha": 0.0,
-                    "omega": 0.0,
-                    "rho": 0.0,
-                    "sin_theta": 0.0,
-                    "cos_theta": 0.0,
-                }
+                self.last_reg_stats = {name: 0.0 for name in names}
 
         return loss_reg + loss_cls

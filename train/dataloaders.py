@@ -55,13 +55,54 @@ def _split_real_by_height_max_mach(real_parsed: List[ParsedRow], cfg: Config):
     return real_train, real_val, split_info
 
 
+def _hm_key(p: ParsedRow, h_tol: float, m_tol: float):
+    h = round(float(p.H) / h_tol) if h_tol > 0 else float(p.H)
+    m = round(float(p.M) / m_tol) if m_tol > 0 else float(p.M)
+    return h, m
+
+
+def _split_by_height_mach_groups(parsed: List[ParsedRow], cfg: Config, kfold: int, fold_idx: int, tag: str):
+    if len(parsed) <= 1:
+        return parsed, [], []
+    h_tol = float(getattr(cfg, "val_height_tol", 1e-6))
+    m_tol = float(getattr(cfg, "val_mach_tol", 1e-6))
+    groups: dict[tuple, list[int]] = {}
+    for i, p in enumerate(parsed):
+        groups.setdefault(_hm_key(p, h_tol, m_tol), []).append(i)
+    keys = sorted(groups.keys())
+    if len(keys) <= 1:
+        return parsed, [], []
+
+    seed = int(getattr(cfg, "val_seed", 42))
+    if kfold and kfold > 1:
+        if kfold > len(keys):
+            raise RuntimeError(f"{tag}: kfold={kfold} is larger than height-Mach groups={len(keys)}")
+        splits = list(KFold(n_splits=kfold, shuffle=True, random_state=seed).split(keys))
+        _, val_group_idx = splits[fold_idx % kfold]
+        val_keys = {keys[i] for i in val_group_idx}
+    else:
+        rng = np.random.default_rng(seed)
+        idx = np.arange(len(keys))
+        rng.shuffle(idx)
+        n_val = max(1, int(round(len(keys) * float(getattr(cfg, "val_ratio", 0.2)))))
+        val_keys = {keys[i] for i in idx[:n_val]}
+
+    val_indices = {idx for key in val_keys for idx in groups[key]}
+    train = [p for i, p in enumerate(parsed) if i not in val_indices]
+    val = [p for i, p in enumerate(parsed) if i in val_indices]
+    if not train or not val:
+        raise RuntimeError(f"{tag}: height_mach_kfold split produced empty train or val set")
+    return train, val, [(key, len(groups[key])) for key in sorted(val_keys)]
+
+
 def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow], cfg: Config,
                       kfold: int, fold_idx: int, device: torch.device, out_dir: Path):
     in_norm_sim = compute_input_normalizer_sim(sim_parsed)
     if is_main_process():
         in_norm_sim.save(out_dir / 'Normalizer_Input_Sim.pth')
 
-    out_norm_sim = compute_output_normalizer_masked(sim_parsed)
+    residue_target = str(getattr(cfg, "residue_target", "polar")).lower()
+    out_norm_sim = compute_output_normalizer_masked(sim_parsed, residue_target=residue_target)
     if is_main_process():
         out_norm_sim.save(out_dir / 'Normalizer_Output_Sim.pth')
 
@@ -73,9 +114,18 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     seed = int(getattr(cfg, "val_seed", 42))
     val_strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
     use_height_max_mach_val = use_val_split and val_strategy == "height_max_mach"
+    use_height_mach_kfold = use_val_split and val_strategy == "height_mach_kfold"
 
     # --- Sim split (给 Stage-1 用) ---
-    if (not use_height_max_mach_val) and use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
+    if use_height_mach_kfold:
+        sim_train, sim_val, sim_info = _split_by_height_mach_groups(sim_parsed, cfg, kfold, fold_idx, "sim")
+        if is_main_process():
+            print(
+                f"[VAL] sim height_mach_kfold: val_groups={len(sim_info)}, "
+                f"train_rows={len(sim_train)}, val_rows={len(sim_val)}",
+                flush=True,
+            )
+    elif (not use_height_max_mach_val) and use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
         rng = np.random.default_rng(seed)
         idx = np.arange(len(sim_parsed))
         rng.shuffle(idx)
@@ -90,7 +140,15 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
 
     # --- Real split (给 Stage-2 & final validation 用) ---
     if use_val_split:
-        if use_height_max_mach_val:
+        if use_height_mach_kfold:
+            real_train, real_val, real_info = _split_by_height_mach_groups(real_parsed, cfg, kfold, fold_idx, "real")
+            if is_main_process():
+                print(
+                    f"[VAL] real height_mach_kfold: val_groups={len(real_info)}, "
+                    f"train_rows={len(real_train)}, val_rows={len(real_val)}",
+                    flush=True,
+                )
+        elif use_height_max_mach_val:
             real_train, real_val, split_info = _split_real_by_height_max_mach(real_parsed, cfg)
             if is_main_process():
                 detail = ", ".join(
@@ -125,7 +183,7 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         real_train = real_parsed
         real_val   = []
 
-    out_norm_real = compute_output_normalizer_masked(real_train)
+    out_norm_real = compute_output_normalizer_masked(real_train, residue_target=residue_target)
     if is_main_process():
         out_norm_real.save(out_dir / f'Normalizer_Output_Real_Fold{fold_idx}.pth')
 
