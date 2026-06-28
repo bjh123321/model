@@ -14,6 +14,19 @@ from scipy.optimize import linear_sum_assignment
 _PERM_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 
 
+def _match_width(t: torch.Tensor, width: int) -> torch.Tensor:
+    width = int(width)
+    cur = int(t.size(-1))
+    if cur == width:
+        return t
+    if cur > width:
+        return t[..., :width]
+    pad_shape = list(t.shape)
+    pad_shape[-1] = width - cur
+    pad = t.new_zeros(pad_shape)
+    return torch.cat([t, pad], dim=-1)
+
+
 def _assignment_perms(k_pred: int, k_tgt: int, device: torch.device) -> torch.Tensor:
     key = (int(k_pred), int(k_tgt))
     if key not in _PERM_CACHE:
@@ -87,6 +100,9 @@ class MaskedMSE(nn.Module):
         else:
             res_mean = res_mean.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
             res_std = res_std.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype).clamp_min(1e-8)
+        pred_width = pred_n["alpha"].size(1)
+        res_mean = _match_width(res_mean, pred_width)
+        res_std = _match_width(res_std, pred_width).clamp_min(1e-8)
         for i, name in enumerate(names):
             pred_n[name] = (pred[name] - res_mean[:, i, :]) / res_std[:, i, :]
         return pred_n
@@ -211,11 +227,13 @@ class MaskedHungarianMSE(MaskedMSE):
         weights = [self.w_alpha, self.w_omega, *self._residue_weights()]
         pred_n = self._normalized_pred_dict(pred, tgt)
         pred_vals = [pred_n[name] for name in names]
-        tgt_vals = [tgt[name] for name in names]
+        tgt_width = tgt[names[0]].size(1)
+        tgt_vals = [_match_width(tgt[name], tgt_width) for name in names]
+        mask = _match_width(mask, tgt_width)
         pa = pred_n["alpha"]
         bsz = pa.size(0)
         k_pred = pa.size(1)
-        k_tgt = mask.size(1)
+        k_tgt = tgt_width
 
         with torch.no_grad():
             cost = pa.new_zeros((bsz, k_pred, k_tgt))

@@ -64,7 +64,7 @@ class ModalDataset(Dataset):
         exc_id = torch.tensor(p.exc_id, dtype=torch.long)
         ch_id  = torch.tensor(p.ch_id, dtype=torch.long)
         lab_norm, res_mean, res_std = build_label_tensor(p, self.K_max, self.out_norm)
-        mask = torch.from_numpy(p.mask.copy())
+        mask = _fixed_len_tensor(p.mask, self.K_max)
         return Hn, Mn, exc_id, ch_id, mask, lab_norm, res_mean, res_std
 
 def collate_modal(batch):

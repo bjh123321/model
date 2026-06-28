@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from surrogate_model.config import Config
 from surrogate_model.data.OE_BATCH_PROCESS import batch_process
 from surrogate_model.data.build_replay_data import build_replay_data
-from surrogate_model.data.datasets import build_label_tensor
+from surrogate_model.data.datasets import _fixed_len_tensor, build_label_tensor
 from surrogate_model.data.io import parse_rows_to_struct
 from surrogate_model.data.normalizer import Normalizer
 from surrogate_model.losses.masked_mse import MaskedHungarianMSE
@@ -64,13 +64,18 @@ class RealIncrementalDataset(Dataset):
         H = ((H - float(in_norm.mean[0])) / max(float(in_norm.std[0]), 1e-12)).unsqueeze(-1)
         M = ((M - float(in_norm.mean[1])) / max(float(in_norm.std[1]), 1e-12)).unsqueeze(-1)
 
+        K_max = (
+            int(out_norm.residue_mean.shape[2])
+            if getattr(out_norm, "residue_mean", None) is not None
+            else max(len(p.mask) for p in parsed)
+        )
         label_list, res_mean_list, res_std_list, mask_list = [], [], [], []
         for p in parsed:
-            y_norm, res_mean, res_std = build_label_tensor(p, len(p.mask), out_norm)
+            y_norm, res_mean, res_std = build_label_tensor(p, K_max, out_norm)
             label_list.append(y_norm.float())
             res_mean_list.append(res_mean.float())
             res_std_list.append(res_std.float())
-            mask_list.append(torch.from_numpy(p.mask.copy()).float())
+            mask_list.append(_fixed_len_tensor(p.mask, K_max))
 
         mask = torch.stack(mask_list, dim=0)
         yN = torch.stack(label_list, dim=0)
