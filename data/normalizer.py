@@ -10,10 +10,6 @@ class Normalizer:
     mean: np.ndarray
     std: np.ndarray
     residue_target: str = "polar"
-    residue_mean: np.ndarray | None = None
-    residue_std: np.ndarray | None = None
-    residue_global_mean: np.ndarray | None = None
-    residue_global_std: np.ndarray | None = None
     def save(self, path):
         import torch as _torch
         d = {
@@ -22,14 +18,6 @@ class Normalizer:
             'std':  self.std.astype(np.float32).tolist(),
             'residue_target': self.residue_target,
         }
-        if self.residue_mean is not None:
-            d['residue_mean'] = self.residue_mean.astype(np.float32).tolist()
-        if self.residue_std is not None:
-            d['residue_std'] = self.residue_std.astype(np.float32).tolist()
-        if self.residue_global_mean is not None:
-            d['residue_global_mean'] = self.residue_global_mean.astype(np.float32).tolist()
-        if self.residue_global_std is not None:
-            d['residue_global_std'] = self.residue_global_std.astype(np.float32).tolist()
         _torch.save(d, path)
     @staticmethod
     def load(path) -> 'Normalizer':
@@ -56,22 +44,10 @@ class Normalizer:
         elif not isinstance(std, _np.ndarray):
             std = _np.asarray(std, dtype=_np.float32)
 
-        def _arr_or_none(name):
-            value = d.get(name)
-            if value is None:
-                return None
-            if isinstance(value, _torch.Tensor):
-                return value.detach().cpu().numpy().astype(_np.float32)
-            return _np.asarray(value, dtype=_np.float32)
-
         return Normalizer(
             mean=mean,
             std=std,
             residue_target=str(residue_target),
-            residue_mean=_arr_or_none('residue_mean'),
-            residue_std=_arr_or_none('residue_std'),
-            residue_global_mean=_arr_or_none('residue_global_mean'),
-            residue_global_std=_arr_or_none('residue_global_std'),
         )
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         m = torch.as_tensor(self.mean, dtype=x.dtype, device=x.device)
@@ -86,35 +62,6 @@ class Normalizer:
         if target == "cartesian":
             return ["residue_re", "residue_im"]
         return ["rho", "sin_theta", "cos_theta"]
-    def residue_stats_for_row(self, p: ParsedRow, K_max: int) -> tuple[np.ndarray, np.ndarray]:
-        names = self.residue_names()
-        r_count = len(names)
-        mean = np.zeros((r_count, K_max), dtype=np.float32)
-        std = np.ones((r_count, K_max), dtype=np.float32)
-        if self.residue_mean is None or self.residue_std is None:
-            g_mean = self.residue_global_mean
-            g_std = self.residue_global_std
-            if g_mean is None:
-                g_mean = np.asarray(self.mean[2:2 + r_count], dtype=np.float32)
-            if g_std is None:
-                g_std = np.asarray(self.std[2:2 + r_count], dtype=np.float32)
-            mean[:] = np.asarray(g_mean, dtype=np.float32).reshape(r_count, 1)
-            std[:] = np.asarray(g_std, dtype=np.float32).reshape(r_count, 1)
-            return mean, np.maximum(std, 1e-8)
-
-        e = int(p.exc_id)
-        c = int(p.ch_id)
-        max_e, max_c, max_k, _ = self.residue_mean.shape
-        g_mean = np.asarray(self.residue_global_mean, dtype=np.float32).reshape(r_count)
-        g_std = np.asarray(self.residue_global_std, dtype=np.float32).reshape(r_count)
-        for k in range(K_max):
-            if 0 <= e < max_e and 0 <= c < max_c and 0 <= k < max_k:
-                mean[:, k] = self.residue_mean[e, c, k, :]
-                std[:, k] = self.residue_std[e, c, k, :]
-            else:
-                mean[:, k] = g_mean
-                std[:, k] = g_std
-        return mean, np.maximum(std, 1e-8)
 
 def compute_input_normalizer_sim(sim_parsed: List[ParsedRow]) -> Normalizer:
     HM = np.array([[p.H, p.M] for p in sim_parsed], dtype=np.float64)
@@ -148,47 +95,12 @@ def compute_output_normalizer_masked(parsed: List[ParsedRow], residue_target: st
     al_arr = np.concatenate(al)
     om_arr = np.concatenate(om)
     residue_mat = np.concatenate(residue_all, axis=0)
-    residue_global_mean = residue_mat.mean(axis=0)
-    residue_global_std = np.maximum(residue_mat.std(axis=0), 1e-8)
-    mean = np.concatenate([[al_arr.mean(), om_arr.mean()], residue_global_mean], axis=0)
-    std = np.concatenate([[al_arr.std(), om_arr.std()], residue_global_std], axis=0)
+    residue_param_mean = residue_mat.mean(axis=0)
+    residue_param_std = np.maximum(residue_mat.std(axis=0), 1e-8)
+    mean = np.concatenate([[al_arr.mean(), om_arr.mean()], residue_param_mean], axis=0)
+    std = np.concatenate([[al_arr.std(), om_arr.std()], residue_param_std], axis=0)
     std = np.maximum(std, 1e-8)
-
-    e_num = max(int(p.exc_id) for p in parsed) + 1
-    c_num = max(int(p.ch_id) for p in parsed) + 1
-    k_num = max(len(p.mask) for p in parsed)
-    r_count = residue_mat.shape[1]
-    sums = np.zeros((e_num, c_num, k_num, r_count), dtype=np.float64)
-    sums2 = np.zeros_like(sums)
-    counts = np.zeros((e_num, c_num, k_num, r_count), dtype=np.float64)
-
-    for p in parsed:
-        values = _residue_values(p, residue_target)
-        for k in range(int(p.K_valid)):
-            e = int(p.exc_id)
-            c = int(p.ch_id)
-            v = values[k]
-            sums[e, c, k, :] += v
-            sums2[e, c, k, :] += v * v
-            counts[e, c, k, :] += 1.0
-
-    group_mean = np.broadcast_to(residue_global_mean.reshape(1, 1, 1, r_count), sums.shape).copy()
-    group_std = np.broadcast_to(residue_global_std.reshape(1, 1, 1, r_count), sums.shape).copy()
-    valid = counts > 0
-    group_mean[valid] = sums[valid] / counts[valid]
-    var = np.zeros_like(sums)
-    var[valid] = sums2[valid] / counts[valid] - group_mean[valid] ** 2
-    group_std[valid] = np.sqrt(np.maximum(var[valid], 1e-12))
-
-    return Normalizer(
-        mean=mean,
-        std=std,
-        residue_target=residue_target,
-        residue_mean=group_mean,
-        residue_std=group_std,
-        residue_global_mean=residue_global_mean,
-        residue_global_std=residue_global_std,
-    )
+    return Normalizer(mean=mean, std=std, residue_target=residue_target)
 
 if __name__ == '__main__':
     # 简单测试

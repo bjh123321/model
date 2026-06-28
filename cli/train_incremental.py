@@ -37,7 +37,7 @@ def _path_from_ini(cp: configparser.ConfigParser, paths_ini_path: Path, section:
 
 
 class RealIncrementalDataset(Dataset):
-    def __init__(self, txt_path: Path, in_norm: Normalizer, out_norm: Normalizer):
+    def __init__(self, txt_path: Path, in_norm: Normalizer, out_norm: Normalizer, K_max: int | None = None):
         super().__init__()
         self.txt_path = Path(txt_path)
 
@@ -64,31 +64,21 @@ class RealIncrementalDataset(Dataset):
         H = ((H - float(in_norm.mean[0])) / max(float(in_norm.std[0]), 1e-12)).unsqueeze(-1)
         M = ((M - float(in_norm.mean[1])) / max(float(in_norm.std[1]), 1e-12)).unsqueeze(-1)
 
-        K_max = (
-            int(out_norm.residue_mean.shape[2])
-            if getattr(out_norm, "residue_mean", None) is not None
-            else max(len(p.mask) for p in parsed)
-        )
-        label_list, res_mean_list, res_std_list, mask_list = [], [], [], []
+        K_max = int(K_max) if K_max is not None else max(len(p.mask) for p in parsed)
+        label_list, mask_list = [], []
         for p in parsed:
-            y_norm, res_mean, res_std = build_label_tensor(p, K_max, out_norm)
+            y_norm = build_label_tensor(p, K_max, out_norm)
             label_list.append(y_norm.float())
-            res_mean_list.append(res_mean.float())
-            res_std_list.append(res_std.float())
             mask_list.append(_fixed_len_tensor(p.mask, K_max))
 
         mask = torch.stack(mask_list, dim=0)
         yN = torch.stack(label_list, dim=0)
-        res_mean = torch.stack(res_mean_list, dim=0)
-        res_std = torch.stack(res_std_list, dim=0)
 
         self.H = H
         self.M = M
         self.exc = exc
         self.chn = chn
         self.yN = yN
-        self.res_mean = res_mean
-        self.res_std = res_std
         self.mask = mask
 
     def __len__(self):
@@ -99,8 +89,6 @@ class RealIncrementalDataset(Dataset):
         y_dict = {
             "alpha": yNk[0],
             "omega": yNk[1],
-            "residue_mean": self.res_mean[idx],
-            "residue_std": self.res_std[idx],
         }
         if yNk.size(0) == 5:
             y_dict.update({
@@ -301,10 +289,10 @@ def main():
     if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
         raise RuntimeError(f"Normalizer_Input.pth must be 2D [H, M], got mean={in_norm.mean}, std={in_norm.std}")
 
-    ds_new = RealIncrementalDataset(new_data_out, in_norm, out_norm)
+    ds_new = RealIncrementalDataset(new_data_out, in_norm, out_norm, K_max=cfg.K_max)
     ds_replay = None
     if replay_txt_path.exists() and replay_txt_path.stat().st_size > 0:
-        ds_replay = RealIncrementalDataset(replay_txt_path, in_norm, out_norm)
+        ds_replay = RealIncrementalDataset(replay_txt_path, in_norm, out_norm, K_max=cfg.K_max)
 
     dl_new = DataLoader(ds_new, batch_size=args.batch_size, shuffle=True, drop_last=False)
     dl_replay = DataLoader(ds_replay, batch_size=args.batch_size, shuffle=True, drop_last=False) if ds_replay is not None else None

@@ -89,17 +89,15 @@ class MaskedMSE(nn.Module):
 
     def _normalized_pred_dict(self, pred, tgt):
         pred_n = self.norm_pred(pred)
-        res_mean = tgt.get("residue_mean")
-        res_std = tgt.get("residue_std")
         names = self._residue_names()
-        if res_mean is None or res_std is None:
-            fallback_mean = self.mean[2:2 + len(names)].view(1, len(names), 1)
-            fallback_std = self.std[2:2 + len(names)].view(1, len(names), 1).clamp_min(1e-8)
-            res_mean = fallback_mean.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
-            res_std = fallback_std.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
-        else:
-            res_mean = res_mean.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
-            res_std = res_std.to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype).clamp_min(1e-8)
+        res_mean = self.mean[2:2 + len(names)]
+        res_std = self.std[2:2 + len(names)]
+        if res_mean.numel() < len(names):
+            res_mean = torch.cat([res_mean, res_mean.new_zeros(len(names) - res_mean.numel())], dim=0)
+        if res_std.numel() < len(names):
+            res_std = torch.cat([res_std, res_std.new_ones(len(names) - res_std.numel())], dim=0)
+        res_mean = res_mean.view(1, len(names), 1).to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype)
+        res_std = res_std.view(1, len(names), 1).to(device=pred_n["alpha"].device, dtype=pred_n["alpha"].dtype).clamp_min(1e-8)
         pred_width = pred_n["alpha"].size(1)
         res_mean = _match_width(res_mean, pred_width)
         res_std = _match_width(res_std, pred_width).clamp_min(1e-8)
@@ -178,6 +176,10 @@ class MaskedMSE(nn.Module):
         pred_n = self._normalized_pred_dict(pred, tgt)
         pred_s, _ = self._sort_by_omega({name: pred_n[name] for name in names}, mask)
         tgt_s, m_t = self._sort_by_omega({name: tgt[name] for name in names}, mask)
+        width = max(pred_s[names[0]].size(1), tgt_s[names[0]].size(1), m_t.size(1))
+        pred_s = {name: _match_width(value, width) for name, value in pred_s.items()}
+        tgt_s = {name: _match_width(value, width) for name, value in tgt_s.items()}
+        m_t = _match_width(m_t, width)
         w = m_t
         num = w.sum().clamp_min(1.0)
         losses = {name: (pred_s[name] - tgt_s[name]).pow(2) for name in names}

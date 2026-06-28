@@ -27,4 +27,4 @@ python -m surrogate_model.test.Predict_user
 - Stage 2 trains `low + lin + adaptation` together.
 - Validation is enabled by default. `val_split_strategy="height_max_mach"` keeps the existing validation rule; `val_split_strategy="height_mach_kfold"` splits complete `(H, M)` operating-point groups.
 - Residue targets are configurable with `residue_target="polar"` or `residue_target="cartesian"`. The input data file format is unchanged.
-- Residue normalization is grouped by `exc_id x ch_id x mode_id x residue_param`; alpha/omega normalization remains global.
+- Output normalization is global masked normalization over valid modes only. `polar` uses `[alpha, omega, rho, sin_theta, cos_theta]`; `cartesian` uses `[alpha, omega, residue_re, residue_im]`.
