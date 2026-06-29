@@ -393,13 +393,13 @@ def run_infer_batched(
       H_all/M_all: (N,) float32
       exc_all/ch_all: (N,) int64
     输出：
-      dict: alpha/omega/rho/sin_theta/cos_theta/p_exist 均为 numpy，形状 (N, S)
+      dict: alpha/omega/rho/sin_theta/cos_theta/valid_mask 均为 numpy，形状 (N, S)
     注意：
       - omega 输出已乘 omegaN（rad/s）
       - rho 输出已 exp
     """
     N = len(H_all)
-    outs_acc = {k: [] for k in ["alpha", "omega", "rho", "sin_theta", "cos_theta", "p_exist"]}
+    outs_acc = {k: [] for k in ["alpha", "omega", "rho", "sin_theta", "cos_theta", "valid_mask"]}
 
     for s in range(0, N, batch_size):
         e = min(N, s + batch_size)
@@ -421,19 +421,40 @@ def run_infer_batched(
                 raise RuntimeError("Model returned a single output; use --predict_output low for this checkpoint.")
             out = model_out
 
-        alpha = out["alpha"].detach().cpu().numpy()
-        omega = out["omega"].detach().cpu().numpy() * omegaN
-        rho = np.exp(out["rho"].detach().cpu().numpy())
-        sin_t = out["sin_theta"].detach().cpu().numpy()
-        cos_t = out["cos_theta"].detach().cpu().numpy()
-        p_exist = out["p_exist"].detach().cpu().numpy()
+        freq = out["freq"].detach().cpu().numpy()
+        damping_percent = out["damping"].detach().cpu().numpy()
+        residue_re = out["residue_re"].detach().cpu().numpy()
+        residue_im = out["residue_im"].detach().cpu().numpy()
+
+        freq = np.nan_to_num(freq, nan=0.0, posinf=0.0, neginf=0.0)
+        zeta = np.clip(
+            np.nan_to_num(damping_percent / 100.0, nan=0.0, posinf=0.999, neginf=0.0),
+            1e-6,
+            0.999,
+        )
+        omega = np.maximum(freq, 0.0) * (2.0 * np.pi)
+        omega_n = omega / np.sqrt(np.maximum(1.0 - zeta * zeta, 1e-8))
+        alpha = -zeta * omega_n
+        rho = np.sqrt(np.maximum(residue_re * residue_re + residue_im * residue_im, 0.0))
+        safe_rho = np.maximum(rho, 1e-12)
+        sin_t = residue_im / safe_rho
+        cos_t = residue_re / safe_rho
+        valid_mask = (
+            np.isfinite(alpha)
+            & np.isfinite(omega)
+            & np.isfinite(rho)
+            & (freq > 0.0)
+            & (zeta > 0.0)
+            & (zeta < 1.0)
+            & (rho > 1e-12)
+        )
 
         outs_acc["alpha"].append(alpha)
         outs_acc["omega"].append(omega)
         outs_acc["rho"].append(rho)
         outs_acc["sin_theta"].append(sin_t)
         outs_acc["cos_theta"].append(cos_t)
-        outs_acc["p_exist"].append(p_exist)
+        outs_acc["valid_mask"].append(valid_mask.astype(np.float32))
 
     outs = {k: np.concatenate(v, axis=0) for k, v in outs_acc.items()}
     return outs
@@ -515,7 +536,7 @@ def save_response_dat(
     Y_hat = np.zeros((N, C_full), dtype=np.float64)
     for j in range(C_full):
         # 先按存在性筛选
-        mask_ex = outs_resp["p_exist"][j] > exist_thresh
+        mask_ex = outs_resp["valid_mask"][j] > 0.5
         if not np.any(mask_ex):
             continue
 
@@ -523,7 +544,6 @@ def save_response_dat(
         w_all = outs_resp["omega"][j][mask_ex]
         r_all = outs_resp["rho"][j][mask_ex]
         th_all = theta[j][mask_ex]
-        p_all = outs_resp["p_exist"][j][mask_ex]
 
         freqs_all = w_all / (2 * np.pi)
 
@@ -545,7 +565,6 @@ def save_response_dat(
         w_sel = w_all[chosen_idx]
         r_sel = r_all[chosen_idx]
         th_sel = th_all[chosen_idx]
-        p_sel = p_all[chosen_idx]
 
         B, A = build_BA_from_residues(
             a_sel,
@@ -553,8 +572,6 @@ def save_response_dat(
             r_sel,
             th_sel,
             Ts,
-            p_exist=p_sel,
-            exist_thresh=exist_thresh,
         )
         Y_hat[:, j] = lfilter(B, A, u)
 
@@ -603,7 +620,7 @@ def save_response_dat(
         ch_idx = int(ch)
         ch_name = channels[ch_idx]
 
-        mask = outs_resp["p_exist"][ch_idx] > exist_thresh
+        mask = outs_resp["valid_mask"][ch_idx] > 0.5
         if not np.any(mask):
             fd_lines.append(f"{ch_name}," + ",".join([""] * 9) + "\n")
             continue
@@ -671,7 +688,7 @@ def _build_yhat_and_slot_strings(
     rho_row: np.ndarray,
     sin_row: np.ndarray,
     cos_row: np.ndarray,
-    p_exist_row: np.ndarray,
+    valid_mask_row: np.ndarray,
     ch_name: str,
     csv_path: Path,
     u: np.ndarray,
@@ -687,7 +704,7 @@ def _build_yhat_and_slot_strings(
     freq_slots = ["", "", ""]
     damp_slots = ["", "", ""]
 
-    mask = p_exist_row > exist_thresh
+    mask = valid_mask_row > 0.5
     if not np.any(mask):
         return y_hat, freq_slots, damp_slots
 
@@ -695,7 +712,6 @@ def _build_yhat_and_slot_strings(
     w_all = omega_row[mask]
     r_all = rho_row[mask]
     th_all = np.arctan2(sin_row[mask], cos_row[mask])
-    p_all = p_exist_row[mask]
     freqs_all = w_all / (2 * np.pi)
 
     fr_map = _load_channel_freq_ranges(csv_path)
@@ -715,7 +731,6 @@ def _build_yhat_and_slot_strings(
     w_sel = w_all[chosen_idx]
     r_sel = r_all[chosen_idx]
     th_sel = th_all[chosen_idx]
-    p_sel = p_all[chosen_idx]
 
     B, A = build_BA_from_residues(
         a_sel,
@@ -723,8 +738,6 @@ def _build_yhat_and_slot_strings(
         r_sel,
         th_sel,
         Ts,
-        p_exist=p_sel,
-        exist_thresh=exist_thresh,
     )
     y_hat = lfilter(B, A, u)
     return y_hat, freq_slots, damp_slots
@@ -758,7 +771,7 @@ def save_HF_HG_for_entry(
     alpha = outs_hscan["alpha"]   # (n_case,S)
     omega = outs_hscan["omega"]
     rho = outs_hscan["rho"]
-    p_ex = outs_hscan["p_exist"]
+    valid_mask = outs_hscan["valid_mask"]
 
     hf_path = hf_dir / prediction_file_name("HF", entry, model_version)
     hg_path = hg_dir / prediction_file_name("HG", entry, model_version)
@@ -785,7 +798,7 @@ def save_HF_HG_for_entry(
                 rho_row=rho[row],
                 sin_row=outs_hscan["sin_theta"][row],
                 cos_row=outs_hscan["cos_theta"][row],
-                p_exist_row=p_ex[row],
+                valid_mask_row=valid_mask[row],
                 ch_name=ch_name,
                 csv_path=csv_path,
                 u=u,
@@ -854,7 +867,7 @@ def save_VF_VG_for_entry(
     alpha = outs_mscan["alpha"]
     omega = outs_mscan["omega"]
     rho = outs_mscan["rho"]
-    p_ex = outs_mscan["p_exist"]
+    valid_mask = outs_mscan["valid_mask"]
 
     vf_path = vf_dir / prediction_file_name("VF", entry, model_version)
     vg_path = vg_dir / prediction_file_name("VG", entry, model_version)
@@ -881,7 +894,7 @@ def save_VF_VG_for_entry(
                 rho_row=rho[row],
                 sin_row=outs_mscan["sin_theta"][row],
                 cos_row=outs_mscan["cos_theta"][row],
-                p_exist_row=p_ex[row],
+                valid_mask_row=valid_mask[row],
                 ch_name=ch_name,
                 csv_path=csv_path,
                 u=u,
@@ -1009,7 +1022,8 @@ def main():
     cfg = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_norm = Normalizer.load(out_norm_path)
-    cfg.residue_target = getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar"))
+    cfg.K_max = 3
+    cfg.residue_target = "fixed"
 
     print(f"==> Loading ckpt: {ckpt_path}")
     print(f"==> Prediction output: {args.predict_output}")

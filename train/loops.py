@@ -11,7 +11,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from surrogate_model.config import Config
-from surrogate_model.losses.masked_mse import MaskedHungarianMSE, MaskedMSE
+from surrogate_model.losses.masked_mse import MaskedMSE
 from surrogate_model.models.blocks import MFDNN
 from surrogate_model.train.dataloaders import build_dataloaders
 from surrogate_model.utils.dist_utils import dist_mean_scalar, is_main_process
@@ -164,18 +164,17 @@ def _write_train_log(path: Path, sim_hist, real_hist, total_hist, val_hist, lr_h
 
 
 def _build_criteria(cfg: Config, mean_sim, std_sim, mean_real, std_real):
-    cls = MaskedHungarianMSE if cfg.use_hungarian_loss else MaskedMSE
     common = dict(
         w_alpha=1.0,
         w_omega=1.0,
         w_rho=1.0,
         w_sin_theta=1.0,
         w_cos_theta=1.0,
-        presence_weight=cfg.presence_loss_weight,
-        cardinality_weight=cfg.cardinality_loss_weight,
-        residue_target=getattr(cfg, "residue_target", "polar"),
+        presence_weight=0.0,
+        cardinality_weight=0.0,
+        residue_target="fixed",
     )
-    return cls(mean=mean_sim, std=std_sim, **common), cls(mean=mean_real, std=std_real, **common)
+    return MaskedMSE(mean=mean_sim, std=std_sim, **common), MaskedMSE(mean=mean_real, std=std_real, **common)
 
 
 def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
@@ -333,11 +332,10 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
                 if comp_count > 0:
                     avg = {k: v / comp_count for k, v in comp_accum.items()}
                     print(
-                        f"[S1 parts] alpha={avg.get('alpha', 0.0):.4f}, "
-                        f"omega={avg.get('omega', 0.0):.4f}, rho={avg.get('rho', 0.0):.4f}, "
-                        f"sin_theta={avg.get('sin_theta', 0.0):.4f}, "
-                        f"cos_theta={avg.get('cos_theta', 0.0):.4f}, "
-                        f"BCE={avg.get('bce', 0.0):.4f}, CARD={avg.get('card', 0.0):.4f}",
+                        f"[S1 parts] freq={avg.get('freq', 0.0):.4f}, "
+                        f"damping={avg.get('damping', 0.0):.4f}, "
+                        f"residue_re={avg.get('residue_re', 0.0):.4f}, "
+                        f"residue_im={avg.get('residue_im', 0.0):.4f}",
                         flush=True,
                     )
 
@@ -589,12 +587,10 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
             if real_part_count > 0:
                 avg = {k: v / real_part_count for k, v in real_part_accum.items()}
                 print(
-                    f"[S2 train-real parts] alpha={avg.get('alpha', 0.0):.4f}, "
-                    f"omega={avg.get('omega', 0.0):.4f}, rho={avg.get('rho', 0.0):.4f}, "
-                    f"sin_theta={avg.get('sin_theta', 0.0):.4f}, "
-                    f"cos_theta={avg.get('cos_theta', 0.0):.4f}, "
-                    f"BCE={avg.get('bce', 0.0):.4f}, CARD={avg.get('card', 0.0):.4f}, "
-                    f"CLSw={avg.get('cls_weighted', 0.0):.4f}",
+                    f"[S2 train-real parts] freq={avg.get('freq', 0.0):.4f}, "
+                    f"damping={avg.get('damping', 0.0):.4f}, "
+                    f"residue_re={avg.get('residue_re', 0.0):.4f}, "
+                    f"residue_im={avg.get('residue_im', 0.0):.4f}",
                     flush=True,
                 )
 
@@ -646,8 +642,7 @@ def train_one_fold(fold: int, cfg: Config, sim_parsed, real_parsed, args):
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
-    eval_cls = MaskedHungarianMSE if cfg.use_hungarian_loss else MaskedMSE
-    crit_eval = eval_cls(mean=mean_real, std=std_real, residue_target=getattr(cfg, "residue_target", "polar"))
+    crit_eval = MaskedMSE(mean=mean_real, std=std_real, residue_target="fixed")
     vloss = _eval_loss(model, val_dl, crit_eval, device, forward_high=True)
     if vloss is None:
         vloss = float("nan")

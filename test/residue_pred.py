@@ -1,9 +1,7 @@
 import numpy as np
 from scipy.signal import invresz
 
-def build_BA_from_residues(alpha, omega, rho, theta, Ts,
-                           *, p_exist=None, exist_thresh: float = 0.5,
-                           residues_are_discrete: bool = False):
+def build_BA_from_residues(alpha, omega, rho, theta, Ts, *, residues_are_discrete: bool = False):
     """
     根据 (alpha, omega, rho, theta) 构造离散 IIR 系统系数 (B, A)，变量为 z^{-1}。
     - alpha, omega: 连续域极点实部/虚部，形状 (K,)
@@ -21,13 +19,7 @@ def build_BA_from_residues(alpha, omega, rho, theta, Ts,
     if not (alpha.shape == omega.shape == rho.shape == theta.shape):
         raise ValueError("alpha, omega, rho, theta 形状必须一致")
     
-    if p_exist is not None:
-        p_exist = np.asarray(p_exist, dtype=np.float64)
-        if p_exist.shape != alpha.shape:
-            raise ValueError("p_exist 形状必须与 alpha 等一致")
-        mask = p_exist > exist_thresh
-    else:
-        mask = np.ones_like(alpha, dtype=bool)
+    mask = np.ones_like(alpha, dtype=bool)
 
     if not np.any(mask):
         return np.array([0.0], dtype=np.float64), np.array([1.0], dtype=np.float64)

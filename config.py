@@ -4,7 +4,7 @@ from typing import List
 
 @dataclass
 class Config:
-    K_max: int = 6
+    K_max: int = 3
     embed_excitation_num: int = 6
     embed_channel_num: int = 34
     embed_excitation_dim: int = 4
@@ -37,10 +37,8 @@ class Config:
     val_mach_tol: float = 1e-6
     val_heights: List[float] = field(default_factory=lambda: [3.0, 8.23])
 
-    # Residue target:
-    # - polar: rho, sin(theta), cos(theta)
-    # - cartesian: Re, Im, converted from rho/theta in the existing data rows
-    residue_target: str = "polar"
+    # Fixed-slot target: freq, damping_percent, residue_re, residue_im
+    residue_target: str = "fixed"
 
     epochs_stage1: int = 3000
     epochs_stage2: int = 3000
@@ -56,10 +54,10 @@ class Config:
     # 网络与损失
     use_modulation: bool = True
     use_modulation_in_high: bool = False
-    use_hungarian_loss: bool = True
+    use_hungarian_loss: bool = False
 
     # 存在头
-    presence_loss_weight: float = 0.2
-    cardinality_loss_weight: float = 0.05
+    presence_loss_weight: float = 0.0
+    cardinality_loss_weight: float = 0.0
     presence_threshold: float = 0.5
 

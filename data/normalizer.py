@@ -9,7 +9,7 @@ from surrogate_model.data.io import ParsedRow
 class Normalizer:
     mean: np.ndarray
     std: np.ndarray
-    residue_target: str = "polar"
+    residue_target: str = "fixed"
     def save(self, path):
         import torch as _torch
         d = {
@@ -31,7 +31,7 @@ class Normalizer:
 
         mean = d.get('mean')
         std  = d.get('std')
-        residue_target = d.get('residue_target', 'polar')
+        residue_target = d.get('residue_target', 'fixed')
 
         # 统一转成 numpy
         if isinstance(mean, _torch.Tensor):
@@ -58,10 +58,10 @@ class Normalizer:
         s = torch.as_tensor(self.std, dtype=x.dtype, device=x.device)
         return x * s + m
     def residue_names(self) -> list[str]:
-        target = str(getattr(self, "residue_target", "polar")).lower()
-        if target == "cartesian":
-            return ["residue_re", "residue_im"]
-        return ["rho", "sin_theta", "cos_theta"]
+        return ["residue_re", "residue_im"]
+
+    def target_names(self) -> list[str]:
+        return ["freq", "damping", "residue_re", "residue_im"]
 
 def compute_input_normalizer_sim(sim_parsed: List[ParsedRow]) -> Normalizer:
     HM = np.array([[p.H, p.M] for p in sim_parsed], dtype=np.float64)
@@ -69,38 +69,30 @@ def compute_input_normalizer_sim(sim_parsed: List[ParsedRow]) -> Normalizer:
     std = HM.std(axis=0)
     return Normalizer(mean=mean, std=std)
 
-def _residue_values(p: ParsedRow, target: str) -> np.ndarray:
-    if target == "cartesian":
-        return np.stack([p.residue_re, p.residue_im], axis=1)
-    return np.stack([p.rho, p.sin_theta, p.cos_theta], axis=1)
-
-
-def compute_output_normalizer_masked(parsed: List[ParsedRow], residue_target: str = "polar") -> Normalizer:
-    residue_target = str(residue_target).lower()
-    if residue_target not in {"polar", "cartesian"}:
-        raise ValueError(f"Unsupported residue_target: {residue_target}")
-
-    al, om, residue_all = [], [], []
+def compute_output_normalizer_masked(parsed: List[ParsedRow], residue_target: str = "fixed") -> Normalizer:
+    values = []
     for p in parsed:
-        k = int(p.K_valid)
-        if k <= 0:
+        mask = np.asarray(p.mask, dtype=bool)
+        if not mask.any():
             continue
-        al.append(p.alpha[:k]); om.append(p.omega[:k]); residue_all.append(_residue_values(p, residue_target)[:k])
-    if len(al) == 0:
-        r_count = 2 if residue_target == "cartesian" else 3
-        mean = np.zeros(2 + r_count, dtype=np.float64)
-        std  = np.ones(2 + r_count, dtype=np.float64)
-        return Normalizer(mean=mean, std=std, residue_target=residue_target)
+        mat = np.stack([p.freq, p.damping_percent, p.residue_re, p.residue_im], axis=1)
+        values.append(mat[mask])
+    if not values:
+        return Normalizer(mean=np.zeros(4, dtype=np.float64), std=np.ones(4, dtype=np.float64), residue_target="fixed")
 
-    al_arr = np.concatenate(al)
-    om_arr = np.concatenate(om)
-    residue_mat = np.concatenate(residue_all, axis=0)
-    residue_param_mean = residue_mat.mean(axis=0)
-    residue_param_std = np.maximum(residue_mat.std(axis=0), 1e-8)
-    mean = np.concatenate([[al_arr.mean(), om_arr.mean()], residue_param_mean], axis=0)
-    std = np.concatenate([[al_arr.std(), om_arr.std()], residue_param_std], axis=0)
-    std = np.maximum(std, 1e-8)
-    return Normalizer(mean=mean, std=std, residue_target=residue_target)
+    arr = np.concatenate(values, axis=0).astype(np.float64)
+    mean = arr.mean(axis=0)
+    std = arr.std(axis=0)
+    min_std = np.array([1e-6, 1e-6, 1e-8, 1e-8], dtype=np.float64)
+    small = std < min_std
+    if np.any(small):
+        names = np.array(["freq", "damping_percent", "residue_re", "residue_im"])
+        print(
+            "[fixed-slots] output std too small; using safe floor for "
+            + ", ".join(names[small].tolist())
+        )
+    std = np.maximum(std, min_std)
+    return Normalizer(mean=mean, std=std, residue_target="fixed")
 
 if __name__ == '__main__':
     # 简单测试

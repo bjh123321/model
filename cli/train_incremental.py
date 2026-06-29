@@ -18,7 +18,7 @@ from surrogate_model.data.build_replay_data import build_replay_data
 from surrogate_model.data.datasets import _fixed_len_tensor, build_label_tensor
 from surrogate_model.data.io import parse_rows_to_struct
 from surrogate_model.data.normalizer import Normalizer
-from surrogate_model.losses.masked_mse import MaskedHungarianMSE
+from surrogate_model.losses.masked_mse import MaskedMSE
 from surrogate_model.models.blocks import MFDNN
 
 
@@ -87,21 +87,12 @@ class RealIncrementalDataset(Dataset):
     def __getitem__(self, idx):
         yNk = self.yN[idx]
         y_dict = {
-            "alpha": yNk[0],
-            "omega": yNk[1],
+            "freq": yNk[0],
+            "damping": yNk[1],
+            "residue_re": yNk[2],
+            "residue_im": yNk[3],
         }
-        if yNk.size(0) == 5:
-            y_dict.update({
-                "rho": yNk[2],
-                "sin_theta": yNk[3],
-                "cos_theta": yNk[4],
-            })
-        elif yNk.size(0) == 4:
-            y_dict.update({
-                "residue_re": yNk[2],
-                "residue_im": yNk[3],
-            })
-        else:
+        if yNk.size(0) != 4:
             raise RuntimeError(f"Unexpected label shape: {tuple(yNk.shape)}")
         return {
             "H": self.H[idx],
@@ -146,45 +137,20 @@ def adaptation_anchor_loss(module: nn.Module, ref_state: Dict[str, torch.Tensor]
 
 
 def build_adaptation_param_groups(model: MFDNN, lr_base: float, lr_lora: float, lr_embed: float):
-    base_params = []
-    lora_params = []
-    embed_params = []
-    unmatched = []
-
+    params = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         if not name.startswith("adaptation."):
             raise RuntimeError(f"Non-adaptation parameter unexpectedly trainable: {name}")
-        if ".mlp." in name and ".base." in name:
-            base_params.append(param)
-        elif ".mlp." in name and ".lora_" in name:
-            lora_params.append(param)
-        elif name.startswith("adaptation.emb_") or name.startswith("adaptation.mod."):
-            embed_params.append(param)
-        else:
-            unmatched.append(name)
-
-    if unmatched:
-        raise RuntimeError(f"Unmatched trainable adaptation parameters: {unmatched}")
-    if not base_params:
-        raise RuntimeError("Optimizer base group is empty")
-    if not lora_params:
-        raise RuntimeError("Optimizer lora group is empty")
-    if not embed_params:
-        warnings.warn("Optimizer embed group is empty", RuntimeWarning)
-
-    groups = [
-        {"params": base_params, "lr": lr_base, "name": "base"},
-        {"params": lora_params, "lr": lr_lora, "name": "lora"},
-    ]
-    if embed_params:
-        groups.append({"params": embed_params, "lr": lr_embed, "name": "embed"})
-    return groups
+        params.append(param)
+    if not params:
+        raise RuntimeError("Optimizer adaptation group is empty")
+    return [{"params": params, "lr": lr_base, "name": "adaptation"}]
 
 
 def kd_loss_fn(new: dict, old: dict, w: float = 1.0):
-    keys = ["alpha", "omega", "rho", "sin_theta", "cos_theta"]
+    keys = ["freq", "damping", "residue_re", "residue_im"]
     loss = 0.0
     for key in keys:
         loss = loss + ((new[key] - old[key]) ** 2).mean()
@@ -257,10 +223,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg = Config()
     cfg.use_lora = True
+    cfg.K_max = 3
 
     in_norm = Normalizer.load(model_dir / "Normalizer_Input.pth")
     out_norm = Normalizer.load(model_dir / "Normalizer_Output.pth")
-    cfg.residue_target = getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar"))
+    cfg.residue_target = "fixed"
 
     student = MFDNN(cfg).to(device)
     teacher = MFDNN(cfg).to(device)
@@ -299,10 +266,10 @@ def main():
 
     mean_t = torch.as_tensor(out_norm.mean, dtype=torch.float32, device=device)
     std_t = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device)
-    crit = MaskedHungarianMSE(
+    crit = MaskedMSE(
         mean=mean_t,
         std=std_t,
-        residue_target=getattr(out_norm, "residue_target", getattr(cfg, "residue_target", "polar")),
+        residue_target="fixed",
     )
 
     opt = torch.optim.AdamW(

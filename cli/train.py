@@ -141,7 +141,7 @@ def main():
     parser.add_argument("--batch_real", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch", type=int, default=4)
-    parser.add_argument("--residue_target", type=str, default="polar", choices=["polar", "cartesian"])
+    parser.add_argument("--residue_target", type=str, default="fixed", choices=["fixed"])
     parser.add_argument("--val_split_strategy", type=str, default=None, choices=["height_max_mach", "height_mach_kfold", ""])
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     args, _unknown = parser.parse_known_args()
@@ -164,10 +164,10 @@ def main():
     cfg.batch_real = args.batch_real
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
-    cfg.residue_target = args.residue_target
+    cfg.residue_target = "fixed"
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
-    cfg.K_max = max(sim_stats["K_max"], real_stats["K_max"])
+    cfg.K_max = 3
     cfg.embed_channel_num = max(sim_stats["channel_num"], real_stats["channel_num"])
     cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
 

@@ -28,28 +28,15 @@ def _global_stats(out_norm: Normalizer, count: int):
 
 
 def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
-    residue_target = str(getattr(out_norm, "residue_target", "polar")).lower()
-    if residue_target == "cartesian":
-        lab = torch.stack(
-            [
-                _fixed_len_tensor(p.alpha, K_max),
-                _fixed_len_tensor(p.omega, K_max),
-                _fixed_len_tensor(p.residue_re, K_max),
-                _fixed_len_tensor(p.residue_im, K_max),
-            ],
-            dim=0,
-        )
-    else:
-        lab = torch.stack(
-            [
-                _fixed_len_tensor(p.alpha, K_max),
-                _fixed_len_tensor(p.omega, K_max),
-                _fixed_len_tensor(p.rho, K_max),
-                _fixed_len_tensor(p.sin_theta, K_max),
-                _fixed_len_tensor(p.cos_theta, K_max),
-            ],
-            dim=0,
-        )
+    lab = torch.stack(
+        [
+            _fixed_len_tensor(p.freq, K_max),
+            _fixed_len_tensor(p.damping_percent, K_max),
+            _fixed_len_tensor(p.residue_re, K_max),
+            _fixed_len_tensor(p.residue_im, K_max),
+        ],
+        dim=0,
+    )
 
     mean, std = _global_stats(out_norm, lab.size(0))
     return (lab - mean[:, None]) / std[:, None]
@@ -82,20 +69,11 @@ def collate_modal(batch):
     m  = torch.stack([b[4] for b in batch], dim=0)  # (B,K)
     yN = torch.stack([b[5] for b in batch], dim=0)  # (B,P,K)
     y_dict = {
-        'alpha':     yN[:,0,:],
-        'omega':     yN[:,1,:],
+        'freq':       yN[:,0,:],
+        'damping':    yN[:,1,:],
+        'residue_re': yN[:,2,:],
+        'residue_im': yN[:,3,:],
     }
-    if yN.size(1) == 5:
-        y_dict.update({
-            'rho':       yN[:,2,:],
-            'sin_theta': yN[:,3,:],
-            'cos_theta': yN[:,4,:],
-        })
-    elif yN.size(1) == 4:
-        y_dict.update({
-            'residue_re': yN[:,2,:],
-            'residue_im': yN[:,3,:],
-        })
-    else:
+    if yN.size(1) != 4:
         raise RuntimeError(f"Unexpected label tensor shape: {tuple(yN.shape)}")
     return H, M, e, c, m, y_dict
