@@ -112,7 +112,8 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
 
 def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     debug_n = int(getattr(args, "debug_overfit_n", 0) or 0)
-    if debug_n > 0:
+    debug_mode = debug_n > 0
+    if debug_mode:
         cfg = deepcopy(cfg)
         cfg.use_val_split = False
         cfg.early_stop_patience_s1 = 0
@@ -133,7 +134,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     mean = torch.as_tensor(out_norm.mean, dtype=torch.float32, device=device)
     std = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device)
     opt = torch.optim.AdamW(model_core.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=20, min_lr=1e-6)
+    sched = None if debug_mode else torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=20, min_lr=1e-6)
 
     best = float("inf")
     best_epoch = 0
@@ -161,7 +162,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             opt.zero_grad(set_to_none=True)
             loss, parts = _polar_loss(model(H, M, e, c), y, mask, mean, std)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=5.0)
+            if not debug_mode:
+                torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=5.0)
             opt.step()
             bs = H.size(0)
             total_sum += float(loss.detach().item()) * bs
@@ -173,7 +175,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         train_parts = _mean_parts(part_sum, count)
         val_loss, val_parts = _eval_model(model, val_dl, device, mean, std)
         metric = val_loss if val_loss is not None else train_loss
-        sched.step(metric)
+        if sched is not None:
+            sched.step(metric)
         train_hist.append(train_loss)
         val_hist.append(float("nan") if val_loss is None else val_loss)
 
