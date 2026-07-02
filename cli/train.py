@@ -138,8 +138,9 @@ def main():
     parser.add_argument("--batch_real", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch", type=int, default=4)
-    parser.add_argument("--residue_target", type=str, default="fixed", choices=["fixed"])
+    parser.add_argument("--residue_target", type=str, default="polar", choices=["polar"])
     parser.add_argument("--val_split_strategy", type=str, default=None, choices=["height_max_mach", "height_mach_kfold", ""])
+    parser.add_argument("--debug_overfit_n", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     args, _unknown = parser.parse_known_args()
 
@@ -156,7 +157,7 @@ def main():
     cfg.batch_real = args.batch_real
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
-    cfg.residue_target = "fixed"
+    cfg.residue_target = "polar"
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
     cfg.K_max = 3
@@ -167,7 +168,7 @@ def main():
 
     for fold in range(num_folds):
         if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
-            print(f"========== Fold {fold + 1}/{num_folds} ==========", flush=True)
+            print(f"========== Fold {fold + 1}/{num_folds} ==========")
         train_one_fold(fold, cfg, real_parsed, args)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
