@@ -10,6 +10,7 @@ import numpy as np
 
 FIXED_K_MAX = 3
 FS_HZ = 512.0
+OMEGA_N = math.pi * FS_HZ
 
 
 def read_variable_txt(path: Path) -> List[List[float]]:
@@ -36,17 +37,18 @@ class ParsedRow:
     exc_id: int
     ch_id: int
     K_valid: int
-    freq: np.ndarray
-    damping: np.ndarray
-    damping_percent: np.ndarray
-    residue_re: np.ndarray
-    residue_im: np.ndarray
-    mask: np.ndarray
     alpha: np.ndarray
     omega: np.ndarray
     rho: np.ndarray
     sin_theta: np.ndarray
     cos_theta: np.ndarray
+    mask: np.ndarray
+    # Compatibility fields for older fixed-output helpers.
+    freq: np.ndarray
+    damping: np.ndarray
+    damping_percent: np.ndarray
+    residue_re: np.ndarray
+    residue_im: np.ndarray
 
 
 def _modal_tail(r: List[float]) -> List[float]:
@@ -65,47 +67,54 @@ def _safe_mode(Re: float, Im: float, mag: float, theta: float) -> Tuple[bool, tu
     eps = 1e-12
     if not (np.isfinite(Re) and np.isfinite(Im)):
         return False, ()
+    if abs(float(Re)) <= eps and abs(float(Im)) <= eps:
+        return False, ()
     if abs(float(Im)) <= eps:
         return False, ()
 
-    sigma = -abs(float(Re))
-    omega_d = abs(float(Im))
+    re_value = float(Re)
+    im_value = float(Im)
+    alpha = -abs(re_value)
+    omega = abs(im_value) / OMEGA_N
+
+    sigma = alpha
+    omega_d = abs(im_value)
     denom = math.sqrt(sigma * sigma + omega_d * omega_d)
     if denom <= eps:
         return False, ()
-
     damping = -sigma / denom
-    if not np.isfinite(damping):
-        return False, ()
     damping = float(np.clip(damping, 1e-6, 0.999999))
     freq = omega_d / (2.0 * math.pi)
 
-    if np.isfinite(mag) and np.isfinite(theta):
-        mag_value = float(mag)
+    if np.isfinite(mag):
+        mag_value = max(abs(float(mag)), eps)
+    else:
+        mag_value = eps
+    rho = math.log(mag_value)
+
+    if np.isfinite(theta):
         theta_value = float(theta)
-        residue_re = mag_value * math.cos(theta_value)
-        residue_im = mag_value * math.sin(theta_value)
-        rho_log = math.log(max(abs(mag_value), eps))
         sin_theta = math.sin(theta_value)
         cos_theta = math.cos(theta_value)
+        residue_re = mag_value * cos_theta
+        residue_im = mag_value * sin_theta
     else:
-        residue_re = 0.0
-        residue_im = 0.0
-        rho_log = math.log(eps)
         sin_theta = 0.0
         cos_theta = 1.0
+        residue_re = mag_value
+        residue_im = 0.0
 
     return True, (
+        alpha,
+        omega,
+        rho,
+        sin_theta,
+        cos_theta,
         freq,
         damping,
         damping * 100.0,
         residue_re,
         residue_im,
-        sigma,
-        omega_d,
-        rho_log,
-        sin_theta,
-        cos_theta,
     )
 
 
@@ -131,16 +140,16 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
         tail = _modal_tail(r)
         K_all = len(tail) // 4
 
-        freq = np.zeros((FIXED_K_MAX,), dtype=np.float32)
-        damping = np.zeros((FIXED_K_MAX,), dtype=np.float32)
-        damping_percent = np.zeros((FIXED_K_MAX,), dtype=np.float32)
-        residue_re = np.zeros((FIXED_K_MAX,), dtype=np.float32)
-        residue_im = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         alpha = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         omega = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         rho = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         sin_theta = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         cos_theta = np.zeros((FIXED_K_MAX,), dtype=np.float32)
+        freq = np.zeros((FIXED_K_MAX,), dtype=np.float32)
+        damping = np.zeros((FIXED_K_MAX,), dtype=np.float32)
+        damping_percent = np.zeros((FIXED_K_MAX,), dtype=np.float32)
+        residue_re = np.zeros((FIXED_K_MAX,), dtype=np.float32)
+        residue_im = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         mask = np.zeros((FIXED_K_MAX,), dtype=np.float32)
 
         ignored_extra += max(0, K_all - FIXED_K_MAX)
@@ -161,16 +170,16 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
                 continue
 
             (
-                freq[slot],
-                damping[slot],
-                damping_percent[slot],
-                residue_re[slot],
-                residue_im[slot],
                 alpha[slot],
                 omega[slot],
                 rho[slot],
                 sin_theta[slot],
                 cos_theta[slot],
+                freq[slot],
+                damping[slot],
+                damping_percent[slot],
+                residue_re[slot],
+                residue_im[slot],
             ) = mode
             mask[slot] = 1.0
 
@@ -181,17 +190,17 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
                 exc_id,
                 ch_id,
                 int(mask.sum()),
-                freq,
-                damping,
-                damping_percent,
-                residue_re,
-                residue_im,
-                mask,
                 alpha,
                 omega,
                 rho,
                 sin_theta,
                 cos_theta,
+                mask,
+                freq,
+                damping,
+                damping_percent,
+                residue_re,
+                residue_im,
             )
         )
 
