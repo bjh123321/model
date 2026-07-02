@@ -28,18 +28,16 @@ def _global_stats(out_norm: Normalizer, count: int):
 
 
 def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
-    lab = torch.stack(
-        [
-            _fixed_len_tensor(p.freq, K_max),
-            _fixed_len_tensor(p.damping_percent, K_max),
-            _fixed_len_tensor(p.residue_re, K_max),
-            _fixed_len_tensor(p.residue_im, K_max),
-        ],
-        dim=0,
-    )
-
-    mean, std = _global_stats(out_norm, lab.size(0))
-    return (lab - mean[:, None]) / std[:, None]
+    lab3 = torch.stack([
+        _fixed_len_tensor(p.alpha, K_max),
+        _fixed_len_tensor(p.omega, K_max),
+        _fixed_len_tensor(p.rho, K_max),
+    ], dim=0)
+    mean, std = _global_stats(out_norm, lab3.size(0))
+    lab3 = (lab3 - mean[:, None]) / std[:, None]
+    s = _fixed_len_tensor(p.sin_theta, K_max).unsqueeze(0)
+    c = _fixed_len_tensor(p.cos_theta, K_max).unsqueeze(0)
+    return torch.cat([lab3, s, c], dim=0)
 
 
 class ModalDataset(Dataset):
@@ -48,32 +46,35 @@ class ModalDataset(Dataset):
         self.K_max = K_max
         self.in_norm = input_norm
         self.out_norm = output_norm
+
     def __len__(self):
         return len(self.parsed)
+
     def __getitem__(self, idx):
         p = self.parsed[idx]
         HM = torch.tensor([p.H, p.M], dtype=torch.float32)
         HM = self.in_norm.transform(HM)
-        Hn = HM[0:1]; Mn = HM[1:2]
+        Hn = HM[0:1]
+        Mn = HM[1:2]
         exc_id = torch.tensor(p.exc_id, dtype=torch.long)
-        ch_id  = torch.tensor(p.ch_id, dtype=torch.long)
+        ch_id = torch.tensor(p.ch_id, dtype=torch.long)
         lab_norm = build_label_tensor(p, self.K_max, self.out_norm)
         mask = _fixed_len_tensor(p.mask, self.K_max)
         return Hn, Mn, exc_id, ch_id, mask, lab_norm
 
+
 def collate_modal(batch):
-    H  = torch.stack([b[0] for b in batch], dim=0)  # (B,1)
-    M  = torch.stack([b[1] for b in batch], dim=0)  # (B,1)
-    e  = torch.stack([b[2] for b in batch], dim=0)  # (B,)
-    c  = torch.stack([b[3] for b in batch], dim=0)  # (B,)
-    m  = torch.stack([b[4] for b in batch], dim=0)  # (B,K)
-    yN = torch.stack([b[5] for b in batch], dim=0)  # (B,P,K)
+    H = torch.stack([b[0] for b in batch], dim=0)
+    M = torch.stack([b[1] for b in batch], dim=0)
+    e = torch.stack([b[2] for b in batch], dim=0)
+    c = torch.stack([b[3] for b in batch], dim=0)
+    m = torch.stack([b[4] for b in batch], dim=0)
+    yN = torch.stack([b[5] for b in batch], dim=0)
     y_dict = {
-        'freq':       yN[:,0,:],
-        'damping':    yN[:,1,:],
-        'residue_re': yN[:,2,:],
-        'residue_im': yN[:,3,:],
+        'alpha': yN[:, 0, :],
+        'omega': yN[:, 1, :],
+        'rho': yN[:, 2, :],
+        'sin_theta': yN[:, 3, :],
+        'cos_theta': yN[:, 4, :],
     }
-    if yN.size(1) != 4:
-        raise RuntimeError(f"Unexpected label tensor shape: {tuple(yN.shape)}")
     return H, M, e, c, m, y_dict
