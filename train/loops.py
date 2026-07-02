@@ -16,6 +16,9 @@ from surrogate_model.train.dataloaders import build_single_fidelity_dataloaders
 from surrogate_model.utils.dist_utils import is_main_process
 
 
+PART_NAMES = ("freq", "damping", "residue_re", "residue_im")
+
+
 def _select_device(args) -> torch.device:
     requested = str(getattr(args, "device", "auto")).lower()
     if requested not in {"auto", "cuda", "cpu"}:
@@ -53,12 +56,32 @@ def _batch_to_device(batch, device):
     return H, M, e, c, mask, yN
 
 
+def _empty_parts():
+    return {name: 0.0 for name in PART_NAMES}
+
+
+def _parts_from_criterion(crit) -> dict[str, float]:
+    stats = getattr(crit, "last_reg_stats", None) or {}
+    return {name: float(stats.get(name, 0.0)) for name in PART_NAMES}
+
+
+def _accum_parts(accum: dict[str, float], parts: dict[str, float], weight: int):
+    for name in PART_NAMES:
+        accum[name] += float(parts.get(name, 0.0)) * int(weight)
+
+
+def _mean_parts(accum: dict[str, float], count: int) -> dict[str, float]:
+    denom = max(int(count), 1)
+    return {name: accum[name] / denom for name in PART_NAMES}
+
+
 def _eval_loss(model, dl, crit, device):
     if dl is None or len(dl.dataset) == 0:
-        return None
+        return None, _empty_parts()
     model.eval()
     use_cuda = device.type == "cuda"
     value_sum, value_count = 0.0, 0
+    part_sum = _empty_parts()
     with torch.no_grad():
         for batch in dl:
             H, M, e, c, mask, yN = _batch_to_device(batch, device)
@@ -70,6 +93,7 @@ def _eval_loss(model, dl, crit, device):
             bs = H.size(0)
             value_sum += float(loss.item()) * bs
             value_count += bs
+            _accum_parts(part_sum, _parts_from_criterion(crit), bs)
 
     t_sum = torch.tensor(value_sum, device=device)
     t_count = torch.tensor(value_count, device=device, dtype=torch.float32)
@@ -77,25 +101,31 @@ def _eval_loss(model, dl, crit, device):
         dist.all_reduce(t_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(t_count, op=dist.ReduceOp.SUM)
     if t_count.item() <= 0:
-        return None
-    return (t_sum / t_count).item()
+        return None, _empty_parts()
+    return (t_sum / t_count).item(), _mean_parts(part_sum, value_count)
 
 
-def _write_train_log(path: Path, train_hist, val_hist, lr_hist):
+def _write_train_log(path: Path, rows: list[dict[str, float]]):
     path.parent.mkdir(parents=True, exist_ok=True)
-    max_len = max(len(train_hist), len(val_hist), len(lr_hist), 0)
+    fields = [
+        "epoch",
+        "loss_train_total",
+        "loss_train_freq",
+        "loss_train_damping",
+        "loss_train_residue_re",
+        "loss_train_residue_im",
+        "loss_val_total",
+        "loss_val_freq",
+        "loss_val_damping",
+        "loss_val_residue_re",
+        "loss_val_residue_im",
+        "lr",
+    ]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["epoch", "loss_train_real", "loss_val_real", "lr"])
-        for i in range(max_len):
-            writer.writerow(
-                [
-                    i + 1,
-                    train_hist[i] if i < len(train_hist) else "",
-                    val_hist[i] if i < len(val_hist) else "",
-                    lr_hist[i] if i < len(lr_hist) else "",
-                ]
-            )
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fields})
 
 
 def _make_criterion(out_norm, device):
@@ -136,6 +166,15 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
 
 
 def train_one_fold(fold: int, cfg: Config, real_parsed, args):
+    debug_n = int(getattr(args, "debug_overfit_n", 0) or 0)
+    if debug_n > 0:
+        cfg = deepcopy(cfg)
+        cfg.use_val_split = False
+        cfg.early_stop_patience_s1 = 0
+        real_parsed = list(real_parsed)[:debug_n]
+        if is_main_process():
+            print(f"[DEBUG] Overfit mode enabled: using first {len(real_parsed)} samples, validation disabled.", flush=True)
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = _select_device(args)
     if is_main_process():
@@ -199,9 +238,9 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     best_epoch = 0
     best_state = None
     bad_epochs = 0
+    log_rows: list[dict[str, float]] = []
     train_hist: list[float] = []
     val_hist: list[float] = []
-    lr_hist: list[float] = []
     patience = int(getattr(cfg, "early_stop_patience_s1", 500))
     min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
 
@@ -209,6 +248,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         _maybe_set_epoch(train_dl, epoch)
         model.train()
         loss_sum, sample_count = 0.0, 0
+        train_part_sum = _empty_parts()
         for batch in train_dl:
             H, M, e, c, mask, yN = _batch_to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
@@ -229,15 +269,31 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             bs = H.size(0)
             loss_sum += float(loss.detach().item()) * bs
             sample_count += bs
+            _accum_parts(train_part_sum, _parts_from_criterion(crit), bs)
 
         train_loss = loss_sum / max(sample_count, 1)
-        val_loss = _eval_loss(model, val_dl, crit, device)
+        train_parts = _mean_parts(train_part_sum, sample_count)
+        val_loss, val_parts = _eval_loss(model, val_dl, crit, device)
         metric = val_loss if val_loss is not None else train_loss
         scheduler.step(metric)
 
         train_hist.append(train_loss)
         val_hist.append(float("nan") if val_loss is None else val_loss)
-        lr_hist.append(_cur_lr(optimizer))
+        row = {
+            "epoch": epoch + 1,
+            "loss_train_total": train_loss,
+            "loss_train_freq": train_parts["freq"],
+            "loss_train_damping": train_parts["damping"],
+            "loss_train_residue_re": train_parts["residue_re"],
+            "loss_train_residue_im": train_parts["residue_im"],
+            "loss_val_total": "" if val_loss is None else val_loss,
+            "loss_val_freq": "" if val_loss is None else val_parts["freq"],
+            "loss_val_damping": "" if val_loss is None else val_parts["damping"],
+            "loss_val_residue_re": "" if val_loss is None else val_parts["residue_re"],
+            "loss_val_residue_im": "" if val_loss is None else val_parts["residue_im"],
+            "lr": _cur_lr(optimizer),
+        }
+        log_rows.append(row)
 
         improved = metric < (best_metric - min_delta)
         if improved:
@@ -252,13 +308,14 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
         if is_main_process() and ((epoch + 1) == 1 or (epoch + 1) % 10 == 0 or improved):
             val_text = "nan" if val_loss is None else f"{val_loss:.6f}"
-            parts = getattr(crit, "last_reg_stats", {}) or {}
             print(
                 f"[Fold {fold + 1}] Fixed-SF Epoch {epoch + 1}/{cfg.epochs_stage1} "
                 f"loss_real={train_loss:.6f} val_real={val_text} "
                 f"best={best_metric:.6f}@{best_epoch} lr={_cur_lr(optimizer):.3e} "
-                f"parts=freq:{parts.get('freq', 0.0):.4f},damp:{parts.get('damping', 0.0):.4f},"
-                f"re:{parts.get('residue_re', 0.0):.4f},im:{parts.get('residue_im', 0.0):.4f}",
+                f"train_parts=freq:{train_parts['freq']:.4f},damp:{train_parts['damping']:.4f},"
+                f"re:{train_parts['residue_re']:.4f},im:{train_parts['residue_im']:.4f} "
+                f"val_parts=freq:{val_parts['freq']:.4f},damp:{val_parts['damping']:.4f},"
+                f"re:{val_parts['residue_re']:.4f},im:{val_parts['residue_im']:.4f}",
                 flush=True,
             )
 
@@ -279,7 +336,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             args, out_dir, model_core, in_norm, out_norm, best_epoch, best_metric
         )
         train_log_path = Path(getattr(args, "train_log_path", "") or (out_dir / "train_log.csv"))
-        _write_train_log(train_log_path, train_hist, val_hist, lr_hist)
+        _write_train_log(train_log_path, log_rows)
         print(f"[OK] Fixed single-fidelity model saved to: {model_path}", flush=True)
         print(f"[OK] Normalizers saved to: {norm_dir}", flush=True)
 
