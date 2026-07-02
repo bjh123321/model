@@ -132,12 +132,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out_dir", type=str, default=str(model_dir / model_version))
     parser.add_argument("--kfold", type=int, default=0)
-    parser.add_argument("--stage2_kfold", type=int, default=0, choices=[0, 1])
     parser.add_argument("--embed_excitation_dim", type=int, default=4)
     parser.add_argument("--embed_channel_dim", type=int, default=12)
-    parser.add_argument("--epochs_s1", type=int, default=2000)
-    parser.add_argument("--epochs_s2", type=int, default=1000)
-    parser.add_argument("--batch_sim", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch_real", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch", type=int, default=4)
@@ -149,18 +146,13 @@ def main():
     _ddp_setup()
     _enable_fast_cuda(args)
 
-    sim_dataset_path = base_dir / "sim_dataset.txt"
-    sim_rows = read_variable_txt(sim_dataset_path)
     real_rows = read_variable_txt(real_dataset_path)
-    sim_parsed, sim_stats = parse_rows_to_struct(sim_rows)
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
     cfg = Config()
     cfg.embed_excitation_dim = args.embed_excitation_dim
     cfg.embed_channel_dim = args.embed_channel_dim
-    cfg.epochs_stage1 = args.epochs_s1
-    cfg.epochs_stage2 = args.epochs_s2
-    cfg.batch_sim = args.batch_sim
+    cfg.epochs_stage1 = args.epochs
     cfg.batch_real = args.batch_real
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
@@ -168,16 +160,15 @@ def main():
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
     cfg.K_max = 3
-    cfg.embed_channel_num = max(sim_stats["channel_num"], real_stats["channel_num"])
-    cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
+    cfg.embed_channel_num = real_stats["channel_num"]
+    cfg.embed_excitation_num = real_stats["excitation_num"]
 
-    num_folds = args.kfold if (bool(args.stage2_kfold) or cfg.val_split_strategy == "height_mach_kfold") else 1
-    setattr(args, "stage1_once", 1)
+    num_folds = args.kfold if (cfg.val_split_strategy == "height_mach_kfold" and args.kfold > 1) else 1
 
     for fold in range(num_folds):
         if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             print(f"========== Fold {fold + 1}/{num_folds} ==========", flush=True)
-        train_one_fold(fold, cfg, sim_parsed, real_parsed, args)
+        train_one_fold(fold, cfg, real_parsed, args)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

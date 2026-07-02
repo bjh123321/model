@@ -386,7 +386,8 @@ def run_infer_batched(
     exc_all: np.ndarray,
     ch_all: np.ndarray,
     batch_size: int = 20000,
-    predict_output: str = "high",
+    predict_output: str = "low",
+    mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
 ):
     """
     输入：
@@ -417,8 +418,6 @@ def run_infer_batched(
             outL, outH = model_out
             out = outL if predict_output == "low" else outH
         else:
-            if predict_output != "low":
-                raise RuntimeError("Model returned a single output; use --predict_output low for this checkpoint.")
             out = model_out
 
         freq = out["freq"].detach().cpu().numpy()
@@ -445,9 +444,21 @@ def run_infer_batched(
             & np.isfinite(rho)
             & (freq > 0.0)
             & (zeta > 0.0)
-            & (zeta < 1.0)
+            & (zeta < 0.5)
             & (rho > 1e-12)
         )
+        if mode_freq_ranges is not None:
+            for local_i, ch_idx in enumerate(ch_all[s:e]):
+                ch_name = channels[int(ch_idx)] if 0 <= int(ch_idx) < len(channels) else f"C{int(ch_idx):02d}"
+                ranges = mode_freq_ranges.get(ch_name, [None, None, None])
+                for slot in range(valid_mask.shape[1]):
+                    rg = ranges[slot] if slot < len(ranges) else None
+                    if rg is None:
+                        valid_mask[local_i, slot] = False
+                        continue
+                    fmin, fmax = rg
+                    f_val = float(freq[local_i, slot])
+                    valid_mask[local_i, slot] = bool(valid_mask[local_i, slot] and (fmin <= f_val <= fmax))
 
         outs_acc["alpha"].append(alpha)
         outs_acc["omega"].append(omega)
@@ -943,9 +954,9 @@ def main():
     )
     parser.add_argument(
         "--predict_output",
-        choices=["high", "low"],
-        default="high",
-        help="Use high-fidelity or low-fidelity model output for prediction. Default: high.",
+        choices=["low"],
+        default="low",
+        help="Fixed-SF only has low-network output.",
     )
     args, _unknown = parser.parse_known_args()
 
@@ -956,7 +967,9 @@ def main():
 
     base_dir = get_exe_dir()
     user_input_path = base_dir / "user_input.dat"
-    csv_path = base_dir / "模态频率范围.csv"
+    csv_path = base_dir / "mode_freq_range.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Fixed-SF prediction requires mode frequency ranges: {csv_path}")
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     if len(lines) < 4:
@@ -1040,6 +1053,7 @@ def main():
     model.eval()
 
     in_norm = Normalizer.load(in_norm_path)
+    mode_freq_ranges = _load_channel_freq_ranges(csv_path)
     if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
         raise RuntimeError(f"Normalizer_Input.pth 应为二维 [H, M]，当前 mean={in_norm.mean}, std={in_norm.std}")
 
@@ -1080,6 +1094,7 @@ def main():
             H_all=H_all, M_all=M_all, exc_all=exc_all, ch_all=ch_all,
             batch_size=4096,
             predict_output=args.predict_output,
+            mode_freq_ranges=mode_freq_ranges,
         )
 
         # 2) 生成激励 u(t)
@@ -1107,6 +1122,7 @@ def main():
                 H_all=Hs, M_all=Ms, exc_all=excs, ch_all=chs,
                 batch_size=20000,
                 predict_output=args.predict_output,
+                mode_freq_ranges=mode_freq_ranges,
             )
             save_HF_HG_for_entry(
                 entry, H_axis, outs_hscan, csv_path,
@@ -1130,6 +1146,7 @@ def main():
                 H_all=Hs, M_all=Ms, exc_all=excs, ch_all=chs,
                 batch_size=20000,
                 predict_output=args.predict_output,
+                mode_freq_ranges=mode_freq_ranges,
             )
             save_VF_VG_for_entry(
                 entry, M_axis, outs_mscan, csv_path,

@@ -257,3 +257,100 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         len(sim_ds), len(real_tr),
         out_norm_sim, out_norm_real, in_norm_sim,
     )
+
+
+def build_single_fidelity_dataloaders(
+    real_parsed: List[ParsedRow],
+    cfg: Config,
+    kfold: int,
+    fold_idx: int,
+    device: torch.device,
+    out_dir: Path,
+):
+    use_val_split = bool(getattr(cfg, "use_val_split", False))
+    val_ratio = float(getattr(cfg, "val_ratio", 0.2))
+    seed = int(getattr(cfg, "val_seed", 42))
+    val_strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
+
+    if use_val_split:
+        if val_strategy == "height_mach_kfold":
+            real_train, real_val, real_info = _split_by_height_mach_groups(real_parsed, cfg, kfold, fold_idx, "real")
+            if is_main_process():
+                print(
+                    f"[VAL] real height_mach_kfold: val_groups={len(real_info)}, "
+                    f"train_rows={len(real_train)}, val_rows={len(real_val)}",
+                    flush=True,
+                )
+        elif val_strategy == "height_max_mach":
+            real_train, real_val, split_info = _split_real_by_height_max_mach(real_parsed, cfg)
+            if is_main_process():
+                detail = ", ".join(f"H={h:g}, maxM={m:g}, val_rows={n}" for h, m, n in split_info)
+                print(
+                    f"[VAL] real split by height max Mach: {detail}; "
+                    f"train_rows={len(real_train)}, val_rows={len(real_val)}",
+                    flush=True,
+                )
+        elif kfold > 1 and len(real_parsed) > 1:
+            kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
+            indices = list(range(len(real_parsed)))
+            train_idx, val_idx = list(kf.split(indices))[fold_idx]
+            real_train = [real_parsed[i] for i in train_idx]
+            real_val = [real_parsed[i] for i in val_idx]
+        elif (0.0 < val_ratio < 1.0) and (len(real_parsed) > 1):
+            rng = np.random.default_rng(seed + 1000)
+            idx = np.arange(len(real_parsed))
+            rng.shuffle(idx)
+            n_val = max(1, int(round(len(real_parsed) * val_ratio)))
+            real_train = [real_parsed[i] for i in idx[n_val:]]
+            real_val = [real_parsed[i] for i in idx[:n_val]]
+        else:
+            real_train = real_parsed
+            real_val = []
+    else:
+        real_train = real_parsed
+        real_val = []
+
+    in_norm_real = compute_input_normalizer_sim(real_train)
+    out_norm_real = compute_output_normalizer_masked(real_train, residue_target="fixed")
+    if is_main_process():
+        in_norm_real.save(out_dir / "Normalizer_Input_Real.pth")
+        out_norm_real.save(out_dir / f"Normalizer_Output_Real_Fold{fold_idx}.pth")
+
+    real_tr = ModalDataset(real_train, cfg.K_max, in_norm_real, out_norm_real)
+    real_va = ModalDataset(real_val, cfg.K_max, in_norm_real, out_norm_real)
+
+    if _ddp_ready():
+        real_sampler = DistributedSampler(real_tr, shuffle=True, drop_last=True) if len(real_tr) > 0 else None
+        val_sampler = DistributedSampler(real_va, shuffle=False, drop_last=False) if len(real_va) > 0 else None
+    else:
+        real_sampler = None
+        val_sampler = None
+
+    _pin = bool(torch.cuda.is_available())
+    _nw = int(cfg.num_workers)
+    _dl_kwargs = dict(
+        num_workers=_nw,
+        pin_memory=_pin,
+        collate_fn=collate_modal,
+    )
+    if _nw > 0:
+        _dl_kwargs.update(dict(
+            prefetch_factor=int(cfg.prefetch),
+            persistent_workers=True,
+        ))
+
+    train_dl = DataLoader(
+        real_tr,
+        batch_size=cfg.batch_real,
+        shuffle=(real_sampler is None),
+        sampler=real_sampler,
+        **_dl_kwargs,
+    )
+    val_dl = DataLoader(
+        real_va,
+        batch_size=cfg.batch_real,
+        shuffle=False,
+        sampler=val_sampler,
+        **_dl_kwargs,
+    )
+    return train_dl, val_dl, len(real_tr), len(real_va), out_norm_real, in_norm_real

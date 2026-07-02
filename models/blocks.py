@@ -85,49 +85,6 @@ class LowFidelityHead(nn.Module):
         }
 
 
-class LinearHFHead(nn.Module):
-    def __init__(self, K_max: int):
-        super().__init__()
-        self.K_max = int(K_max)
-        self.aff = nn.Linear(SLOT_PARAM_COUNT, SLOT_PARAM_COUNT)
-        nn.init.eye_(self.aff.weight)
-        nn.init.zeros_(self.aff.bias)
-        self.state_corrector = nn.Sequential(
-            nn.Linear(2 + SLOT_PARAM_COUNT, 32),
-            nn.GELU(),
-            nn.Linear(32, SLOT_PARAM_COUNT),
-        )
-        self.correction_scale = nn.Parameter(torch.tensor(0.1))
-
-    def forward(self, u_freq, u_damping, u_residue_re, u_residue_im, Hn=None, Mn=None):
-        U = torch.stack([u_freq, u_damping, u_residue_re, u_residue_im], dim=-1)
-        out = self.aff(U)
-        if Hn is not None and Mn is not None:
-            B, K, _ = U.shape
-            hm = torch.cat([Hn, Mn], dim=1).unsqueeze(1).expand(B, K, 2)
-            corr = self.state_corrector(torch.cat([hm, U], dim=-1))
-            out = out + torch.tanh(self.correction_scale) * corr
-        return self._split_tuple(out)
-
-    @staticmethod
-    def _split_tuple(out):
-        return out[..., 0], out[..., 1], out[..., 2], out[..., 3]
-
-
-class AdaptationHead(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.cfg = cfg
-        in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim + SLOT_PARAM_COUNT
-        self.mlp = MLP([in_dim] + list(cfg.adapt_hidden) + [cfg.K_max * SLOT_PARAM_COUNT], dropout=cfg.dropout_prob)
-
-    def forward(self, Hn, Mn, exc_emb, ch_emb, uL_freq, uL_damping, uL_residue_re, uL_residue_im):
-        low_pool = torch.stack([uL_freq, uL_damping, uL_residue_re, uL_residue_im], dim=-1).mean(dim=1)
-        x = torch.cat([Hn, Mn, exc_emb, ch_emb, low_pool], dim=1)
-        out = self.mlp(x).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
-        return out[..., 0], out[..., 1], out[..., 2], out[..., 3]
-
-
 class ParamFixed(nn.Module):
     def __init__(self, K_max: int):
         super().__init__()
@@ -158,52 +115,55 @@ class MFDNN(nn.Module):
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_ch = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
         self.low = LowFidelityHead(cfg)
-        self.lin = LinearHFHead(cfg.K_max)
-        self.adaptation = AdaptationHead(cfg)
         self.param = ParamFixed(cfg.K_max)
         self.register_buffer("online_gain", torch.ones(1, cfg.K_max, SLOT_PARAM_COUNT))
         self.register_buffer("online_bias", torch.zeros(1, cfg.K_max, SLOT_PARAM_COUNT))
+        self.enable_online_fix = False
 
     def forward_low(self, Hn, Mn, exc_id, ch_id):
         exc_emb = self.emb_exc(exc_id)
         ch_emb = self.emb_ch(ch_id)
         raw = self.low(Hn, Mn, exc_emb, ch_emb)
+        U = torch.stack(
+            [raw["u_freq"], raw["u_damping"], raw["u_residue_re"], raw["u_residue_im"]],
+            dim=-1,
+        )
+        if self.enable_online_fix:
+            U = U * self.online_gain + self.online_bias
         return self.param.to_physical(
-            raw["u_freq"],
-            raw["u_damping"],
-            raw["u_residue_re"],
-            raw["u_residue_im"],
+            U[..., 0],
+            U[..., 1],
+            U[..., 2],
+            U[..., 3],
         )
 
     def forward_high(self, Hn, Mn, exc_id, ch_id, outL):
-        exc_emb = self.emb_exc(exc_id)
-        ch_emb = self.emb_ch(ch_id)
-        lf, ld, lr, li = self.lin(
-            outL["u_freq"],
-            outL["u_damping"],
-            outL["u_residue_re"],
-            outL["u_residue_im"],
-            Hn=Hn,
-            Mn=Mn,
-        )
-        df, dd, dr, di = self.adaptation(
-            Hn,
-            Mn,
-            exc_emb,
-            ch_emb,
-            outL["u_freq"],
-            outL["u_damping"],
-            outL["u_residue_re"],
-            outL["u_residue_im"],
-        )
-        U = torch.stack([lf + df, ld + dd, lr + dr, li + di], dim=-1)
-        U = U * self.online_gain + self.online_bias
-        return self.param.to_physical(U[..., 0], U[..., 1], U[..., 2], U[..., 3])
+        raise RuntimeError("High-fidelity head is disabled in user_for_win7_fixed_sf.")
 
     def forward(self, Hn, Mn, exc_id, ch_id):
-        outL = self.forward_low(Hn, Mn, exc_id, ch_id)
-        outH = self.forward_high(Hn, Mn, exc_id, ch_id, outL)
-        return outL, outH
+        return self.forward_low(Hn, Mn, exc_id, ch_id)
+
+    @torch.no_grad()
+    def quick_fix_biasgain(self, delta_or_ab: dict):
+        if "delta" in delta_or_ab:
+            delta = delta_or_ab["delta"].to(self.online_bias.device).view_as(self.online_bias)
+            self.online_bias.copy_(delta)
+            self.online_gain.fill_(1.0)
+        elif "a" in delta_or_ab and "b" in delta_or_ab:
+            self.online_gain.copy_(delta_or_ab["a"].to(self.online_gain.device).view_as(self.online_gain))
+            self.online_bias.copy_(delta_or_ab["b"].to(self.online_bias.device).view_as(self.online_bias))
+        else:
+            raise ValueError("expect {'delta': ...} or {'a': ..., 'b': ...}")
+
+    @torch.no_grad()
+    def reset_quick_fix(self):
+        self.online_gain.fill_(1.0)
+        self.online_bias.zero_()
+        self.enable_online_fix = False
+
+    @torch.no_grad()
+    def enable_quick_fix(self, flag: bool = True):
+        self.enable_online_fix = bool(flag)
 
     def flatten_u(self, u_freq, u_damping, u_residue_re, u_residue_im, *unused) -> torch.Tensor:
         return torch.cat([u_freq, u_damping, u_residue_re, u_residue_im], dim=-1)
