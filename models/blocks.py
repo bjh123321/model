@@ -83,17 +83,25 @@ class LowFidelityHead(nn.Module):
 
 
 class ParamPolar(nn.Module):
-    def __init__(self, K_max: int):
+    def __init__(self, cfg):
         super().__init__()
-        self.K_max = int(K_max)
+        self.cfg = cfg
+        self.K_max = int(cfg.K_max)
 
     def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta):
-        alpha = -F.softplus(u_alpha)
-        omega = torch.sigmoid(u_omega)
-        rho = u_rho
-        norm = torch.sqrt(u_sin_theta.pow(2) + u_cos_theta.pow(2) + 1e-8)
-        sin_theta = u_sin_theta / norm
-        cos_theta = u_cos_theta / norm
+        if bool(getattr(self.cfg, "debug_direct_output", False)):
+            alpha = u_alpha
+            omega = u_omega
+            rho = u_rho
+            sin_theta = u_sin_theta
+            cos_theta = u_cos_theta
+        else:
+            alpha = -F.softplus(u_alpha)
+            omega = torch.sigmoid(u_omega)
+            rho = u_rho
+            norm = torch.sqrt(u_sin_theta.pow(2) + u_cos_theta.pow(2) + 1e-8)
+            sin_theta = u_sin_theta / norm
+            cos_theta = u_cos_theta / norm
         return {
             "alpha": alpha,
             "omega": omega,
@@ -115,7 +123,7 @@ class MFDNN(nn.Module):
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_ch = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
         self.low = LowFidelityHead(cfg)
-        self.param = ParamPolar(cfg.K_max)
+        self.param = ParamPolar(cfg)
         self.register_buffer("online_gain", torch.ones(1, cfg.K_max, SLOT_PARAM_COUNT))
         self.register_buffer("online_bias", torch.zeros(1, cfg.K_max, SLOT_PARAM_COUNT))
         self.enable_online_fix = False
