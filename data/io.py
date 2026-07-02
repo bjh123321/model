@@ -42,7 +42,6 @@ class ParsedRow:
     residue_re: np.ndarray
     residue_im: np.ndarray
     mask: np.ndarray
-    # Compatibility fields for older visualization/postprocess helpers.
     alpha: np.ndarray
     omega: np.ndarray
     rho: np.ndarray
@@ -64,12 +63,9 @@ def _modal_tail(r: List[float]) -> List[float]:
 
 def _safe_mode(Re: float, Im: float, mag: float, theta: float) -> Tuple[bool, tuple]:
     eps = 1e-12
-    vals = (Re, Im, mag, theta)
-    if not all(np.isfinite(v) for v in vals):
+    if not (np.isfinite(Re) and np.isfinite(Im)):
         return False, ()
-    if mag <= eps:
-        return False, ()
-    if abs(Im) <= eps:
+    if abs(float(Im)) <= eps:
         return False, ()
 
     sigma = -abs(float(Re))
@@ -77,18 +73,29 @@ def _safe_mode(Re: float, Im: float, mag: float, theta: float) -> Tuple[bool, tu
     denom = math.sqrt(sigma * sigma + omega_d * omega_d)
     if denom <= eps:
         return False, ()
+
     damping = -sigma / denom
     if not np.isfinite(damping):
         return False, ()
     damping = float(np.clip(damping, 1e-6, 0.999999))
     freq = omega_d / (2.0 * math.pi)
-    residue_re = float(mag) * math.cos(float(theta))
-    residue_im = float(mag) * math.sin(float(theta))
-    rho_log = math.log(max(float(mag), eps))
-    sin_theta = math.sin(float(theta))
-    cos_theta = math.cos(float(theta))
+
+    if np.isfinite(mag) and np.isfinite(theta):
+        mag_value = float(mag)
+        theta_value = float(theta)
+        residue_re = mag_value * math.cos(theta_value)
+        residue_im = mag_value * math.sin(theta_value)
+        rho_log = math.log(max(abs(mag_value), eps))
+        sin_theta = math.sin(theta_value)
+        cos_theta = math.cos(theta_value)
+    else:
+        residue_re = 0.0
+        residue_im = 0.0
+        rho_log = math.log(eps)
+        sin_theta = 0.0
+        cos_theta = 1.0
+
     return True, (
-        omega_d,
         freq,
         damping,
         damping * 100.0,
@@ -114,7 +121,8 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
 
     parsed: List[ParsedRow] = []
     dropped_bad = 0
-    dropped_extra = 0
+    ignored_extra = 0
+    missing_slots = 0
 
     for r in rows:
         H, M = float(r[0]), float(r[1])
@@ -122,25 +130,6 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
         ch_id = int(round(r[3]))
         tail = _modal_tail(r)
         K_all = len(tail) // 4
-
-        modes = []
-        for k in range(K_all):
-            base = 4 * k
-            ok, mode = _safe_mode(
-                float(tail[base + 0]),
-                float(tail[base + 1]),
-                float(tail[base + 2]),
-                float(tail[base + 3]),
-            )
-            if ok:
-                modes.append(mode)
-            else:
-                dropped_bad += 1
-
-        modes.sort(key=lambda item: item[0])
-        if len(modes) > FIXED_K_MAX:
-            dropped_extra += len(modes) - FIXED_K_MAX
-        modes = modes[:FIXED_K_MAX]
 
         freq = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         damping = np.zeros((FIXED_K_MAX,), dtype=np.float32)
@@ -154,9 +143,24 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
         cos_theta = np.zeros((FIXED_K_MAX,), dtype=np.float32)
         mask = np.zeros((FIXED_K_MAX,), dtype=np.float32)
 
-        for slot, mode in enumerate(modes):
+        ignored_extra += max(0, K_all - FIXED_K_MAX)
+        missing_slots += max(0, FIXED_K_MAX - K_all)
+
+        for slot in range(FIXED_K_MAX):
+            if slot >= K_all:
+                continue
+            base = 4 * slot
+            ok, mode = _safe_mode(
+                float(tail[base + 0]),
+                float(tail[base + 1]),
+                float(tail[base + 2]),
+                float(tail[base + 3]),
+            )
+            if not ok:
+                dropped_bad += 1
+                continue
+
             (
-                _sort_omega,
                 freq[slot],
                 damping[slot],
                 damping_percent[slot],
@@ -192,9 +196,11 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
         )
 
     if dropped_bad:
-        print(f"[fixed-slots] skipped {dropped_bad} invalid modal tuples while parsing.")
-    if dropped_extra:
-        print(f"[fixed-slots] truncated {dropped_extra} modal tuples beyond the first {FIXED_K_MAX} frequency slots.")
+        print(f"[fixed-slots] skipped {dropped_bad} invalid pole tuples while keeping raw slot positions.")
+    if ignored_extra:
+        print(f"[fixed-slots] ignored {ignored_extra} modal tuples beyond the first {FIXED_K_MAX} raw slots.")
+    if missing_slots:
+        print(f"[fixed-slots] filled {missing_slots} missing raw slots with zeros and mask=0.")
 
     stats = {
         "K_max": FIXED_K_MAX,
