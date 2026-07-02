@@ -158,6 +158,13 @@ def main():
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
     cfg.residue_target = "polar"
+    cfg.debug_direct_output = False
+    if args.debug_overfit_n > 0:
+        cfg.use_lora = False
+        cfg.use_modulation = False
+        cfg.weight_decay = 0.0
+        cfg.debug_direct_output = True
+        cfg.lr_low_adam = 3e-3
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
     cfg.K_max = 3
