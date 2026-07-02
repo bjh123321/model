@@ -13,16 +13,25 @@ FS_HZ = 512.0
 OMEGA_N = math.pi * FS_HZ
 
 
+def _parse_float_cell(cell: str) -> float:
+    cell = cell.strip()
+    if cell == "":
+        return float("nan")
+    return float(cell)
+
+
 def read_variable_txt(path: Path) -> List[List[float]]:
     rows: List[List[float]] = []
     with open(path, "r", encoding="utf-8") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
+        for raw in f:
+            ln = raw.rstrip("\r\n")
+            if not ln.strip() or ln.lstrip().startswith("#"):
                 continue
-            parts = ln.replace(",", " ").split()
             try:
-                row = [float(x) for x in parts]
+                if "\t" in ln:
+                    row = [_parse_float_cell(x) for x in ln.split("\t")]
+                else:
+                    row = [float(x) for x in ln.replace(",", " ").split()]
             except ValueError:
                 continue
             if len(row) >= 4:
@@ -43,7 +52,6 @@ class ParsedRow:
     sin_theta: np.ndarray
     cos_theta: np.ndarray
     mask: np.ndarray
-    # Compatibility fields for older fixed-output helpers.
     freq: np.ndarray
     damping: np.ndarray
     damping_percent: np.ndarray
@@ -220,7 +228,7 @@ def parse_rows_to_struct(rows: List[List[float]]) -> Tuple[List[ParsedRow], dict
 
 
 if __name__ == "__main__":
-    test_path = Path(__file__).parent / "sim_dataset_new.txt"
+    test_path = Path(__file__).parent / "real_dataset_oe.txt"
     test_rows = read_variable_txt(test_path)
     parsed, stats = parse_rows_to_struct(test_rows)
     print(stats)
