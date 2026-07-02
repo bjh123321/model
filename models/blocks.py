@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-SLOT_PARAM_COUNT = 4
+SLOT_PARAM_COUNT = 5
 
 
 class MLP(nn.Module):
@@ -73,38 +73,38 @@ class LowFidelityHead(nn.Module):
         if self.mod is not None:
             hm = torch.cat([Hn, Mn], dim=1)
             out = out + self.cfg.mod_gamma * self.mod(hm).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
-        return self._split(out)
-
-    @staticmethod
-    def _split(out):
         return {
-            "u_freq": out[..., 0],
-            "u_damping": out[..., 1],
-            "u_residue_re": out[..., 2],
-            "u_residue_im": out[..., 3],
+            "u_alpha": out[..., 0],
+            "u_omega": out[..., 1],
+            "u_rho": out[..., 2],
+            "u_sin_theta": out[..., 3],
+            "u_cos_theta": out[..., 4],
         }
 
 
-class ParamFixed(nn.Module):
+class ParamPolar(nn.Module):
     def __init__(self, K_max: int):
         super().__init__()
         self.K_max = int(K_max)
 
-    def to_physical(self, u_freq, u_damping, u_residue_re, u_residue_im):
-        freq = F.softplus(u_freq).clamp_min(1e-9)
-        damping_percent = torch.sigmoid(u_damping) * 100.0
-        residue_re = u_residue_re
-        residue_im = u_residue_im
+    def to_physical(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta):
+        alpha = -F.softplus(u_alpha)
+        omega = torch.sigmoid(u_omega)
+        rho = u_rho
+        norm = torch.sqrt(u_sin_theta.pow(2) + u_cos_theta.pow(2) + 1e-8)
+        sin_theta = u_sin_theta / norm
+        cos_theta = u_cos_theta / norm
         return {
-            "freq": freq,
-            "damping": damping_percent,
-            "damping_percent": damping_percent,
-            "residue_re": residue_re,
-            "residue_im": residue_im,
-            "u_freq": u_freq,
-            "u_damping": u_damping,
-            "u_residue_re": u_residue_re,
-            "u_residue_im": u_residue_im,
+            "alpha": alpha,
+            "omega": omega,
+            "rho": rho,
+            "sin_theta": sin_theta,
+            "cos_theta": cos_theta,
+            "u_alpha": u_alpha,
+            "u_omega": u_omega,
+            "u_rho": u_rho,
+            "u_sin_theta": u_sin_theta,
+            "u_cos_theta": u_cos_theta,
         }
 
 
@@ -115,7 +115,7 @@ class MFDNN(nn.Module):
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_ch = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
         self.low = LowFidelityHead(cfg)
-        self.param = ParamFixed(cfg.K_max)
+        self.param = ParamPolar(cfg.K_max)
         self.register_buffer("online_gain", torch.ones(1, cfg.K_max, SLOT_PARAM_COUNT))
         self.register_buffer("online_bias", torch.zeros(1, cfg.K_max, SLOT_PARAM_COUNT))
         self.enable_online_fix = False
@@ -125,45 +125,18 @@ class MFDNN(nn.Module):
         ch_emb = self.emb_ch(ch_id)
         raw = self.low(Hn, Mn, exc_emb, ch_emb)
         U = torch.stack(
-            [raw["u_freq"], raw["u_damping"], raw["u_residue_re"], raw["u_residue_im"]],
+            [raw["u_alpha"], raw["u_omega"], raw["u_rho"], raw["u_sin_theta"], raw["u_cos_theta"]],
             dim=-1,
         )
         if self.enable_online_fix:
             U = U * self.online_gain + self.online_bias
-        return self.param.to_physical(
-            U[..., 0],
-            U[..., 1],
-            U[..., 2],
-            U[..., 3],
-        )
+        return self.param.to_physical(U[..., 0], U[..., 1], U[..., 2], U[..., 3], U[..., 4])
 
     def forward_high(self, Hn, Mn, exc_id, ch_id, outL):
-        raise RuntimeError("High-fidelity head is disabled in user_for_win7_fixed_sf.")
+        raise RuntimeError("high head disabled")
 
     def forward(self, Hn, Mn, exc_id, ch_id):
         return self.forward_low(Hn, Mn, exc_id, ch_id)
 
-    @torch.no_grad()
-    def quick_fix_biasgain(self, delta_or_ab: dict):
-        if "delta" in delta_or_ab:
-            delta = delta_or_ab["delta"].to(self.online_bias.device).view_as(self.online_bias)
-            self.online_bias.copy_(delta)
-            self.online_gain.fill_(1.0)
-        elif "a" in delta_or_ab and "b" in delta_or_ab:
-            self.online_gain.copy_(delta_or_ab["a"].to(self.online_gain.device).view_as(self.online_gain))
-            self.online_bias.copy_(delta_or_ab["b"].to(self.online_bias.device).view_as(self.online_bias))
-        else:
-            raise ValueError("expect {'delta': ...} or {'a': ..., 'b': ...}")
-
-    @torch.no_grad()
-    def reset_quick_fix(self):
-        self.online_gain.fill_(1.0)
-        self.online_bias.zero_()
-        self.enable_online_fix = False
-
-    @torch.no_grad()
-    def enable_quick_fix(self, flag: bool = True):
-        self.enable_online_fix = bool(flag)
-
-    def flatten_u(self, u_freq, u_damping, u_residue_re, u_residue_im, *unused) -> torch.Tensor:
-        return torch.cat([u_freq, u_damping, u_residue_re, u_residue_im], dim=-1)
+    def flatten_u(self, u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta, *unused):
+        return torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)
