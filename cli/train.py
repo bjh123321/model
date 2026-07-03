@@ -161,11 +161,13 @@ def main():
     cfg.residue_target = "polar"
     cfg.debug_direct_output = False
     if args.debug_overfit_n > 0:
-        cfg.use_lora = False
-        cfg.use_modulation = False
-        cfg.weight_decay = 0.0
-        cfg.debug_direct_output = True
-        cfg.lr_low_adam = 3e-3
+        offset = int(args.debug_overfit_offset or 0)
+        real_parsed = list(real_parsed)[offset:offset + int(args.debug_overfit_n)]
+        print(f"[DEBUG-CLI] pre-sliced samples={len(real_parsed)} offset={offset}; train loop uses normal polar loss", flush=True)
+        args.debug_overfit_n = 0
+        args.debug_overfit_offset = 0
+        cfg.use_val_split = False
+        cfg.early_stop_patience_s1 = 0
         cfg.num_workers = 0
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
