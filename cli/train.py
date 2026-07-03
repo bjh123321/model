@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct, read_variable_txt
+from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.train.loops import train_one_fold
 
 
@@ -138,7 +139,20 @@ def main():
     parser.add_argument("--batch_real", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--prefetch", type=int, default=4)
-    parser.add_argument("--residue_target", type=str, default="polar", choices=["polar"])
+    parser.add_argument(
+        "--pole_target",
+        type=str,
+        default="alpha_omega",
+        choices=["alpha_omega", "freq_damping", "pole", "modal"],
+        help="alpha_omega keeps the old pole-real/imag path; freq_damping trains on converted frequency/damping.",
+    )
+    parser.add_argument(
+        "--residue_target",
+        type=str,
+        default="polar",
+        choices=["polar", "cartesian", "fixed"],
+        help="polar keeps the old log-magnitude/sin/cos path; cartesian trains on residue real/imag.",
+    )
     parser.add_argument("--val_split_strategy", type=str, default=None, choices=["height_max_mach", "height_mach_kfold", ""])
     parser.add_argument("--debug_overfit_n", type=int, default=0)
     parser.add_argument("--debug_overfit_offset", type=int, default=0)
@@ -158,12 +172,17 @@ def main():
     cfg.batch_real = args.batch_real
     cfg.num_workers = args.num_workers
     cfg.prefetch = args.prefetch
-    cfg.residue_target = "polar"
+    cfg.pole_target = canonical_pole_target(args.pole_target)
+    cfg.residue_target = canonical_residue_target(args.residue_target)
     cfg.debug_direct_output = False
     if args.debug_overfit_n > 0:
         offset = int(args.debug_overfit_offset or 0)
         real_parsed = list(real_parsed)[offset:offset + int(args.debug_overfit_n)]
-        print(f"[DEBUG-CLI] pre-sliced samples={len(real_parsed)} offset={offset}; train loop uses normal polar loss", flush=True)
+        print(
+            f"[DEBUG-CLI] pre-sliced samples={len(real_parsed)} offset={offset}; "
+            f"pole_target={cfg.pole_target}, residue_target={cfg.residue_target}",
+            flush=True,
+        )
         args.debug_overfit_n = 0
         args.debug_overfit_offset = 0
         cfg.use_val_split = False
