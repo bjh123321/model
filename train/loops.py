@@ -72,7 +72,19 @@ def _polar_loss(pred, tgt, mask, mean, std, direct_target: bool = False):
     return total, parts
 
 
-def _eval_model(model, dl, device, mean, std, direct_target: bool = False):
+def _filter_by_excitation(H, M, e, c, mask, y, excitation_ids):
+    if excitation_ids is None:
+        return H, M, e, c, mask, y
+    keep = torch.zeros_like(e, dtype=torch.bool)
+    for exc_id in excitation_ids:
+        keep |= (e == int(exc_id))
+    if not bool(keep.any().item()):
+        return None
+    y_sel = {k: v[keep] for k, v in y.items()}
+    return H[keep], M[keep], e[keep], c[keep], mask[keep], y_sel
+
+
+def _eval_model(model, dl, device, mean, std, direct_target: bool = False, eval_excitation_ids=None):
     if dl is None or len(dl.dataset) == 0:
         return None, _part_dict_zero()
     model.eval()
@@ -82,13 +94,19 @@ def _eval_model(model, dl, device, mean, std, direct_target: bool = False):
     with torch.no_grad():
         for batch in dl:
             H, M, e, c, mask, y = _to_device(batch, device)
+            filtered = _filter_by_excitation(H, M, e, c, mask, y, eval_excitation_ids)
+            if filtered is None:
+                continue
+            H, M, e, c, mask, y = filtered
             loss, parts = _polar_loss(model(H, M, e, c), y, mask, mean, std, direct_target=direct_target)
             bs = H.size(0)
             total_sum += float(loss.item()) * bs
             count += bs
             for name in PART_NAMES:
                 part_sum[name] += float(parts[name].item()) * bs
-    return total_sum / max(count, 1), _mean_parts(part_sum, count)
+    if count == 0:
+        return None, _part_dict_zero()
+    return total_sum / count, _mean_parts(part_sum, count)
 
 
 def _write_train_log(path: Path, rows):
@@ -139,6 +157,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     std = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device)
     opt = torch.optim.AdamW(model_core.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
     sched = None if debug_mode else torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=20, min_lr=1e-6)
+    val_eval_excitation_ids = None if debug_mode else (0, 1)
 
     best = float("inf")
     best_epoch = 0
@@ -152,6 +171,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
     if is_main_process():
         print(f"[Fixed-SF] train_rows={n_train}, val_rows={n_val}, target=polar", flush=True)
+        if val_eval_excitation_ids is not None:
+            print(f"[VAL] loss is computed only on validation samples with exc_id in {val_eval_excitation_ids}", flush=True)
         if sched is not None:
             print("[LR] ReduceLROnPlateau monitors train_loss: factor=0.5 patience=20 min_lr=1e-6", flush=True)
 
@@ -179,7 +200,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
         train_loss = total_sum / max(count, 1)
         train_parts = _mean_parts(part_sum, count)
-        val_loss, val_parts = _eval_model(model, val_dl, device, mean, std, direct_target=debug_mode)
+        val_loss, val_parts = _eval_model(model, val_dl, device, mean, std, direct_target=debug_mode, eval_excitation_ids=val_eval_excitation_ids)
         metric = val_loss if val_loss is not None else train_loss
         if sched is not None:
             sched.step(train_loss)
