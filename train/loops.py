@@ -49,27 +49,30 @@ def _mean_parts(sums, count):
     return {k: float(sums[k]) / den for k in PART_NAMES}
 
 
-def _polar_loss(pred, tgt, mask, mean, std):
+def _polar_loss(pred, tgt, mask, mean, std, direct_target: bool = False):
     width = min(mask.size(1), pred["alpha"].size(1), tgt["alpha"].size(1))
     w = mask[:, :width].to(dtype=pred["alpha"].dtype)
     den = w.sum().clamp_min(1.0)
-    pred_norm = {
-        "alpha": (pred["alpha"][:, :width] - mean[0]) / std[0].clamp_min(1e-8),
-        "omega": (pred["omega"][:, :width] - mean[1]) / std[1].clamp_min(1e-8),
-        "rho": (pred["rho"][:, :width] - mean[2]) / std[2].clamp_min(1e-8),
-        "sin_theta": pred["sin_theta"][:, :width],
-        "cos_theta": pred["cos_theta"][:, :width],
-    }
+    if direct_target:
+        pred_cmp = {name: pred[name][:, :width] for name in PART_NAMES}
+    else:
+        pred_cmp = {
+            "alpha": (pred["alpha"][:, :width] - mean[0]) / std[0].clamp_min(1e-8),
+            "omega": (pred["omega"][:, :width] - mean[1]) / std[1].clamp_min(1e-8),
+            "rho": (pred["rho"][:, :width] - mean[2]) / std[2].clamp_min(1e-8),
+            "sin_theta": pred["sin_theta"][:, :width],
+            "cos_theta": pred["cos_theta"][:, :width],
+        }
     total = pred["alpha"].new_tensor(0.0)
     parts = {}
     for name in PART_NAMES:
-        val = (w * (pred_norm[name] - tgt[name][:, :width]).pow(2)).sum() / den
+        val = (w * (pred_cmp[name] - tgt[name][:, :width]).pow(2)).sum() / den
         parts[name] = val
         total = total + val
     return total, parts
 
 
-def _eval_model(model, dl, device, mean, std):
+def _eval_model(model, dl, device, mean, std, direct_target: bool = False):
     if dl is None or len(dl.dataset) == 0:
         return None, _part_dict_zero()
     model.eval()
@@ -79,7 +82,7 @@ def _eval_model(model, dl, device, mean, std):
     with torch.no_grad():
         for batch in dl:
             H, M, e, c, mask, y = _to_device(batch, device)
-            loss, parts = _polar_loss(model(H, M, e, c), y, mask, mean, std)
+            loss, parts = _polar_loss(model(H, M, e, c), y, mask, mean, std, direct_target=direct_target)
             bs = H.size(0)
             total_sum += float(loss.item()) * bs
             count += bs
@@ -117,9 +120,10 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         cfg = deepcopy(cfg)
         cfg.use_val_split = False
         cfg.early_stop_patience_s1 = 0
-        real_parsed = list(real_parsed)[:debug_n]
+        offset = int(getattr(args, "debug_overfit_offset", 0) or 0)
+        real_parsed = list(real_parsed)[offset:offset + debug_n]
         if is_main_process():
-            print(f"[DEBUG] overfit samples={len(real_parsed)}", flush=True)
+            print(f"[DEBUG] overfit samples={len(real_parsed)} offset={offset} direct_label_loss=True", flush=True)
 
     device = _select_device(args)
     out_dir = Path(args.out_dir)
@@ -160,7 +164,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         for batch in train_dl:
             H, M, e, c, mask, y = _to_device(batch, device)
             opt.zero_grad(set_to_none=True)
-            loss, parts = _polar_loss(model(H, M, e, c), y, mask, mean, std)
+            loss, parts = _polar_loss(model(H, M, e, c), y, mask, mean, std, direct_target=debug_mode)
             loss.backward()
             if not debug_mode:
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=5.0)
@@ -173,7 +177,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
         train_loss = total_sum / max(count, 1)
         train_parts = _mean_parts(part_sum, count)
-        val_loss, val_parts = _eval_model(model, val_dl, device, mean, std)
+        val_loss, val_parts = _eval_model(model, val_dl, device, mean, std, direct_target=debug_mode)
         metric = val_loss if val_loss is not None else train_loss
         if sched is not None:
             sched.step(metric)
