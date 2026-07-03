@@ -141,6 +141,7 @@ def main():
     parser.add_argument("--residue_target", type=str, default="polar", choices=["polar"])
     parser.add_argument("--val_split_strategy", type=str, default=None, choices=["height_max_mach", "height_mach_kfold", ""])
     parser.add_argument("--debug_overfit_n", type=int, default=0)
+    parser.add_argument("--debug_overfit_offset", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     args, _unknown = parser.parse_known_args()
 
@@ -165,6 +166,7 @@ def main():
         cfg.weight_decay = 0.0
         cfg.debug_direct_output = True
         cfg.lr_low_adam = 3e-3
+        cfg.num_workers = 0
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
     cfg.K_max = 3
