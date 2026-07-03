@@ -1,9 +1,10 @@
 from __future__ import annotations
-from typing import List
+
 import torch
 from torch.utils.data import Dataset
+
 from surrogate_model.data.io import ParsedRow
-from surrogate_model.data.normalizer import Normalizer
+from surrogate_model.data.normalizer import Normalizer, row_target_values
 
 
 def _fixed_len_tensor(values, K_max: int) -> torch.Tensor:
@@ -28,24 +29,23 @@ def _global_stats(out_norm: Normalizer, count: int):
 
 
 def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
-    lab3 = torch.stack([
-        _fixed_len_tensor(p.alpha, K_max),
-        _fixed_len_tensor(p.omega, K_max),
-        _fixed_len_tensor(p.rho, K_max),
+    names = out_norm.target_names()
+    raw_values = row_target_values(p, out_norm.pole_target, out_norm.residue_target)
+    lab = torch.stack([
+        _fixed_len_tensor(raw_values[name], K_max)
+        for name in names
     ], dim=0)
-    mean, std = _global_stats(out_norm, lab3.size(0))
-    lab3 = (lab3 - mean[:, None]) / std[:, None]
-    s = _fixed_len_tensor(p.sin_theta, K_max).unsqueeze(0)
-    c = _fixed_len_tensor(p.cos_theta, K_max).unsqueeze(0)
-    return torch.cat([lab3, s, c], dim=0)
+    mean, std = _global_stats(out_norm, lab.size(0))
+    return (lab - mean[:, None]) / std[:, None]
 
 
 class ModalDataset(Dataset):
-    def __init__(self, parsed: List[ParsedRow], K_max: int, input_norm: Normalizer, output_norm: Normalizer):
+    def __init__(self, parsed: list[ParsedRow], K_max: int, input_norm: Normalizer, output_norm: Normalizer):
         self.parsed = parsed
         self.K_max = K_max
         self.in_norm = input_norm
         self.out_norm = output_norm
+        self.target_names = self.out_norm.target_names()
 
     def __len__(self):
         return len(self.parsed)
@@ -59,8 +59,9 @@ class ModalDataset(Dataset):
         exc_id = torch.tensor(p.exc_id, dtype=torch.long)
         ch_id = torch.tensor(p.ch_id, dtype=torch.long)
         lab_norm = build_label_tensor(p, self.K_max, self.out_norm)
+        y_dict = {name: lab_norm[i] for i, name in enumerate(self.target_names)}
         mask = _fixed_len_tensor(p.mask, self.K_max)
-        return Hn, Mn, exc_id, ch_id, mask, lab_norm
+        return Hn, Mn, exc_id, ch_id, mask, y_dict
 
 
 def collate_modal(batch):
@@ -69,12 +70,17 @@ def collate_modal(batch):
     e = torch.stack([b[2] for b in batch], dim=0)
     c = torch.stack([b[3] for b in batch], dim=0)
     m = torch.stack([b[4] for b in batch], dim=0)
-    yN = torch.stack([b[5] for b in batch], dim=0)
-    y_dict = {
-        'alpha': yN[:, 0, :],
-        'omega': yN[:, 1, :],
-        'rho': yN[:, 2, :],
-        'sin_theta': yN[:, 3, :],
-        'cos_theta': yN[:, 4, :],
-    }
+    y0 = batch[0][5]
+    if isinstance(y0, dict):
+        y_dict = {name: torch.stack([b[5][name] for b in batch], dim=0) for name in y0.keys()}
+    else:
+        # Legacy fallback for old tensors: alpha/omega/rho/sin/cos.
+        yN = torch.stack([b[5] for b in batch], dim=0)
+        y_dict = {
+            "alpha": yN[:, 0, :],
+            "omega": yN[:, 1, :],
+            "rho": yN[:, 2, :],
+            "sin_theta": yN[:, 3, :],
+            "cos_theta": yN[:, 4, :],
+        }
     return H, M, e, c, m, y_dict
