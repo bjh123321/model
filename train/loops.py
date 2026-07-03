@@ -152,6 +152,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
     if is_main_process():
         print(f"[Fixed-SF] train_rows={n_train}, val_rows={n_val}, target=polar", flush=True)
+        if sched is not None:
+            print("[LR] ReduceLROnPlateau monitors train_loss: factor=0.5 patience=20 min_lr=1e-6", flush=True)
 
     for epoch in range(int(cfg.epochs_stage1)):
         sampler = getattr(train_dl, "sampler", None)
@@ -180,7 +182,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         val_loss, val_parts = _eval_model(model, val_dl, device, mean, std, direct_target=debug_mode)
         metric = val_loss if val_loss is not None else train_loss
         if sched is not None:
-            sched.step(metric)
+            sched.step(train_loss)
         train_hist.append(train_loss)
         val_hist.append(float("nan") if val_loss is None else val_loss)
 
