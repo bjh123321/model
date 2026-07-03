@@ -37,8 +37,15 @@ class Config:
     val_mach_tol: float = 1e-6
     val_heights: List[float] = field(default_factory=lambda: [3.0, 8.23])
 
-    # Fixed-slot target: freq, damping_percent, residue_re, residue_im
-    residue_target: str = "fixed"
+    # Target representation switches:
+    # pole_target:
+    #   alpha_omega  -> 用极点实部 alpha 和归一化虚部 omega_d/(pi*fs) 训练（默认旧路径）
+    #   freq_damping -> 将极点转换为频率 Hz 和阻尼比后训练
+    # residue_target:
+    #   polar     -> 用 log(留数模长), sin(theta), cos(theta) 训练（默认旧路径）
+    #   cartesian -> 将留数转换为实部、虚部后训练
+    pole_target: str = "alpha_omega"
+    residue_target: str = "polar"
 
     epochs_stage1: int = 3000
     epochs_stage2: int = 3000
@@ -60,4 +67,3 @@ class Config:
     presence_loss_weight: float = 0.0
     cardinality_loss_weight: float = 0.0
     presence_threshold: float = 0.5
-
