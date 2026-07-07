@@ -11,10 +11,10 @@ class Config:
     embed_excitation_num: int = 6
     embed_channel_num: int = 34
     embed_excitation_dim: int = 4
-    embed_channel_dim: int = 12
+    embed_channel_dim: int = 6
 
-    low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
-    mod_hidden: List[int] = field(default_factory=lambda: [32, 64])
+    low_hidden: List[int] = field(default_factory=lambda: [32, 32])
+    mod_hidden: List[int] = field(default_factory=lambda: [16, 32])
     dropout_prob: float = 0.0
     use_lora: bool = True
     lora_rank: int = 4
