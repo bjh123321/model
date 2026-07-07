@@ -1,34 +1,33 @@
 from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import List
 
+
 @dataclass
 class Config:
+    # Fixed-SF model shape
     K_max: int = 3
     embed_excitation_num: int = 6
     embed_channel_num: int = 34
     embed_excitation_dim: int = 4
     embed_channel_dim: int = 12
 
-    # low_hidden: List[int] = field(default_factory=lambda: [32, 64, 128, 256, 512, 1024, 512, 256, 128, 64])
     low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
-    mod_hidden: List[int] = field(default_factory=lambda: [32, 64])            # 调制头
-    adapt_hidden: List[int] = field(default_factory=lambda: [64, 128, 256, 128, 64])
-    # adapt_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
-    dropout_prob: float = 0
-    mod_gamma: float = 0.2
+    mod_hidden: List[int] = field(default_factory=lambda: [32, 64])
+    dropout_prob: float = 0.0
     use_lora: bool = True
     lora_rank: int = 4
-    
-    # Training
-    batch_sim: int = 512
+    use_modulation: bool = True
+    mod_gamma: float = 0.2
+    debug_direct_output: bool = False
+
+    # Fixed-SF training
     batch_real: int = 64
     num_workers: int = 8
     prefetch: int = 4
 
-    # Train/Val split
-    # - False: 使用全部数据训练（不划分验证集），early-stop / LR-scheduler 依据训练损失（保持原逻辑）
-    # - True : 划分训练集与验证集，每个 epoch 计算验证集损失，并以其进行 early-stop / LR-scheduler
+    # Train/val split
     use_val_split: bool = True
     val_ratio: float = 0.2
     val_seed: int = 42
@@ -37,33 +36,14 @@ class Config:
     val_mach_tol: float = 1e-6
     val_heights: List[float] = field(default_factory=lambda: [3.0, 8.23])
 
-    # Target representation switches:
-    # pole_target:
-    #   alpha_omega  -> 用极点实部 alpha 和归一化虚部 omega_d/(pi*fs) 训练（默认旧路径）
-    #   freq_damping -> 将极点转换为频率 Hz 和阻尼比后训练
-    # residue_target:
-    #   polar     -> 用 log(留数模长), sin(theta), cos(theta) 训练（默认旧路径）
-    #   cartesian -> 将留数转换为实部、虚部后训练
+    # Target representation
     pole_target: str = "alpha_omega"
     residue_target: str = "polar"
 
     epochs_stage1: int = 3000
-    epochs_stage2: int = 3000
     early_stop_patience_s1: int = 500
-    early_stop_patience_s2: int = 500
     early_stop_min_delta: float = 1e-6
 
     # Optim
     lr_low_adam: float = 1e-3
-    lr_high_adam: float = 1e-3
     weight_decay: float = 5e-5
-
-    # 网络与损失
-    use_modulation: bool = True
-    use_modulation_in_high: bool = False
-    use_hungarian_loss: bool = False
-
-    # 存在头
-    presence_loss_weight: float = 0.0
-    cardinality_loss_weight: float = 0.0
-    presence_threshold: float = 0.5

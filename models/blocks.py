@@ -62,17 +62,21 @@ class LowFidelityHead(nn.Module):
 
         self.mod = None
         if getattr(cfg, "use_modulation", False):
-            self.mod = nn.Sequential(
-                nn.Linear(2, cfg.K_max * SLOT_PARAM_COUNT),
-                nn.Tanh(),
+            mod_in_dim = cfg.embed_excitation_dim + cfg.embed_channel_dim
+            self.mod = MLP(
+                [mod_in_dim] + list(cfg.mod_hidden) + [cfg.K_max * SLOT_PARAM_COUNT],
+                dropout=cfg.dropout_prob,
             )
 
     def forward(self, Hn, Mn, exc_emb, ch_emb):
         x = torch.cat([Hn, Mn, exc_emb, ch_emb], dim=1)
         out = self.mlp(x).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
         if self.mod is not None:
-            hm = torch.cat([Hn, Mn], dim=1)
-            out = out + self.cfg.mod_gamma * self.mod(hm).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
+            mod_input = torch.cat([exc_emb, ch_emb], dim=1)
+            scale = 1.0 + self.cfg.mod_gamma * torch.tanh(
+                self.mod(mod_input).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
+            )
+            out = out * scale
         return {
             "u_alpha": out[..., 0],
             "u_omega": out[..., 1],

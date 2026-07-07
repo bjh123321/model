@@ -192,9 +192,9 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         sim_sampler = real_sampler = sim_val_sampler = val_sampler = None
 
     kwargs = _loader_kwargs(cfg)
-    sim_dl = DataLoader(sim_ds, batch_size=cfg.batch_sim, shuffle=(sim_sampler is None), sampler=sim_sampler, **kwargs)
+    sim_dl = DataLoader(sim_ds, batch_size=int(getattr(cfg, "batch_sim", getattr(cfg, "batch_real", 64))), shuffle=(sim_sampler is None), sampler=sim_sampler, **kwargs)
     real_dl = DataLoader(real_tr, batch_size=cfg.batch_real, shuffle=(real_sampler is None), sampler=real_sampler, **kwargs)
-    sim_val_dl = DataLoader(sim_va, batch_size=cfg.batch_sim, shuffle=False, sampler=sim_val_sampler, **kwargs)
+    sim_val_dl = DataLoader(sim_va, batch_size=int(getattr(cfg, "batch_sim", getattr(cfg, "batch_real", 64))), shuffle=False, sampler=sim_val_sampler, **kwargs)
     val_dl = DataLoader(real_va, batch_size=cfg.batch_real, shuffle=False, sampler=val_sampler, **kwargs)
 
     return sim_dl, real_dl, sim_val_dl, val_dl, len(sim_ds), len(real_tr), out_norm_sim, out_norm_real, in_norm_sim
