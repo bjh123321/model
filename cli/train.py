@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import copy
+import csv
 import multiprocessing as mp
 import os
 import socket
@@ -117,6 +119,16 @@ def _send_finished_udp():
         sock.close()
 
 
+def _write_kfold_summary(path: Path, rows: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = ["fold", "best_metric", "final_train_loss", "final_val_loss", "model_path", "train_log_path"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fields})
+
+
 def main():
     base_dir = get_exe_dir()
     user_input_path = base_dir / "user_input.dat"
@@ -196,12 +208,39 @@ def main():
 
     num_folds = args.kfold if (cfg.val_split_strategy == "height_mach_kfold" and args.kfold > 1) else 1
 
+    model_root = Path(args.out_dir)
+    kfold_rows = []
     for fold in range(num_folds):
         if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             print(f"========== Fold {fold + 1}/{num_folds} ==========")
-        train_one_fold(fold, cfg, real_parsed, args)
+        run_args = copy.copy(args)
+        run_args.fold_index = fold
+        run_args.num_folds = num_folds
+        if num_folds > 1:
+            fold_dir = model_root / f"fold_{fold}"
+            run_args.out_dir = str(fold_dir / "checkpoints")
+            run_args.normalizer_dir = str(fold_dir)
+            run_args.model_save_path = str(fold_dir / "model_best.pth")
+            run_args.train_log_path = str(fold_dir / "train_log.csv")
+            run_args.deploy_model_save_path = str(model_root / f"{model_root.name}.pth")
+            run_args.deploy_normalizer_dir = str(model_root.parent)
+        best, train_hist, val_hist = train_one_fold(fold, cfg, real_parsed, run_args)
+        if num_folds > 1:
+            kfold_rows.append(
+                {
+                    "fold": fold,
+                    "best_metric": best,
+                    "final_train_loss": train_hist[-1] if train_hist else "",
+                    "final_val_loss": val_hist[-1] if val_hist else "",
+                    "model_path": run_args.model_save_path,
+                    "train_log_path": run_args.train_log_path,
+                }
+            )
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if num_folds > 1 and ((not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0):
+        _write_kfold_summary(model_root / "kfold_summary.csv", kfold_rows)
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

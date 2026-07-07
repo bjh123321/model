@@ -148,19 +148,32 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
     normalizer_dir.mkdir(parents=True, exist_ok=True)
     in_norm.save(normalizer_dir / "Normalizer_Input.pth")
     out_norm.save(normalizer_dir / "Normalizer_Output.pth")
-    torch.save(
-        {
-            "stage": "fixed_single_fidelity",
-            "epoch": int(epoch),
-            "best_metric": float(metric),
-            "model_state_dict": model_core.state_dict(),
-            "pole_target": getattr(out_norm, "pole_target", "alpha_omega"),
-            "residue_target": getattr(out_norm, "residue_target", "polar"),
-            "target_names": out_norm.target_names(),
-            "K_max": int(model_core.cfg.K_max),
-        },
-        model_save_path,
-    )
+    payload = {
+        "stage": "fixed_single_fidelity",
+        "epoch": int(epoch),
+        "best_metric": float(metric),
+        "model_state_dict": model_core.state_dict(),
+        "pole_target": getattr(out_norm, "pole_target", "alpha_omega"),
+        "residue_target": getattr(out_norm, "residue_target", "polar"),
+        "target_names": out_norm.target_names(),
+        "K_max": int(model_core.cfg.K_max),
+        "fold": getattr(args, "fold_index", None),
+        "num_folds": getattr(args, "num_folds", None),
+    }
+    torch.save(payload, model_save_path)
+    deploy_model_save_path = getattr(args, "deploy_model_save_path", "")
+    if deploy_model_save_path:
+        deploy_model_save_path = Path(deploy_model_save_path)
+        if deploy_model_save_path != model_save_path:
+            deploy_model_save_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(payload, deploy_model_save_path)
+    deploy_normalizer_dir = getattr(args, "deploy_normalizer_dir", "")
+    if deploy_normalizer_dir:
+        deploy_normalizer_dir = Path(deploy_normalizer_dir)
+        if deploy_normalizer_dir != normalizer_dir:
+            deploy_normalizer_dir.mkdir(parents=True, exist_ok=True)
+            in_norm.save(deploy_normalizer_dir / "Normalizer_Input.pth")
+            out_norm.save(deploy_normalizer_dir / "Normalizer_Output.pth")
     return model_save_path, normalizer_dir
 
 
