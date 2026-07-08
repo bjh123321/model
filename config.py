@@ -15,9 +15,11 @@ class Config:
 
     low_hidden: List[int] = field(default_factory=lambda: [64, 64, 64])
     mod_hidden: List[int] = field(default_factory=lambda: [32, 64])
-    dropout_prob: float = 0.0
-    use_lora: bool = True
+    dropout_prob: float = 0.05
+    use_lora: bool = False
     lora_rank: int = 4
+    lora_alpha: float = 1.0
+    lora_dropout: float = 0.0
     use_modulation: bool = False
     mod_gamma: float = 0.2
     debug_direct_output: bool = False
@@ -47,3 +49,12 @@ class Config:
     # Optim
     lr_low_adam: float = 1e-3
     weight_decay: float = 5e-5
+
+    # LoRA incremental fine-tuning
+    incremental_epochs: int = 200
+    incremental_batch_size: int = 16
+    incremental_lr: float = 3e-5
+    incremental_weight_decay: float = 1e-4
+    incremental_beta_kd: float = 0.2
+    incremental_gamma_replay: float = 0.2
+    incremental_warmup_epochs: int = 10

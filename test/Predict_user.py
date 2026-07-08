@@ -1045,6 +1045,35 @@ def main():
     except TypeError:
         ckpt = torch.load(ckpt_path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
+    if isinstance(ckpt, dict):
+        for attr in (
+            "K_max",
+            "low_hidden",
+            "mod_hidden",
+            "dropout_prob",
+            "use_lora",
+            "lora_rank",
+            "lora_alpha",
+            "lora_dropout",
+            "use_modulation",
+            "mod_gamma",
+            "embed_excitation_num",
+            "embed_excitation_dim",
+            "embed_channel_num",
+            "embed_channel_dim",
+            "pole_target",
+            "residue_target",
+        ):
+            if attr in ckpt:
+                setattr(cfg, attr, ckpt[attr])
+    emb_exc = state.get("emb_exc.weight") if isinstance(state, dict) else None
+    emb_ch = state.get("emb_ch.weight") if isinstance(state, dict) else None
+    if isinstance(emb_exc, torch.Tensor):
+        cfg.embed_excitation_num = int(emb_exc.shape[0])
+        cfg.embed_excitation_dim = int(emb_exc.shape[1])
+    if isinstance(emb_ch, torch.Tensor):
+        cfg.embed_channel_num = int(emb_ch.shape[0])
+        cfg.embed_channel_dim = int(emb_ch.shape[1])
 
     model = MFDNN(cfg).to(device)
     missing, unexpected = model.load_state_dict(state, strict=False)

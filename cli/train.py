@@ -19,6 +19,17 @@ from surrogate_model.data.normalizer import canonical_pole_target, canonical_res
 from surrogate_model.train.loops import train_one_fold
 
 
+def _parse_int_list(raw: str) -> list[int]:
+    values = []
+    for part in str(raw).replace(";", ",").split(","):
+        part = part.strip()
+        if part:
+            values.append(int(part))
+    if not values:
+        raise argparse.ArgumentTypeError("expected comma-separated integers")
+    return values
+
+
 def get_exe_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -145,23 +156,31 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out_dir", type=str, default=str(model_dir / model_version))
     parser.add_argument("--kfold", type=int, default=0)
-    parser.add_argument("--embed_excitation_dim", type=int, default=4)
-    parser.add_argument("--embed_channel_dim", type=int, default=6)
-    parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch_real", type=int, default=64)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--prefetch", type=int, default=4)
+    parser.add_argument("--embed_excitation_dim", type=int, default=None)
+    parser.add_argument("--embed_channel_dim", type=int, default=None)
+    parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
+    parser.add_argument("--mod_hidden", type=_parse_int_list, default=None)
+    parser.add_argument("--dropout_prob", type=float, default=None)
+    parser.add_argument("--mod_gamma", type=float, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--early_stop_patience", type=int, default=None)
+    parser.add_argument("--early_stop_min_delta", type=float, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_real", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--prefetch", type=int, default=None)
     parser.add_argument(
         "--pole_target",
         type=str,
-        default="alpha_omega",
+        default=None,
         choices=["alpha_omega", "freq_damping", "pole", "modal"],
         help="alpha_omega keeps the old pole-real/imag path; freq_damping trains on converted frequency/damping.",
     )
     parser.add_argument(
         "--residue_target",
         type=str,
-        default="polar",
+        default=None,
         choices=["polar", "cartesian", "fixed"],
         help="polar keeps the old log-magnitude/sin/cos path; cartesian trains on residue real/imag.",
     )
@@ -178,14 +197,39 @@ def main():
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
     cfg = Config()
-    cfg.embed_excitation_dim = args.embed_excitation_dim
-    cfg.embed_channel_dim = args.embed_channel_dim
-    cfg.epochs_stage1 = args.epochs
-    cfg.batch_real = args.batch_real
-    cfg.num_workers = args.num_workers
-    cfg.prefetch = args.prefetch
-    cfg.pole_target = canonical_pole_target(args.pole_target)
-    cfg.residue_target = canonical_residue_target(args.residue_target)
+    cfg.use_lora = False
+    if args.embed_excitation_dim is not None:
+        cfg.embed_excitation_dim = args.embed_excitation_dim
+    if args.embed_channel_dim is not None:
+        cfg.embed_channel_dim = args.embed_channel_dim
+    if args.low_hidden is not None:
+        cfg.low_hidden = list(args.low_hidden)
+    if args.mod_hidden is not None:
+        cfg.mod_hidden = list(args.mod_hidden)
+    if args.dropout_prob is not None:
+        cfg.dropout_prob = float(args.dropout_prob)
+    if args.mod_gamma is not None:
+        cfg.mod_gamma = float(args.mod_gamma)
+    if args.lr is not None:
+        cfg.lr_low_adam = float(args.lr)
+    if args.weight_decay is not None:
+        cfg.weight_decay = float(args.weight_decay)
+    if args.early_stop_patience is not None:
+        cfg.early_stop_patience_s1 = int(args.early_stop_patience)
+    if args.early_stop_min_delta is not None:
+        cfg.early_stop_min_delta = float(args.early_stop_min_delta)
+    if args.epochs is not None:
+        cfg.epochs_stage1 = int(args.epochs)
+    if args.batch_real is not None:
+        cfg.batch_real = int(args.batch_real)
+    if args.num_workers is not None:
+        cfg.num_workers = int(args.num_workers)
+    if args.prefetch is not None:
+        cfg.prefetch = int(args.prefetch)
+    if args.pole_target is not None:
+        cfg.pole_target = canonical_pole_target(args.pole_target)
+    if args.residue_target is not None:
+        cfg.residue_target = canonical_residue_target(args.residue_target)
     cfg.debug_direct_output = False
     if args.debug_overfit_n > 0:
         offset = int(args.debug_overfit_offset or 0)
