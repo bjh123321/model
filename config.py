@@ -13,12 +13,12 @@ class Config:
     embed_excitation_dim: int = 4
     embed_channel_dim: int = 6
 
-    low_hidden: List[int] = field(default_factory=lambda: [32, 64, 32])
-    mod_hidden: List[int] = field(default_factory=lambda: [16, 32])
+    low_hidden: List[int] = field(default_factory=lambda: [64, 64, 64])
+    mod_hidden: List[int] = field(default_factory=lambda: [32, 64])
     dropout_prob: float = 0.0
     use_lora: bool = True
     lora_rank: int = 4
-    use_modulation: bool = True
+    use_modulation: bool = False
     mod_gamma: float = 0.2
     debug_direct_output: bool = False
 

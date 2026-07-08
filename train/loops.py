@@ -16,6 +16,18 @@ from surrogate_model.utils.dist_utils import is_main_process
 
 
 BASE_OUTPUT_NAMES = ("alpha", "omega", "rho", "sin_theta", "cos_theta")
+EXCITATION_LOSS_SCOPES = (
+    ("all", None),
+    ("exc_FXD_FDC", (0,)),
+    ("exc_FXD_DC", (1,)),
+    ("exc_PW_FDC", (2,)),
+    ("exc_PW_DC", (3,)),
+    ("exc_JFY_FDC", (4,)),
+    ("exc_JFY_DC", (5,)),
+    ("group_FXD", (0, 1)),
+    ("group_PW", (2, 3)),
+    ("group_JFY", (4, 5)),
+)
 
 
 def _select_device(args) -> torch.device:
@@ -105,6 +117,80 @@ def _filter_by_excitation(H, M, e, c, mask, y, excitation_ids):
     return H[keep], M[keep], e[keep], c[keep], mask[keep], y_sel
 
 
+def _empty_scope_accum(target_names):
+    return {
+        scope: {"sum": 0.0, "count": 0, "parts": _part_dict_zero(target_names)}
+        for scope, _ids in EXCITATION_LOSS_SCOPES
+    }
+
+
+def _scope_keep(e: torch.Tensor, excitation_ids):
+    if excitation_ids is None:
+        return torch.ones_like(e, dtype=torch.bool)
+    keep = torch.zeros_like(e, dtype=torch.bool)
+    for exc_id in excitation_ids:
+        keep |= (e == int(exc_id))
+    return keep
+
+
+def _select_pred(pred: dict, keep: torch.Tensor):
+    return {k: v[keep] for k, v in pred.items()}
+
+
+def _accumulate_scope_losses(accum, pred, e, mask, y, mean, std, target_names, base_loss=None, base_parts=None):
+    pred_detached = {k: v.detach() for k, v in pred.items()}
+    for scope, excitation_ids in EXCITATION_LOSS_SCOPES:
+        keep = _scope_keep(e, excitation_ids)
+        if not bool(keep.any().item()):
+            continue
+        if excitation_ids is None and base_loss is not None and base_parts is not None:
+            loss = base_loss.detach()
+            parts = {k: v.detach() for k, v in base_parts.items()}
+        else:
+            y_sel = {k: v[keep] for k, v in y.items()}
+            loss, parts = _representation_loss(_select_pred(pred_detached, keep), y_sel, mask[keep], mean, std, target_names)
+        bs = int(keep.sum().item())
+        accum[scope]["sum"] += float(loss.item()) * bs
+        accum[scope]["count"] += bs
+        for name in target_names:
+            accum[scope]["parts"][name] += float(parts[name].item()) * bs
+
+
+def _finalize_scope_accum(accum, target_names):
+    out = {}
+    for scope, data in accum.items():
+        count = int(data["count"])
+        if count <= 0:
+            out[scope] = None
+            continue
+        out[scope] = {
+            "loss": float(data["sum"]) / count,
+            "parts": _mean_parts(data["parts"], count, target_names),
+        }
+    return out
+
+
+def _allreduce_scope_accum(accum, device):
+    if not (dist.is_available() and dist.is_initialized()):
+        return accum
+    for data in accum.values():
+        t = torch.tensor([float(data["sum"]), float(data["count"])], device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        data["sum"] = float(t[0].item())
+        data["count"] = int(t[1].item())
+        for name, value in list(data["parts"].items()):
+            p = torch.tensor(float(value), device=device)
+            dist.all_reduce(p, op=dist.ReduceOp.SUM)
+            data["parts"][name] = float(p.item())
+    return accum
+
+
+def _add_scope_fields(row: dict, prefix: str, scope_losses: dict):
+    for scope, _ids in EXCITATION_LOSS_SCOPES:
+        entry = scope_losses.get(scope)
+        row[f"{prefix}_{scope}"] = "" if entry is None else entry["loss"]
+
+
 def _eval_model(model, dl, device, mean, std, target_names, eval_excitation_ids=None):
     if dl is None or len(dl.dataset) == 0:
         return None, _part_dict_zero(target_names)
@@ -130,10 +216,26 @@ def _eval_model(model, dl, device, mean, std, target_names, eval_excitation_ids=
     return total_sum / count, _mean_parts(part_sum, count, target_names)
 
 
+def _eval_model_scopes(model, dl, device, mean, std, target_names):
+    accum = _empty_scope_accum(target_names)
+    if dl is None or len(dl.dataset) == 0:
+        return _finalize_scope_accum(accum, target_names)
+    model.eval()
+    with torch.no_grad():
+        for batch in dl:
+            H, M, e, c, mask, y = _to_device(batch, device)
+            pred = model(H, M, e, c)
+            loss, parts = _representation_loss(pred, y, mask, mean, std, target_names)
+            _accumulate_scope_losses(accum, pred, e, mask, y, mean, std, target_names, loss, parts)
+    return _finalize_scope_accum(_allreduce_scope_accum(accum, device), target_names)
+
+
 def _write_train_log(path: Path, rows, target_names):
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = ["epoch", "loss_train_total"] + [f"loss_train_{n}" for n in target_names]
     fields += ["loss_val_total"] + [f"loss_val_{n}" for n in target_names] + ["lr"]
+    fields += [f"loss_train_{scope}" for scope, _ids in EXCITATION_LOSS_SCOPES]
+    fields += [f"loss_val_{scope}" for scope, _ids in EXCITATION_LOSS_SCOPES]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
@@ -204,7 +306,6 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     std = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device).clamp_min(1e-8)
     opt = torch.optim.AdamW(model_core.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay)
     sched = None if debug_mode else torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=20, min_lr=1e-6)
-    val_eval_excitation_ids = None if debug_mode else (0, 1)
 
     best = float("inf")
     best_epoch = 0
@@ -222,8 +323,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             f"pole_target={out_norm.pole_target}, residue_target={out_norm.residue_target}, targets={target_names}",
             flush=True,
         )
-        if val_eval_excitation_ids is not None:
-            print(f"[VAL] loss is computed only on validation samples with exc_id in {val_eval_excitation_ids}", flush=True)
+        print("[VAL] loss is reported for all excitations, each excitation, and FXD/PW/JFY groups.", flush=True)
         if sched is not None:
             print("[LR] ReduceLROnPlateau monitors train_loss: factor=0.5 patience=20 min_lr=1e-6", flush=True)
 
@@ -235,10 +335,13 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         total_sum = 0.0
         count = 0
         part_sum = _part_dict_zero(target_names)
+        train_scope_accum = _empty_scope_accum(target_names)
         for batch in train_dl:
             H, M, e, c, mask, y = _to_device(batch, device)
             opt.zero_grad(set_to_none=True)
-            loss, parts = _representation_loss(model(H, M, e, c), y, mask, mean, std, target_names)
+            pred = model(H, M, e, c)
+            loss, parts = _representation_loss(pred, y, mask, mean, std, target_names)
+            _accumulate_scope_losses(train_scope_accum, pred, e, mask, y, mean, std, target_names, loss, parts)
             loss.backward()
             if not debug_mode:
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=5.0)
@@ -251,7 +354,11 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
         train_loss = total_sum / max(count, 1)
         train_parts = _mean_parts(part_sum, count, target_names)
-        val_loss, val_parts = _eval_model(model, val_dl, device, mean, std, target_names, eval_excitation_ids=val_eval_excitation_ids)
+        train_scope_losses = _finalize_scope_accum(_allreduce_scope_accum(train_scope_accum, device), target_names)
+        val_scope_losses = _eval_model_scopes(model, val_dl, device, mean, std, target_names)
+        val_all = val_scope_losses.get("all")
+        val_loss = None if val_all is None else val_all["loss"]
+        val_parts = _part_dict_zero(target_names) if val_all is None else val_all["parts"]
         metric = val_loss if val_loss is not None else train_loss
         if sched is not None:
             sched.step(train_loss)
@@ -262,6 +369,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         for name in target_names:
             row[f"loss_train_{name}"] = train_parts[name]
             row[f"loss_val_{name}"] = "" if val_loss is None else val_parts[name]
+        _add_scope_fields(row, "loss_train", train_scope_losses)
+        _add_scope_fields(row, "loss_val", val_scope_losses)
         logs.append(row)
 
         if metric < best - min_delta:
