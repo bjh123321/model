@@ -146,7 +146,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default=str(model_dir / model_version))
     parser.add_argument("--kfold", type=int, default=0)
     parser.add_argument("--embed_excitation_dim", type=int, default=4)
-    parser.add_argument("--embed_channel_dim", type=int, default=12)
+    parser.add_argument("--embed_channel_dim", type=int, default=6)
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--batch_real", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
