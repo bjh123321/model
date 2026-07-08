@@ -175,6 +175,7 @@ def main():
             str(cfg["low_hidden"]),
             "--mod_hidden",
             str(cfg["mod_hidden"]),
+            "--use_modulation",
             "--mod_gamma",
             str(cfg["mod_gamma"]),
             "--dropout_prob",

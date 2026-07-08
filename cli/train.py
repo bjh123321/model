@@ -160,6 +160,7 @@ def main():
     parser.add_argument("--embed_channel_dim", type=int, default=None)
     parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
     parser.add_argument("--mod_hidden", type=_parse_int_list, default=None)
+    parser.add_argument("--use_modulation", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dropout_prob", type=float, default=None)
     parser.add_argument("--mod_gamma", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -206,6 +207,8 @@ def main():
         cfg.low_hidden = list(args.low_hidden)
     if args.mod_hidden is not None:
         cfg.mod_hidden = list(args.mod_hidden)
+    if args.use_modulation is not None:
+        cfg.use_modulation = bool(args.use_modulation)
     if args.dropout_prob is not None:
         cfg.dropout_prob = float(args.dropout_prob)
     if args.mod_gamma is not None:

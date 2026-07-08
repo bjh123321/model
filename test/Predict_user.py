@@ -420,31 +420,33 @@ def run_infer_batched(
         else:
             out = model_out
 
-        freq = out["freq"].detach().cpu().numpy()
-        damping_percent = out["damping"].detach().cpu().numpy()
-        residue_re = out["residue_re"].detach().cpu().numpy()
-        residue_im = out["residue_im"].detach().cpu().numpy()
+        alpha = out["alpha"].detach().cpu().numpy()
+        omega_norm = out["omega"].detach().cpu().numpy()
+        rho_log = out["rho"].detach().cpu().numpy()
+        sin_t = out["sin_theta"].detach().cpu().numpy()
+        cos_t = out["cos_theta"].detach().cpu().numpy()
 
-        freq = np.nan_to_num(freq, nan=0.0, posinf=0.0, neginf=0.0)
-        zeta = np.clip(
-            np.nan_to_num(damping_percent / 100.0, nan=0.0, posinf=0.999, neginf=0.0),
-            1e-6,
-            0.999,
-        )
-        omega = np.maximum(freq, 0.0) * (2.0 * np.pi)
-        omega_n = omega / np.sqrt(np.maximum(1.0 - zeta * zeta, 1e-8))
-        alpha = -zeta * omega_n
-        rho = np.sqrt(np.maximum(residue_re * residue_re + residue_im * residue_im, 0.0))
-        safe_rho = np.maximum(rho, 1e-12)
-        sin_t = residue_im / safe_rho
-        cos_t = residue_re / safe_rho
+        alpha = np.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+        omega = np.nan_to_num(omega_norm * float(omegaN), nan=0.0, posinf=0.0, neginf=0.0)
+        freq = omega / (2.0 * np.pi)
+        damping = -alpha / np.sqrt(np.maximum(alpha * alpha + omega * omega, 1e-12))
+        damping = np.nan_to_num(damping, nan=0.0, posinf=0.999, neginf=0.0)
+        rho = np.exp(np.clip(np.nan_to_num(rho_log, nan=-80.0, posinf=80.0, neginf=-80.0), -80.0, 80.0))
+        sin_t = np.nan_to_num(sin_t, nan=0.0, posinf=0.0, neginf=0.0)
+        cos_t = np.nan_to_num(cos_t, nan=0.0, posinf=0.0, neginf=0.0)
+        residue_re = rho * cos_t
+        residue_im = rho * sin_t
         valid_mask = (
             np.isfinite(alpha)
             & np.isfinite(omega)
             & np.isfinite(rho)
+            & np.isfinite(sin_t)
+            & np.isfinite(cos_t)
+            & np.isfinite(residue_re)
+            & np.isfinite(residue_im)
             & (freq > 0.0)
-            & (zeta > 0.0)
-            & (zeta < 0.5)
+            & (damping > 0.0)
+            & (damping < 0.5)
             & (rho > 1e-12)
         )
         if mode_freq_ranges is not None:
