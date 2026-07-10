@@ -58,6 +58,49 @@ def _split_real_by_height_max_mach(real_parsed: List[ParsedRow], cfg: Config):
     return real_train, real_val, split_info
 
 
+def _split_real_by_height_mach_points(real_parsed: List[ParsedRow], cfg: Config):
+    raw_points = list(getattr(cfg, "val_height_mach_points", []))
+    if not raw_points:
+        raise RuntimeError(
+            'val_split_strategy="height_mach_points" requires non-empty '
+            "Config.val_height_mach_points, for example [(3.0, 0.7), (8.23, 0.85)]."
+        )
+
+    points = []
+    for point in raw_points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError(f"Each validation operating point must be (H, M), got {point!r}")
+        points.append((float(point[0]), float(point[1])))
+
+    h_tol = float(getattr(cfg, "val_height_tol", 1e-6))
+    m_tol = float(getattr(cfg, "val_mach_tol", 1e-6))
+    val_indices = set()
+    split_info = []
+    available_points = sorted({(float(p.H), float(p.M)) for p in real_parsed})
+
+    for target_h, target_m in points:
+        hm_indices = [
+            i
+            for i, p in enumerate(real_parsed)
+            if abs(float(p.H) - target_h) <= h_tol and abs(float(p.M) - target_m) <= m_tol
+        ]
+        if not hm_indices:
+            raise RuntimeError(
+                f"No real samples found for validation point H={target_h:g}, M={target_m:g}. "
+                f"Available (H, M) points: {available_points}"
+            )
+        val_indices.update(hm_indices)
+        split_info.append((target_h, target_m, len(hm_indices)))
+
+    real_train = [p for i, p in enumerate(real_parsed) if i not in val_indices]
+    real_val = [p for i, p in enumerate(real_parsed) if i in val_indices]
+    if not real_train:
+        raise RuntimeError("Validation operating points consumed all real samples; no real training data remains.")
+    if not real_val:
+        raise RuntimeError("Specified validation operating points produced no real validation samples.")
+    return real_train, real_val, split_info
+
+
 def _hm_key(p: ParsedRow, h_tol: float, m_tol: float):
     h = round(float(p.H) / h_tol) if h_tol > 0 else float(p.H)
     m = round(float(p.M) / m_tol) if m_tol > 0 else float(p.M)
@@ -127,13 +170,14 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     seed = int(getattr(cfg, "val_seed", 42))
     val_strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
     use_height_max_mach_val = use_val_split and val_strategy == "height_max_mach"
+    use_height_mach_points_val = use_val_split and val_strategy == "height_mach_points"
     use_height_mach_kfold = use_val_split and val_strategy == "height_mach_kfold"
 
     if use_height_mach_kfold:
         sim_train, sim_val, sim_info = _split_by_height_mach_groups(sim_parsed, cfg, kfold, fold_idx, "sim")
         if is_main_process():
             print(f"[VAL] sim height_mach_kfold: val_groups={len(sim_info)}, train_rows={len(sim_train)}, val_rows={len(sim_val)}", flush=True)
-    elif (not use_height_max_mach_val) and use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
+    elif (not use_height_max_mach_val) and (not use_height_mach_points_val) and use_val_split and (0.0 < val_ratio < 1.0) and (len(sim_parsed) > 1):
         rng = np.random.default_rng(seed)
         idx = np.arange(len(sim_parsed))
         rng.shuffle(idx)
@@ -154,6 +198,11 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
             if is_main_process():
                 detail = ", ".join(f"H={h:g}, maxM={m:g}, val_rows={n}" for h, m, n in split_info)
                 print(f"[VAL] real split by height max Mach: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
+        elif use_height_mach_points_val:
+            real_train, real_val, split_info = _split_real_by_height_mach_points(real_parsed, cfg)
+            if is_main_process():
+                detail = ", ".join(f"H={h:g}, M={m:g}, val_rows={n}" for h, m, n in split_info)
+                print(f"[VAL] real split by specified height-Mach points: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
         elif kfold > 1 and len(real_parsed) > 1:
             kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
             indices = list(range(len(real_parsed)))
@@ -223,6 +272,11 @@ def build_single_fidelity_dataloaders(
             if is_main_process():
                 detail = ", ".join(f"H={h:g}, maxM={m:g}, val_rows={n}" for h, m, n in split_info)
                 print(f"[VAL] real split by height max Mach: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
+        elif val_strategy == "height_mach_points":
+            real_train, real_val, split_info = _split_real_by_height_mach_points(real_parsed, cfg)
+            if is_main_process():
+                detail = ", ".join(f"H={h:g}, M={m:g}, val_rows={n}" for h, m, n in split_info)
+                print(f"[VAL] real split by specified height-Mach points: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
         elif kfold > 1 and len(real_parsed) > 1:
             kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
             indices = list(range(len(real_parsed)))

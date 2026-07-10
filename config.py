@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 
 @dataclass
@@ -33,10 +33,21 @@ class Config:
     use_val_split: bool = True
     val_ratio: float = 0.2
     val_seed: int = 42
-    val_split_strategy: str = "height_max_mach"
+    val_split_strategy: str = "height_mach_points" # val_height_mach_points中高度、马赫数点作验证集
+    # val_split_strategy: str = "height_max_mach"   # val_heights中高度的最高马赫数作验证集
     val_height_tol: float = 1e-6
     val_mach_tol: float = 1e-6
     val_heights: List[float] = field(default_factory=lambda: [3.0, 8.23])
+    # Used when val_split_strategy="height_mach_points", e.g. [(3.0, 0.7), (8.23, 0.85)].
+    val_height_mach_points: List[Tuple[float, float]] = field(
+        default_factory=lambda:[
+            (3.0, 0.98),
+            (5.5, 1.05),
+            (5.5, 1.17),
+            (5.5, 1.3),
+            (8.23, 1.7)
+        ]
+    )
 
     # Target representation
     pole_target: str = "alpha_omega"

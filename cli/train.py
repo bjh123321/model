@@ -185,7 +185,12 @@ def main():
         choices=["polar", "cartesian", "fixed"],
         help="polar keeps the old log-magnitude/sin/cos path; cartesian trains on residue real/imag.",
     )
-    parser.add_argument("--val_split_strategy", type=str, default=None, choices=["height_max_mach", "height_mach_kfold", ""])
+    parser.add_argument(
+        "--val_split_strategy",
+        type=str,
+        default=None,
+        choices=["height_max_mach", "height_mach_points", "height_mach_kfold", ""],
+    )
     parser.add_argument("--debug_overfit_n", type=int, default=0)
     parser.add_argument("--debug_overfit_offset", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
