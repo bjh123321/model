@@ -8,20 +8,20 @@ from typing import List
 class Config:
     # Fixed-SF model shape
     K_max: int = 3
-    embed_excitation_num: int = 6
+    embed_excitation_num: int = 2
     embed_channel_num: int = 34
     embed_excitation_dim: int = 4
-    embed_channel_dim: int = 6
+    embed_channel_dim: int = 8
 
-    low_hidden: List[int] = field(default_factory=lambda: [64, 64, 64])
+    low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     mod_hidden: List[int] = field(default_factory=lambda: [32, 64])
-    dropout_prob: float = 0.05
+    dropout_prob: float = 0
     use_lora: bool = False
     lora_rank: int = 4
     lora_alpha: float = 1.0
     lora_dropout: float = 0.0
     use_modulation: bool = False
-    mod_gamma: float = 0.2
+    mod_gamma: float = 0.4
     debug_direct_output: bool = False
 
     # Fixed-SF training
@@ -48,7 +48,7 @@ class Config:
 
     # Optim
     lr_low_adam: float = 1e-3
-    weight_decay: float = 5e-5
+    weight_decay: float = 1e-4
 
     # LoRA incremental fine-tuning
     incremental_epochs: int = 200
