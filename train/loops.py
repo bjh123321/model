@@ -336,7 +336,11 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             f"pole_target={out_norm.pole_target}, residue_target={out_norm.residue_target}, targets={target_names}",
             flush=True,
         )
-        print("[VAL] loss is reported for all excitations, each excitation, and FXD/PW/JFY groups.", flush=True)
+        print(
+            "[VAL] val/best/early-stop use group_FXD (exc_id 0 and 1); "
+            "all excitation scopes are still reported.",
+            flush=True,
+        )
         if sched is not None:
             print("[LR] ReduceLROnPlateau monitors train_loss: factor=0.5 patience=20 min_lr=1e-6", flush=True)
 
@@ -369,9 +373,9 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         train_parts = _mean_parts(part_sum, count, target_names)
         train_scope_losses = _finalize_scope_accum(_allreduce_scope_accum(train_scope_accum, device), target_names)
         val_scope_losses = _eval_model_scopes(model, val_dl, device, mean, std, target_names)
-        val_all = val_scope_losses.get("all")
-        val_loss = None if val_all is None else val_all["loss"]
-        val_parts = _part_dict_zero(target_names) if val_all is None else val_all["parts"]
+        val_group_fxd = val_scope_losses.get("group_FXD")
+        val_loss = None if val_group_fxd is None else val_group_fxd["loss"]
+        val_parts = _part_dict_zero(target_names) if val_group_fxd is None else val_group_fxd["parts"]
         metric = val_loss if val_loss is not None else train_loss
         if sched is not None:
             sched.step(train_loss)

@@ -198,7 +198,6 @@ def main():
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
     cfg = Config()
-    cfg.use_lora = False
     if args.embed_excitation_dim is not None:
         cfg.embed_excitation_dim = args.embed_excitation_dim
     if args.embed_channel_dim is not None:

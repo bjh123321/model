@@ -26,7 +26,7 @@ class MLP(nn.Module):
         for i in range(len(dims) - 2):
             linear = (
                 LoRALinear(dims[i], dims[i + 1], lora_rank, lora_alpha, lora_dropout)
-                if use_lora
+                if use_lora and i > 0
                 else nn.Linear(dims[i], dims[i + 1])
             )
             layers += [linear, nn.GELU()]
@@ -80,21 +80,18 @@ class LowFidelityHead(nn.Module):
 
         self.mod = None
         if getattr(cfg, "use_modulation", False):
-            mod_in_dim = cfg.embed_excitation_dim + cfg.embed_channel_dim
-            self.mod = MLP(
-                [mod_in_dim] + list(cfg.mod_hidden) + [cfg.K_max * SLOT_PARAM_COUNT],
-                dropout=cfg.dropout_prob,
+            self.mod = nn.Sequential(
+                nn.Linear(2, cfg.K_max * SLOT_PARAM_COUNT),
+                nn.Tanh(),
             )
 
     def forward(self, Hn, Mn, exc_emb, ch_emb):
         x = torch.cat([Hn, Mn, exc_emb, ch_emb], dim=1)
         out = self.mlp(x).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
         if self.mod is not None:
-            mod_input = torch.cat([exc_emb, ch_emb], dim=1)
-            scale = 1.0 + self.cfg.mod_gamma * torch.tanh(
-                self.mod(mod_input).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
-            )
-            out = out * scale
+            hm = torch.cat([Hn, Mn], dim=1)
+            correction = self.cfg.mod_gamma * self.mod(hm).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
+            out = out + correction
         return {
             "u_alpha": out[..., 0],
             "u_omega": out[..., 1],
