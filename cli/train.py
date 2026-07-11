@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 
 from surrogate_model.config import Config
-from surrogate_model.data.io import parse_rows_to_struct, read_variable_txt
+from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.train.loops import train_one_fold
 
@@ -199,7 +199,7 @@ def main():
     _ddp_setup()
     _enable_fast_cuda(args)
 
-    real_rows = read_variable_txt(real_dataset_path)
+    real_rows = read_real_dataset(real_dataset_path)
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
     cfg = Config()

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple, Set
+from typing import Dict, Iterable, List, Tuple, Set
 import math
 import re
+
+from surrogate_model.data.io import read_real_dataset
 
 # replay 选取参数（按 LoRA 微调的局部 replay 思路给的默认值）
 PRIMARY_H_THR = 1.5   # km
@@ -121,12 +123,29 @@ def load_real_dataset_groups(real_dataset_file: Path) -> Dict[Tuple[float, float
     return groups
 
 
+def load_replay_dataset_groups(dataset_path: Path) -> Dict[Tuple[float, float, int], List[str]]:
+    """Load replay groups from either a legacy txt file or a split-dataset directory."""
+    groups: Dict[Tuple[float, float, int], List[str]] = {}
+    for row in read_real_dataset(Path(dataset_path)):
+        H = float(row[0])
+        M = float(row[1])
+        excite_id = int(round(float(row[2])))
+        line = "\t".join(f"{float(value):.17g}" for value in row) + "\n"
+        groups.setdefault((H, M, excite_id), []).append(line)
+    return groups
+
+
 def normalized_distance(h: float, m: float, h0: float, m0: float,
                         h_scale: float = PRIMARY_H_THR,
                         m_scale: float = PRIMARY_M_THR) -> float:
     dh = (h - h0) / h_scale
     dm = (m - m0) / m_scale
     return math.sqrt(dh * dh + dm * dm)
+
+
+def _same_filename_operating_point(h: float, m: float, h0: float, m0: float) -> bool:
+    """Compare H/M by the rounded Hxxxx/Mxxx filename codes used by split datasets."""
+    return int(round(h * 100.0)) == int(round(h0 * 100.0)) and int(round(m * 100.0)) == int(round(m0 * 100.0))
 
 
 def pick_replay_groups_for_target(
@@ -169,7 +188,7 @@ def pick_replay_groups_for_target(
     # 若 real_dataset 中恰好包含与新样本同一 H/M/excite_id 的历史行，排除掉“完全同点”可避免重复强化
     filtered = [
         k for k in use_pool
-        if not (abs(k[0] - target_H) < 1e-12 and abs(k[1] - target_M) < 1e-12 and k[2] == target_excite_id)
+        if not (_same_filename_operating_point(k[0], k[1], target_H, target_M) and k[2] == target_excite_id)
     ]
     if len(filtered) >= 1:
         use_pool = filtered
@@ -177,17 +196,35 @@ def pick_replay_groups_for_target(
     return use_pool[:MAX_GROUPS_PER_SELECTED]
 
 
-def build_replay_data(base_dir: Path, model_dir: Path | None = None) -> None:
+def _targets_from_names(names: Iterable[str]) -> List[Tuple[str, float, float, str, int]]:
+    targets: List[Tuple[str, float, float, str, int]] = []
+    seen: Set[str] = set()
+    for raw_name in names:
+        name = Path(raw_name).name.strip()
+        if not name or name in seen:
+            continue
+        H, M, excite_key, excite_id = parse_selected_filename(name)
+        targets.append((name, H, M, excite_key, excite_id))
+        seen.add(name)
+    return targets
+
+
+def build_replay_data(
+    base_dir: Path,
+    model_dir: Path | None = None,
+    replay_dataset_path: Path | None = None,
+    selected_names: Iterable[str] | None = None,
+) -> List[List[float]]:
     base_dir = Path(base_dir)
     selected_list_file = base_dir / "selected_CG_path.txt"
-    real_dataset_file = Path(model_dir) / "real_dataset.txt" if model_dir is not None else base_dir.parent / "GENERATION" / "real_dataset.txt"
-    replay_out_file = base_dir / "replay_data.txt"
-
-    targets = load_selected_targets(selected_list_file)
+    if replay_dataset_path is None:
+        replay_dataset_path = Path(model_dir) / "real_dataset.txt" if model_dir is not None else base_dir.parent / "GENERATION" / "real_dataset.txt"
+    replay_dataset_path = Path(replay_dataset_path)
+    targets = load_selected_targets(selected_list_file) if selected_names is None else _targets_from_names(selected_names)
     if not targets:
         raise RuntimeError("selected_CG_path.txt 中没有可用文件名")
 
-    groups = load_real_dataset_groups(real_dataset_file)
+    groups = load_replay_dataset_groups(replay_dataset_path)
     if not groups:
         raise RuntimeError("real_dataset.txt 中没有可用数据组")
 
@@ -215,15 +252,22 @@ def build_replay_data(base_dir: Path, model_dir: Path | None = None) -> None:
     if not chosen_group_keys:
         raise RuntimeError("最终没有选中任何 replay 数据组")
 
-    replay_out_file.parent.mkdir(parents=True, exist_ok=True)
-    n_lines = 0
-    with open(replay_out_file, "w", encoding="utf-8") as f:
-        for key in chosen_group_keys:
-            for line in groups[key]:
-                f.write(line)
-                n_lines += 1
+    replay_rows: List[List[float]] = []
+    print(f"[REPLAY-USED] groups={len(chosen_group_keys)}")
+    for index, key in enumerate(chosen_group_keys, start=1):
+        group_lines = groups[key]
+        print(
+            f"    [{index}] H={key[0]:.6g}, M={key[1]:.6g}, "
+            f"excite_id={key[2]}, rows={len(group_lines)}"
+        )
+        for line in group_lines:
+            replay_rows.append([float(value) for value in line.replace(",", " ").split()])
 
-    print(f"[DONE] 共写出 replay 状态点组 {len(chosen_group_keys)} 个, 行数 {n_lines} -> {replay_out_file}")
+    print(
+        f"[DONE] replay kept in memory: groups={len(chosen_group_keys)}, "
+        f"rows={len(replay_rows)}; no replay_data.txt written"
+    )
+    return replay_rows
 
 
 def main():

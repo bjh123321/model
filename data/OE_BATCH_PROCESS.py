@@ -1,53 +1,58 @@
-# OE_BATCH_PROCESS.py
+"""Batch OE modal extraction with the standalone app-equivalent kernel."""
+
 from __future__ import annotations
 
+import json
 import re
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.signal import find_peaks
 
-from surrogate_model.data.envelop import compute_spectrum, envelope_rms_tv
-from surrogate_model.data.OE import OEModel
-
-
-# =========================
-# 固定配置（按你确认的默认）
-# =========================
-FS = 512
-MAX_MODES = 6
-
-# 峰检测（沿用你 OE_PROCESS.py 的默认风格）
-F_MAX_HZ = 60.0
-MATCH_HALF_WIDTH_HZ = 2.0          # 峰 ↔ OE 频率匹配窗 ±2 Hz
-PROM_SCALE = 0.01                  # prom = 0.01*(P95-P5)
-MIN_WIDTH_HZ = 1.0
-MIN_DIST_HZ = 3.0
-
-# OE参数
-OE_KWARGS = dict(
-    na=30, nb=30, nk=0,
-    max_nfev=50,
-    init_method="arx",
-    rpm_khat=75,
-    demean=False,
+from surrogate_model.data.OE import (
+    DEFAULT_MODAL_BANDS,
+    DEFAULT_MODAL_TOLERANCES,
+    DEFAULT_PEAK_PARAMS,
+    DEFAULT_POLE_FILTER_PARAMS,
+    amplitude_spectrum,
+    fit_oe_modal,
+    marker_slots_from_bands,
+    match_modes_to_marker_frequencies,
+    robust_spectrum_peaks,
 )
 
-# 激励方式编码（按你给的映射）
-EXCITATION_ID = {
-    "FXD_同": 0,
-    "FXD_反": 1,
-    "PW_同": 2,
-    "PW_反": 3,
-    "JFY_同": 4,
-    "JFY_反": 5,
+
+FS = 512
+MAX_MODES = 6
+INPUT_SIGNAL_NAME = "PM_O1"
+
+OE_KWARGS = {
+    "na": 30,
+    "nb": 30,
+    "nk": 0,
+    "max_nfev": 50,
+    "init_method": "arx",
+    "rpm_khat": 75,
+    "demean": False,
 }
 
-# 文件名中的英文编码 -> 程序内部激励键
+PEAK_PARAMS = dict(DEFAULT_PEAK_PARAMS)
+PEAK_PARAMS["min_prominence_db"] = 0.0
+POLE_FILTER_PARAMS = dict(DEFAULT_POLE_FILTER_PARAMS)
+MODAL_BAND_CONFIG_PATH = Path.home() / ".analyze_signal_app" / "oe_batch_mode_bands.json"
+
+EXCITATION_ID = {
+    "FXD_FDC": 0,
+    "FXD_DC": 1,
+    "PW_FDC": 2,
+    "PW_DC": 3,
+    "JFY_FDC": 4,
+    "JFY_DC": 5,
+}
+
 EXCITATION_CODE_MAP = {
     "FXD_FDC": "FXD_同",
     "FXD_DC": "FXD_反",
@@ -57,46 +62,26 @@ EXCITATION_CODE_MAP = {
     "JFY_DC": "JFY_反",
 }
 
-# 激励输入列名
-INPUT_SIGNAL_NAME = "PM_O1"
-
-# 你要给的通道名列表
-# 注意：这里的名字要与 dat 第一行表头“完全相等”
 CHANNELS_BY_POS: Dict[str, List[str]] = {
-    "FXD": ['LVT1', 'LVT2', 'LVT3', 'LVT4', 'LRY', 'LRY1', 'RVT1', 'RVT2', 'RVT3', 'RVT4', 'RRY', 'RRY1'],
-    "PW":  ['LHT1', 'LHT4', 'LHT2', 'LHT3', 'RHT1', 'RHT4', 'RHT2', 'RHT3'],
-    "JFY": ['LW1', 'LW2', 'LW3', 'LAI', 'RW1', 'RW2', 'RW3', 'RAI'],
+    "FXD": ["LVT1", "LVT2", "LVT3", "LVT4", "LRY", "LRY1", "RVT1", "RVT2", "RVT3", "RVT4", "RRY", "RRY1"],
+    "PW": ["LHT1", "LHT4", "LHT2", "LHT3", "RHT1", "RHT4", "RHT2", "RHT3"],
+    "JFY": ["LW1", "LW2", "LW3", "LAI", "RW1", "RW2", "RW3", "RAI"],
 }
 
-# 输出 txt 时的固定通道编号起点：
-# JFY: 0-7, FXD: 8-19, PW: 20-27
-CHANNEL_ID_BASE = {
-    "JFY": 0,
-    "FXD": 8,
-    "PW": 20,
-}
+CHANNEL_ID_BASE = {"JFY": 0, "FXD": 8, "PW": 20}
 
 
-# =========================
-# 工具函数
-# =========================
 @dataclass
 class ParsedMeta:
     H: float
     M: float
-    excite_pos: str   # FXD/PW/JFY
-    excite_phase: str # 同/反
-    excite_key: str   # e.g. "FXD_反"
+    excite_pos: str
+    excite_phase: str
+    excite_key: str
     excite_id: int
 
 
 def _decode_hm_token(token: str) -> float:
-    """
-    H/M 数值解码：
-    - 含 d：直接把 d 当小数点，如 8d23 -> 8.23
-    - 不含 d 且长度>=2：默认最后两位为小数，如 0823 -> 8.23, 140 -> 1.40
-    - 其他情况：直接转 float
-    """
     token = token.strip()
     if "d" in token:
         return float(token.replace("d", "."))
@@ -106,373 +91,346 @@ def _decode_hm_token(token: str) -> float:
 
 
 def parse_HM_from_filename(file_path: Path) -> Tuple[float, float]:
-    """
-    以文件名为准解析 H/M。
-    支持：
-    - H8d23 / M1d40
-    - H0823 / M140
-    """
-    s = file_path.stem
-
-    mH = re.search(r"_H([0-9d]+)(?=_|$)", s)
-    mM = re.search(r"_M([0-9d]+)(?=_|$)", s)
-    if not mH or not mM:
-        raise ValueError(f"无法从文件名解析 H/M: {file_path}")
-
-    H = _decode_hm_token(mH.group(1))
-    M = _decode_hm_token(mM.group(1))
-    return H, M
+    name = Path(file_path).stem
+    height_match = re.search(r"_H([0-9d]+)(?=_|$)", name)
+    mach_match = re.search(r"_M([0-9d]+)(?=_|$)", name)
+    if height_match is None or mach_match is None:
+        raise ValueError(f"Cannot parse H/M from filename: {file_path}")
+    return _decode_hm_token(height_match.group(1)), _decode_hm_token(mach_match.group(1))
 
 
 def parse_excitation_from_filename(file_path: Path) -> ParsedMeta:
-    """
-    从文件名提取激励位置与相位：
-    例如：
-    - FXD_DC  -> FXD_反
-    - FXD_FDC -> FXD_同
-    """
-    s = file_path.stem
-
-    m = re.search(r"_(FXD|PW|JFY)_(FDC|DC)(?=_|$)", s)
-    if not m:
-        raise ValueError(f"无法从文件名解析激励方式(FXD/PW/JFY + FDC/DC): {file_path}")
-
-    code = f"{m.group(1)}_{m.group(2)}"
-    if code not in EXCITATION_CODE_MAP:
-        raise ValueError(f"激励方式未在映射表中: {code} ({file_path})")
-
-    key = EXCITATION_CODE_MAP[code]
-    pos, phase = key.split("_", 1)
-
-    H, M = parse_HM_from_filename(file_path)
+    match = re.search(r"_(FXD|PW|JFY)_(FDC|DC)(?=_|$)", Path(file_path).stem)
+    if match is None:
+        raise ValueError(f"Cannot parse excitation from filename: {file_path}")
+    position = match.group(1)
+    phase_code = match.group(2)
+    code = f"{position}_{phase_code}"
+    excitation_key = EXCITATION_CODE_MAP[code]
+    height, mach = parse_HM_from_filename(Path(file_path))
     return ParsedMeta(
-        H=H, M=M,
-        excite_pos=pos,
-        excite_phase=phase,
-        excite_key=key,
-        excite_id=EXCITATION_ID[key],
+        H=height,
+        M=mach,
+        excite_pos=position,
+        excite_phase=excitation_key.split("_", 1)[1],
+        excite_key=excitation_key,
+        excite_id=EXCITATION_ID[code],
     )
 
 
 def read_table_dat(file_path: Path) -> Tuple[np.ndarray, List[str]]:
-    """
-    读取 dat：第一行为表头，逗号分隔。
-    兼容首列/若干列为时间字符串等非数值内容的情况：
-    - 逐列尝试转为数值
-    - 全列都无法转为数值的列直接丢弃（如 Time=0:0:0:000）
-    - 其余列保留，并转成 float64
-    返回：Y (float64) 与保留下来的 header list
-    """
-    df = pd.read_csv(file_path, encoding='utf-8-sig')
-    df.columns = [str(c).strip() for c in df.columns]
-
-    keep_cols = []
+    dataframe = pd.read_csv(file_path, encoding="utf-8-sig")
+    dataframe.columns = [str(column).strip() for column in dataframe.columns]
+    keep_columns: List[str] = []
     keep_series = []
-    for col in df.columns:
-        s_num = pd.to_numeric(df[col], errors='coerce')
-        # 像时间列 '0:0:0:000' 这种会整列都是 NaN，直接丢弃
-        if s_num.notna().any():
-            keep_cols.append(col)
-            keep_series.append(s_num.astype(np.float64))
-
-    if not keep_cols:
-        raise ValueError(f"文件中未找到可用于计算的数值列: {file_path}")
-
-    df_num = pd.concat(keep_series, axis=1)
-    df_num.columns = keep_cols
-
-    Y = df_num.to_numpy(dtype=np.float64)
-    # 去均值（与你原脚本一致）
-    Y = Y - Y.mean(axis=0, keepdims=True)
-    return Y, keep_cols
+    for column in dataframe.columns:
+        numeric = pd.to_numeric(dataframe[column], errors="coerce")
+        if numeric.notna().any():
+            keep_columns.append(column)
+            keep_series.append(numeric.astype(np.float64))
+    if not keep_columns:
+        raise ValueError(f"No numeric columns found in: {file_path}")
+    numeric_frame = pd.concat(keep_series, axis=1)
+    numeric_frame.columns = keep_columns
+    values = numeric_frame.to_numpy(dtype=np.float64)
+    values = values - values.mean(axis=0, keepdims=True)
+    return values, keep_columns
 
 
-def get_input_signal(header: List[str], Y: np.ndarray, input_name: str = INPUT_SIGNAL_NAME) -> np.ndarray:
-    """
-    通过表头精确匹配激励输入列，只取 PM_O1。
-    """
-    name_to_idx = {name: i for i, name in enumerate(header)}
-    if input_name not in name_to_idx:
-        raise ValueError(f"未找到激励输入列: {input_name}")
-    return Y[:, name_to_idx[input_name]].astype(float).ravel()
+def get_input_signal(header: List[str], values: np.ndarray, input_name: str = INPUT_SIGNAL_NAME) -> np.ndarray:
+    name_to_index = {name: index for index, name in enumerate(header)}
+    if input_name not in name_to_index:
+        raise ValueError(f"Input column not found: {input_name}")
+    return np.asarray(values[:, name_to_index[input_name]], dtype=float).ravel()
 
 
 def select_channel_indices(header: List[str], excite_pos: str) -> List[Tuple[int, str, int]]:
-    """
-    按激励位置选择要处理的通道名列表，并在 header 中做“完全相等”匹配。
-    返回 [(channel_id, ch_name, col_idx_in_file), ...]
-
-    channel_id 保持与旧 txt 一致：
-    - JFY 按其通道字符串顺序映射为 0~7
-    - FXD 按其通道字符串顺序映射为 8~19
-    - PW  按其通道字符串顺序映射为 20~27
-    """
-    if excite_pos not in CHANNELS_BY_POS:
-        raise ValueError(f"CHANNELS_BY_POS 未配置该激励位置: {excite_pos}")
-    if excite_pos not in CHANNEL_ID_BASE:
-        raise ValueError(f"CHANNEL_ID_BASE 未配置该激励位置: {excite_pos}")
-
-    targets = CHANNELS_BY_POS[excite_pos]
-    base_id = CHANNEL_ID_BASE[excite_pos]
-    name_to_idx = {name: i for i, name in enumerate(header)}
-
-    out: List[Tuple[int, str, int]] = []
-    for local_idx, name in enumerate(targets):
-        if name not in name_to_idx:
-            continue
-        channel_id = base_id + local_idx
-        out.append((channel_id, name, name_to_idx[name]))
-    return out
+    if excite_pos not in CHANNELS_BY_POS or excite_pos not in CHANNEL_ID_BASE:
+        raise ValueError(f"Unsupported excitation position: {excite_pos}")
+    name_to_index = {name: index for index, name in enumerate(header)}
+    base = CHANNEL_ID_BASE[excite_pos]
+    selected = []
+    for local_index, name in enumerate(CHANNELS_BY_POS[excite_pos]):
+        if name in name_to_index:
+            selected.append((base + local_index, name, name_to_index[name]))
+    return selected
 
 
-def find_spectrum_peaks(y: np.ndarray, fs: int) -> np.ndarray:
-    """
-    返回 0~F_MAX_HZ 范围内的谱包络峰频率数组 peak_freqs (Hz)。
-    若失败，则返回空数组。
-    """
+def _coerce_band(value: object) -> Optional[Tuple[float, float]]:
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        low, high = float(value[0]), float(value[1])
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        parts = re.split(r"\s*[-~:,，；;]\s*", text)
+        if len(parts) != 2:
+            return None
+        low, high = float(parts[0]), float(parts[1])
+    return (low, high) if np.isfinite(low) and np.isfinite(high) and high > low else None
+
+
+def _coerce_tolerances(value: object) -> Tuple[float, float, float]:
+    parts = list(value) if isinstance(value, (list, tuple)) else re.split(r"\s*[-~:,，；;]\s*", str(value or "").strip())
+    if len(parts) != 3:
+        return DEFAULT_MODAL_TOLERANCES
+    values = tuple(float(item) for item in parts)
+    if not all(np.isfinite(item) and item > 0 for item in values):
+        return DEFAULT_MODAL_TOLERANCES
+    return values
+
+
+def load_modal_band_config() -> Dict[str, Dict[str, object]]:
+    config = {
+        channel: {"bands": list(DEFAULT_MODAL_BANDS), "tolerances": DEFAULT_MODAL_TOLERANCES}
+        for channels in CHANNELS_BY_POS.values()
+        for channel in channels
+    }
     try:
-        f, y_fft = compute_spectrum(y, fs, window=False, mode="amplitude")
-        mask = f <= F_MAX_HZ
-        f = f[mask]
-        y_fft = y_fft[mask]
-
-        # 频域包络（沿用你脚本）
-        _, env = envelope_rms_tv(y_fft, rms_win=32, n_iter=50, lam=50, rho=2)
-
-        # prom 自适应
-        prom = PROM_SCALE * (np.percentile(env, 95) - np.percentile(env, 5))
-        if not np.isfinite(prom) or prom <= 0:
-            return np.array([], dtype=float)
-
-        df = f[1] - f[0]
-        min_width = max(1, int(MIN_WIDTH_HZ / df))
-        min_dist = max(1, int(MIN_DIST_HZ / df))
-
-        idx, _ = find_peaks(env, prominence=prom, width=min_width, distance=min_dist)
-        return f[idx].astype(float)
+        if not MODAL_BAND_CONFIG_PATH.exists():
+            return config
+        raw = json.loads(MODAL_BAND_CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return config
+        for channel, value in raw.items():
+            if isinstance(value, dict):
+                band_values = value.get("bands", [])
+                tolerance_values = value.get("tolerances")
+            else:
+                band_values = value if isinstance(value, list) else []
+                tolerance_values = None
+            bands = [_coerce_band(item) for item in list(band_values)[:3]]
+            while len(bands) < 3:
+                bands.append(None)
+            config[str(channel)] = {
+                "bands": bands[:3],
+                "tolerances": _coerce_tolerances(tolerance_values),
+            }
     except Exception:
-        return np.array([], dtype=float)
+        return config
+    return config
+
+
+def _modal_config_for_channel(channel_name: Optional[str]) -> Dict[str, object]:
+    config = load_modal_band_config()
+    if channel_name is not None and str(channel_name) in config:
+        return config[str(channel_name)]
+    return {"bands": list(DEFAULT_MODAL_BANDS), "tolerances": DEFAULT_MODAL_TOLERANCES}
+
+
+def find_spectrum_peaks(y: np.ndarray, fs: int, channel_name: Optional[str] = None) -> np.ndarray:
+    frequency, amplitude = amplitude_spectrum(y, fs)
+    robust_spectrum_peaks(frequency, amplitude, **PEAK_PARAMS)
+    entry = _modal_config_for_channel(channel_name)
+    slots = marker_slots_from_bands(
+        frequency,
+        amplitude,
+        list(entry["bands"]),
+        peak_params=PEAK_PARAMS,
+    )
+    return np.array([value for value in slots if value is not None], dtype=float)
 
 
 def oe_extract_modes(u: np.ndarray, y: np.ndarray, fs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    运行 OE，返回初筛后的 (p, r, s)：
-    - p: 离散极点(复数)
-    - r: 留数(复数)
-    - s: 连续域极点 log(p)/Ts (复数)
-    初筛规则：正频支 + Re(s)<0 + 0<=zeta<=0.8 + 有限性
-    """
-    model = OEModel(**OE_KWARGS).fit(y, u)
-    r, p, _k = model.residues()
-
-    r = np.asarray(r, dtype=np.complex128)
-    p = np.asarray(p, dtype=np.complex128)
-
-    Ts = 1.0 / fs
-    s = np.log(p + 1e-12) / Ts
-    sigma = np.real(s)
-    omega_d = np.imag(s)
-
-    freq_hz = np.abs(omega_d) / (2 * np.pi)
-    omega_n = np.sqrt(sigma**2 + omega_d**2)
-
-    valid = np.isfinite(freq_hz) & np.isfinite(omega_n) & (omega_n > 0)
-    zeta = np.full_like(freq_hz, np.nan, dtype=float)
-    zeta[valid] = -sigma[valid] / omega_n[valid]
-
-    mask_pos = omega_d > 0
-    mask_stable = sigma < 0
-    mask_zeta = np.isfinite(zeta) & (zeta <= 0.8) & (zeta >= 0.0)
-
-    mask = valid & mask_pos & mask_stable & mask_zeta
-
-    return p[mask], r[mask], s[mask]
+    result = fit_oe_modal(
+        u,
+        y,
+        fs,
+        nb=int(OE_KWARGS["nb"]),
+        nf=int(OE_KWARGS["na"]),
+        nk=int(OE_KWARGS["nk"]),
+        max_iter=int(OE_KWARGS["max_nfev"]),
+    )
+    poles = np.asarray(result["poles"], dtype=np.complex128)
+    residues = np.asarray(result["residues"], dtype=np.complex128)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        continuous_poles = np.log(poles) * float(fs)
+    return poles, residues, continuous_poles
 
 
-def match_peaks_to_oe(peak_freqs: np.ndarray, p: np.ndarray, r: np.ndarray, s: np.ndarray, fs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    将谱峰与 OE 模态按频率匹配（±MATCH_HALF_WIDTH_HZ），冲突时选 |r| 最大。
-    返回匹配后的 (p_sel, r_sel, s_sel)（数量<=谱峰数，也可能为0）。
-    若 peak_freqs 为空，则 fallback：按 |r| 取前 MAX_MODES。
-    """
-    if p.size == 0:
-        return np.array([], dtype=np.complex128), np.array([], dtype=np.complex128), np.array([], dtype=np.complex128)
-
-    # OE 频率（来自连续域）
-    omega_d = np.imag(s)
-    oe_freqs = np.abs(omega_d) / (2 * np.pi)
-
-    if peak_freqs.size == 0:
-        # fallback：按 |r| 取前 MAX_MODES
-        order = np.argsort(np.abs(r))[::-1]
-        order = order[:MAX_MODES]
-        return p[order], r[order], s[order]
-
-    peak_order = np.arange(len(peak_freqs))
-
-    used = np.zeros(len(oe_freqs), dtype=bool)
-    chosen: List[int] = []
-
-    for jj in peak_order:
-        fp = float(peak_freqs[jj])
-        cand = np.where((np.abs(oe_freqs - fp) <= MATCH_HALF_WIDTH_HZ) & (~used))[0]
-        if cand.size == 0:
-            continue
-        best = cand[np.argmax(np.abs(r[cand]))]
-        used[best] = True
-        chosen.append(int(best))
-
-        if len(chosen) >= MAX_MODES:
-            break
-
-    if len(chosen) == 0:
-        return np.array([], dtype=np.complex128), np.array([], dtype=np.complex128), np.array([], dtype=np.complex128)
-
-    chosen = np.array(chosen, dtype=int)
-    return p[chosen], r[chosen], s[chosen]
+def match_peaks_to_oe(
+    peak_freqs: np.ndarray,
+    poles: np.ndarray,
+    residues: np.ndarray,
+    continuous_poles: np.ndarray,
+    fs: int,
+    tolerances: Optional[Tuple[float, float, float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    del continuous_poles
+    markers = np.asarray(peak_freqs, dtype=float).ravel()
+    thresholds = np.asarray(tolerances or DEFAULT_MODAL_TOLERANCES, dtype=float)[: markers.size]
+    matched = match_modes_to_marker_frequencies(
+        markers,
+        np.asarray(poles, dtype=complex),
+        np.asarray(residues, dtype=complex),
+        fs,
+        f_threshold=5.0,
+        f_thresholds=thresholds,
+        **POLE_FILTER_PARAMS,
+    )
+    if not matched:
+        empty = np.array([], dtype=np.complex128)
+        return empty, empty.copy(), empty.copy()
+    selected_s = np.array([complex(mode.alpha, mode.omega) for _, mode in matched], dtype=np.complex128)
+    selected_p = np.exp(selected_s / float(fs))
+    selected_r = np.array(
+        [mode.residue_abs * np.exp(1j * mode.residue_phase) for _, mode in matched],
+        dtype=np.complex128,
+    )
+    return selected_p, selected_r, selected_s
 
 
-def format_row(meta: ParsedMeta, channel_id: int, p_sel: np.ndarray, r_sel: np.ndarray, s_sel: np.ndarray) -> List[str]:
-    """
-    组织一行输出：
-    H, M, excite_id, channel_id, (sigma1, omegad1, |R1|, angle1), ...
-    - 极点用连续域 s_sel：sigma<0、omega_d>0
-    - 留数幅值/相位用离散域 r_sel：abs/angle
-    - 不足 MAX_MODES 的不补（你要求“没有就不写”）
-    """
-    out: List[str] = [
-        f"{meta.H:.10g}",
-        f"{meta.M:.10g}",
-        str(meta.excite_id),
-        str(channel_id),
-    ]
-
-    for si, ri in zip(s_sel, r_sel):
-        sigma = float(np.real(si))
-        omega_d = float(np.imag(si))
-        Rabs = float(np.abs(ri))
-        Rph = float(np.angle(ri))  # (-pi, pi]
-        out += [f"{sigma:.10g}", f"{omega_d:.10g}", f"{Rabs:.10g}", f"{Rph:.10g}"]
-
-    return out
+def format_row(
+    meta: ParsedMeta,
+    channel_id: int,
+    p_sel: np.ndarray,
+    r_sel: np.ndarray,
+    s_sel: np.ndarray,
+) -> List[str]:
+    del p_sel
+    output = [f"{meta.H:.10g}", f"{meta.M:.10g}", str(meta.excite_id), str(channel_id)]
+    for continuous_pole, residue in zip(s_sel, r_sel):
+        output.extend([
+            f"{float(np.real(continuous_pole)):.10g}",
+            f"{float(np.imag(continuous_pole)):.10g}",
+            f"{float(np.abs(residue)):.10g}",
+            f"{float(np.angle(residue)):.10g}",
+        ])
+    return output
 
 
 def read_selected_dat_files(root_dir: Path, selected_list_file: Path) -> List[Path]:
-    """
-    从 selected_CG_path.txt 读取待处理文件名列表。
-    文件中每行都是 root_dir 下的文件名，例如：
-    CG_SC_FXD_DC_E_1d0_H0823_M140_20260306_JiZai.dat
-
-    返回与 root_dir 拼接后的绝对路径列表。
-    """
     root_dir = Path(root_dir)
     selected_list_file = Path(selected_list_file)
-
     if not selected_list_file.exists():
-        raise FileNotFoundError(f"未找到选取文件列表: {selected_list_file}")
-
-    dat_files: List[Path] = []
+        raise FileNotFoundError(f"Selected-file list not found: {selected_list_file}")
+    files: List[Path] = []
     seen = set()
-
-    with selected_list_file.open("r", encoding="utf-8-sig") as f:
-        for line_no, line in enumerate(f, start=1):
+    with selected_list_file.open("r", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, start=1):
             name = line.strip()
             if not name:
                 continue
-
-            fp = root_dir / name
-            if fp in seen:
+            path = root_dir / name
+            if path in seen:
                 continue
-            if not fp.exists():
-                raise FileNotFoundError(
-                    f"selected_CG_path.txt 第 {line_no} 行指定的文件不存在: {fp}"
-                )
-            if fp.suffix.lower() != ".dat":
-                raise ValueError(
-                    f"selected_CG_path.txt 第 {line_no} 行不是 .dat 文件: {fp}"
-                )
-
-            dat_files.append(fp)
-            seen.add(fp)
-
-    if len(dat_files) == 0:
-        raise ValueError(f"选取文件列表为空: {selected_list_file}")
-
-    return dat_files
+            if not path.exists():
+                raise FileNotFoundError(f"Line {line_number} does not exist: {path}")
+            if path.suffix.lower() != ".dat":
+                raise ValueError(f"Line {line_number} is not a .dat file: {path}")
+            files.append(path)
+            seen.add(path)
+    if not files:
+        raise ValueError(f"Selected-file list is empty: {selected_list_file}")
+    return files
 
 
-# =========================
-# 主流程
-# =========================
+def _extract_rows_from_dat(file_path: Path) -> List[str]:
+    meta = parse_excitation_from_filename(file_path)
+    values, header = read_table_dat(file_path)
+    input_signal = get_input_signal(header, values, INPUT_SIGNAL_NAME)
+    channels = select_channel_indices(header, meta.excite_pos)
+    if not channels:
+        print(f"[SKIP] no channel matched | {file_path}")
+        return []
+    rows: List[str] = []
+    for channel_id, channel_name, column_index in channels:
+        try:
+            output_signal = np.asarray(values[:, column_index], dtype=float).ravel()
+            valid = np.isfinite(input_signal) & np.isfinite(output_signal)
+            paired_input = input_signal[valid]
+            paired_output = output_signal[valid]
+            markers = find_spectrum_peaks(paired_output, FS, channel_name)
+            poles, residues, continuous_poles = oe_extract_modes(paired_input, paired_output, FS)
+            entry = _modal_config_for_channel(channel_name)
+            selected = match_peaks_to_oe(
+                markers,
+                poles,
+                residues,
+                continuous_poles,
+                FS,
+                tolerances=tuple(entry["tolerances"]),
+            )
+            if selected[0].size:
+                rows.append("\t".join(format_row(meta, channel_id, *selected)))
+        except Exception as exc:
+            print(f"[FAIL-CH] {file_path} | channel_id={channel_id} col={column_index} name={channel_name} | {exc!r}")
+            print(traceback.format_exc())
+    return rows
+
+
+def _split_dataset_stem(file_path: Path) -> str:
+    meta = parse_excitation_from_filename(file_path)
+    match = re.search(r"_(FXD|PW|JFY)_(FDC|DC)(?=_|$)", file_path.stem, flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"Cannot derive split-dataset excitation code from: {file_path.name}")
+    excitation_code = f"{match.group(1).upper()}_{match.group(2).upper()}"
+    return f"SF_XGD_{excitation_code}_H{int(round(meta.H * 100)):04d}_M{int(round(meta.M * 100)):03d}"
+
+
+def _next_split_dataset_path(output_dir: Path, stem: str, reserved_dir: Optional[Path] = None) -> Path:
+    reserved_dir = Path(reserved_dir) if reserved_dir is not None else output_dir
+
+    def is_available(path: Path) -> bool:
+        return not path.exists() and not (reserved_dir / path.name).exists()
+
+    candidate = output_dir / f"{stem}.txt"
+    if is_available(candidate):
+        return candidate
+    suffix = 2
+    while True:
+        candidate = output_dir / f"{stem}_{suffix}.txt"
+        if is_available(candidate):
+            return candidate
+        suffix += 1
+
+
+def batch_process_split(
+    root_dir: Path,
+    output_dir: Path,
+    selected_list_file: Path,
+    reserved_names_dir: Optional[Path] = None,
+) -> List[Path]:
+    root_dir, output_dir = Path(root_dir), Path(output_dir)
+    files = read_selected_dat_files(root_dir, Path(selected_list_file))
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generated: List[Path] = []
+    for file_path in files:
+        try:
+            rows = _extract_rows_from_dat(file_path)
+            if not rows:
+                raise RuntimeError(f"No usable modal rows extracted from: {file_path}")
+            output_path = _next_split_dataset_path(output_dir, _split_dataset_stem(file_path), reserved_names_dir)
+            with output_path.open("x", encoding="utf-8") as stream:
+                stream.write("\n".join(rows) + "\n")
+            generated.append(output_path)
+            print(f"[NEW-DATA] source={file_path.name} rows={len(rows)} -> {output_path.name}", flush=True)
+        except Exception as exc:
+            print(f"[FAIL-FILE] {file_path} | {exc!r}")
+            print(traceback.format_exc())
+    if not generated:
+        raise RuntimeError("No split-dataset files were generated from selected_CG_path.txt")
+    return generated
+
+
 def batch_process(root_dir: Path, out_file: Path, selected_list_file: Path) -> None:
-    """
-    根据 selected_CG_path.txt 指定的文件名列表，
-    从 root_dir 下选取对应 .dat 文件进行处理，并写入 out_file。
-    不再遍历 root_dir 下全部 .dat，也不再生成 log 文件。
-    """
-    root_dir = Path(root_dir)
-    out_file = Path(out_file)
-    selected_list_file = Path(selected_list_file)
-
-    dat_files = read_selected_dat_files(root_dir, selected_list_file)
-
+    root_dir, out_file = Path(root_dir), Path(out_file)
+    files = read_selected_dat_files(root_dir, Path(selected_list_file))
     out_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with out_file.open("w", encoding="utf-8") as fout:
-        for fp in dat_files:
+    with out_file.open("w", encoding="utf-8") as stream:
+        for file_path in files:
             try:
-                meta = parse_excitation_from_filename(fp)
-                Y, header = read_table_dat(fp)
-
-                # u 通过表头匹配，只用 PM_O1
-                u = get_input_signal(header, Y, INPUT_SIGNAL_NAME)
-
-                # 按激励位置选通道（精确匹配表头）
-                ch_list = select_channel_indices(header, meta.excite_pos)
-                if len(ch_list) == 0:
-                    print(f"[SKIP] no channel matched | {fp}")
-                    continue
-
-                for channel_id, ch_name, col_idx in ch_list:
-                    try:
-                        y = Y[:, col_idx].astype(float).ravel()
-
-                        # 谱峰
-                        peak_freqs = find_spectrum_peaks(y, FS)
-
-                        # OE + 初筛
-                        p0, r0, s0 = oe_extract_modes(u, y, FS)
-
-                        # 峰匹配（或 fallback）
-                        p_sel, r_sel, s_sel = match_peaks_to_oe(peak_freqs, p0, r0, s0, FS)
-
-                        # 没有模态：按你要求“什么都不写”
-                        if p_sel.size == 0:
-                            continue
-
-                        row = format_row(meta, channel_id, p_sel, r_sel, s_sel)
-                        fout.write("\t".join(row) + "\n")
-
-                    except Exception as e_ch:
-                        print(f"[FAIL-CH] {fp} | channel_id={channel_id} col={col_idx} name={ch_name} | {repr(e_ch)}")
-                        print(traceback.format_exc())
-                        continue
-
-            except Exception as e_fp:
-                print(f"[FAIL-FILE] {fp} | {repr(e_fp)}")
+                rows = _extract_rows_from_dat(file_path)
+                if rows:
+                    stream.write("\n".join(rows) + "\n")
+            except Exception as exc:
+                print(f"[FAIL-FILE] {file_path} | {exc!r}")
                 print(traceback.format_exc())
-                continue
 
 
 if __name__ == "__main__":
-    # ====== 你只需要改这里 ======
-    ROOT = Path(r"C:\Users\Administrator\Desktop\试飞数据(训练用) - 副本")
+    ROOT = Path(r"C:\Users\Administrator\Desktop\试飞数据(训练用 - 副本")
     OUT = Path(r"C:\Users\Administrator\Desktop") / "new_real.txt"
-
-    # 示例：
-    # selected_CG_path.txt 中每行写一个 ROOT 文件夹下待处理的 dat 文件名，例如：
-    # CG_SC_FXD_DC_E_1d0_H0823_M140_20260306_JiZai.dat
     SELECTED_LIST = Path(r"C:\Users\Administrator\Desktop\selected_CG_path.txt")
-
     batch_process(ROOT, OUT, SELECTED_LIST)
-    print(f"完成. 输出: {OUT}")
+    print(f"Done. Output: {OUT}")

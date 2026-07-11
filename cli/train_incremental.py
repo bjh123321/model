@@ -4,16 +4,17 @@ import argparse
 import configparser
 import socket
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from surrogate_model.config import Config
-from surrogate_model.data.OE_BATCH_PROCESS import batch_process
+from surrogate_model.data.OE_BATCH_PROCESS import batch_process_split
 from surrogate_model.data.build_replay_data import build_replay_data
 from surrogate_model.data.datasets import _fixed_len_tensor, build_label_tensor
-from surrogate_model.data.io import OMEGA_N, parse_rows_to_struct
+from surrogate_model.data.io import OMEGA_N, parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import Normalizer
 from surrogate_model.models.blocks import (
     MFDNN,
@@ -39,17 +40,26 @@ def _path_from_ini(cp: configparser.ConfigParser, paths_ini_path: Path, section:
 
 
 class RealIncrementalDataset(Dataset):
-    def __init__(self, txt_path: Path, in_norm: Normalizer, out_norm: Normalizer, K_max: int = 3):
+    def __init__(
+        self,
+        txt_path: Path | list[Path] | None,
+        in_norm: Normalizer,
+        out_norm: Normalizer,
+        K_max: int = 3,
+        rows_float: list[list[float]] | None = None,
+    ):
         super().__init__()
-        self.txt_path = Path(txt_path)
-        rows_float = []
-        with open(self.txt_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    rows_float.append([float(x) for x in line.replace(",", " ").split()])
+        self.txt_paths = [] if txt_path is None else (
+            [Path(p) for p in txt_path] if isinstance(txt_path, (list, tuple)) else [Path(txt_path)]
+        )
+        if rows_float is None:
+            rows_float = []
+            for path in self.txt_paths:
+                rows_float.extend(read_real_dataset(path))
+        else:
+            rows_float = [list(row) for row in rows_float]
         if not rows_float:
-            raise RuntimeError(f"[RealIncrementalDataset] {self.txt_path} is empty or cannot be parsed")
+            raise RuntimeError(f"[RealIncrementalDataset] inputs are empty or cannot be parsed: {self.txt_paths}")
 
         parsed, _ = parse_rows_to_struct(rows_float)
         H = torch.tensor([p.H for p in parsed], dtype=torch.float32)
@@ -133,6 +143,25 @@ def representation_loss(pred, tgt, mask, mean, std, target_names):
     return loss
 
 
+def evaluate_representation_loss(model, data_loader, device, mean, std, target_names) -> float:
+    """Evaluate one deterministic, valid-mode-weighted loss over the complete dataset."""
+    model.eval()
+    weighted_sum = 0.0
+    valid_count = 0.0
+    with torch.no_grad():
+        for batch in data_loader:
+            H, M, e, c, yN, mask = _batch_to_device(batch, device)
+            pred = model(H, M, e, c)
+            loss = representation_loss(pred, yN, mask, mean, std, target_names)
+            width = min(mask.size(1), pred["alpha"].size(1), min(yN[name].size(1) for name in target_names))
+            batch_valid = float(mask[:, :width].sum().item())
+            weighted_sum += float(loss.item()) * batch_valid
+            valid_count += batch_valid
+    if valid_count <= 0:
+        raise RuntimeError("Full new-data evaluation found no valid modal slots")
+    return weighted_sum / valid_count
+
+
 def kd_loss_fn(new: dict, old: dict, target_names, w: float = 1.0):
     new_targets = _model_output_as_targets(new, target_names)
     old_targets = _model_output_as_targets(old, target_names)
@@ -153,6 +182,9 @@ def _restore_cfg_from_checkpoint(ckpt: dict, use_lora: bool) -> Config:
         "low_hidden",
         "mod_hidden",
         "dropout_prob",
+        "lora_rank",
+        "lora_alpha",
+        "lora_dropout",
         "use_modulation",
         "mod_gamma",
         "pole_target",
@@ -162,6 +194,15 @@ def _restore_cfg_from_checkpoint(ckpt: dict, use_lora: bool) -> Config:
             setattr(cfg, attr, ckpt[attr])
     cfg.use_lora = bool(use_lora)
     return cfg
+
+
+def _checkpoint_uses_lora(ckpt: dict, state: dict) -> bool:
+    metadata_flag = bool(ckpt.get("use_lora", False)) if isinstance(ckpt, dict) else False
+    state_flag = any(
+        (".A.weight" in key) or (".B.weight" in key) or (".base.weight" in key)
+        for key in state.keys()
+    )
+    return metadata_flag or state_flag
 
 
 def _send_finished_udp():
@@ -192,14 +233,9 @@ def main():
     model_version = lines[1].strip()
     new_model_version = lines[2].strip()
     base_ckpt_path = model_dir / model_version / (model_version + ".pth")
-    replay_txt_path = base_dir / "replay_data.txt"
-    new_data_out = base_dir / "new_data.txt"
     selected_list = base_dir / "selected_CG_path.txt"
     save_ckpt_path = model_dir / new_model_version / (new_model_version + ".pth")
     save_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
-
-    build_replay_data(base_dir, model_dir)
-    batch_process(data_dir, new_data_out, selected_list)
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=None)
@@ -216,6 +252,69 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     default_cfg = Config()
+
+    def resolve_user_path(raw: str) -> Path:
+        path = Path(raw.strip()).expanduser()
+        return path if path.is_absolute() else (base_dir / path).resolve()
+
+    direct_data_paths: list[Path] = []
+    fourth_raw = lines[3].strip() if len(lines) >= 4 else ""
+    fourth_path = resolve_user_path(fourth_raw) if fourth_raw else None
+    if fourth_path is not None and fourth_path.is_file():
+        correction_mode = "direct_dataset"
+        for line_no, raw in enumerate(lines[3:], start=4):
+            value = raw.strip()
+            if not value:
+                continue
+            path = resolve_user_path(value)
+            if not path.is_file():
+                raise FileNotFoundError(f"user_input.dat line {line_no} is not an existing dataset file: {path}")
+            direct_data_paths.append(path)
+
+        parent_dirs = {path.resolve().parent for path in direct_data_paths}
+        if len(parent_dirs) != 1:
+            raise ValueError(f"Direct correction dataset files must share one parent directory, got: {sorted(map(str, parent_dirs))}")
+        replay_dataset_path = next(iter(parent_dirs))
+        replay_rows = build_replay_data(
+            base_dir,
+            model_dir,
+            replay_dataset_path=replay_dataset_path,
+            selected_names=[path.name for path in direct_data_paths],
+        )
+        new_data_paths = direct_data_paths
+        print(
+            f"[CORRECTION] mode=direct_dataset files={len(new_data_paths)} "
+            f"replay_pool={replay_dataset_path}",
+            flush=True,
+        )
+    else:
+        correction_mode = "cg_oe"
+        if fourth_path is not None:
+            print(
+                f"[WARN] user_input.dat line 4 is not an existing file: {fourth_path}; "
+                "falling back to selected_CG_path + OE mode.",
+                flush=True,
+            )
+        replay_dataset_path = Path(default_cfg.incremental_replay_dataset_dir).expanduser()
+        if not replay_dataset_path.is_absolute():
+            replay_dataset_path = (base_dir / replay_dataset_path).resolve()
+        if not replay_dataset_path.is_dir():
+            raise FileNotFoundError(f"Configured incremental replay dataset directory does not exist: {replay_dataset_path}")
+
+        # Snapshot replay before generating this run's new split files.
+        replay_rows = build_replay_data(base_dir, model_dir, replay_dataset_path=replay_dataset_path)
+        new_data_paths = batch_process_split(
+            data_dir,
+            base_dir,
+            selected_list,
+            reserved_names_dir=replay_dataset_path,
+        )
+        print(
+            f"[CORRECTION] mode=cg_oe files={len(new_data_paths)} "
+            f"output_dir={base_dir} replay_pool={replay_dataset_path}",
+            flush=True,
+        )
+
     epochs = int(args.epochs if args.epochs is not None else default_cfg.incremental_epochs)
     batch_size = int(args.batch_size if args.batch_size is not None else default_cfg.incremental_batch_size)
     lr = float(args.lr if args.lr is not None else default_cfg.incremental_lr)
@@ -231,17 +330,35 @@ def main():
 
     ckpt = torch.load(base_ckpt_path, map_location="cpu")
     state = ckpt.get("model_state_dict", ckpt)
-    teacher_cfg = _restore_cfg_from_checkpoint(ckpt if isinstance(ckpt, dict) else {}, use_lora=False)
-    teacher_cfg.use_lora = False
-    student_cfg = _restore_cfg_from_checkpoint(ckpt if isinstance(ckpt, dict) else {}, use_lora=True)
-    student_cfg.lora_rank = int(args.lora_rank if args.lora_rank is not None else default_cfg.lora_rank)
-    student_cfg.lora_alpha = float(args.lora_alpha if args.lora_alpha is not None else default_cfg.lora_alpha)
-    student_cfg.lora_dropout = float(args.lora_dropout if args.lora_dropout is not None else default_cfg.lora_dropout)
+    ckpt_meta = ckpt if isinstance(ckpt, dict) else {}
+    base_uses_lora = _checkpoint_uses_lora(ckpt_meta, state)
+    teacher_cfg = _restore_cfg_from_checkpoint(ckpt_meta, use_lora=base_uses_lora)
+    student_cfg = _restore_cfg_from_checkpoint(ckpt_meta, use_lora=True)
+
+    checkpoint_rank = int(student_cfg.lora_rank)
+    requested_rank = int(args.lora_rank if args.lora_rank is not None else checkpoint_rank)
+    if base_uses_lora and requested_rank != checkpoint_rank:
+        raise ValueError(
+            f"LoRA base checkpoint rank={checkpoint_rank} cannot be loaded into requested rank={requested_rank}. "
+            "Omit --lora_rank or use the checkpoint rank."
+        )
+    student_cfg.lora_rank = requested_rank
+    student_cfg.lora_alpha = float(args.lora_alpha if args.lora_alpha is not None else student_cfg.lora_alpha)
+    student_cfg.lora_dropout = float(args.lora_dropout if args.lora_dropout is not None else student_cfg.lora_dropout)
 
     student = MFDNN(student_cfg).to(device)
     teacher = MFDNN(teacher_cfg).to(device)
-    load_base_weights_into_lora_model(student, state)
-    teacher.load_state_dict(state, strict=True)
+    if base_uses_lora:
+        student.load_state_dict(state, strict=True)
+        teacher.load_state_dict(state, strict=True)
+        print(
+            f"[LoRA load] continuing from LoRA base checkpoint: rank={checkpoint_rank}",
+            flush=True,
+        )
+    else:
+        load_base_weights_into_lora_model(student, state)
+        teacher.load_state_dict(state, strict=True)
+        print("[LoRA load] initialized LoRA student from plain base checkpoint", flush=True)
     freeze_base_train_lora_only(student)
     teacher.eval()
     for p in teacher.parameters():
@@ -252,12 +369,17 @@ def main():
     trainable, total = count_parameters(student)
     print(f"[LoRA] trainable={trainable}, total={total}, ratio={trainable / max(total, 1):.6f}", flush=True)
 
-    ds_new = RealIncrementalDataset(new_data_out, in_norm, out_norm, K_max=student_cfg.K_max)
-    ds_replay = None
-    if replay_txt_path.exists() and replay_txt_path.stat().st_size > 0:
-        ds_replay = RealIncrementalDataset(replay_txt_path, in_norm, out_norm, K_max=student_cfg.K_max)
+    ds_new = RealIncrementalDataset(new_data_paths, in_norm, out_norm, K_max=student_cfg.K_max)
+    ds_replay = RealIncrementalDataset(
+        None,
+        in_norm,
+        out_norm,
+        K_max=student_cfg.K_max,
+        rows_float=replay_rows,
+    )
 
     dl_new = DataLoader(ds_new, batch_size=batch_size, shuffle=True, drop_last=False)
+    dl_new_eval = DataLoader(ds_new, batch_size=batch_size, shuffle=False, drop_last=False)
     dl_replay = DataLoader(ds_replay, batch_size=batch_size, shuffle=True, drop_last=False) if ds_replay is not None else None
 
     target_names = out_norm.target_names()
@@ -265,19 +387,29 @@ def main():
     std_t = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device).clamp_min(1e-8)
     opt = torch.optim.AdamW(lora_params, lr=lr, weight_decay=weight_decay)
 
+    best_new_full = evaluate_representation_loss(student, dl_new_eval, device, mean_t, std_t, target_names)
+    best_epoch = 0
+    best_state = deepcopy(student.state_dict())
+    print(f"[FULL-EVAL] epoch=0 loss_new_full={best_new_full:.6f}", flush=True)
+
     for epoch in range(1, epochs + 1):
         student.train()
         it_replay = iter(dl_replay) if dl_replay is not None else None
         warm = min(float(epoch) / float(max(warmup_epochs, 1)), 1.0)
         sum_new = sum_kd = sum_rep = sum_total = 0.0
+        count_new = count_kd = count_rep = 0.0
         n_steps = 0
 
         for batch in dl_new:
             H, M, e, c, yN, mask = _batch_to_device(batch, device)
             out_new = student(H, M, e, c)
             loss_new = representation_loss(out_new, yN, mask, mean_t, std_t, target_names)
+            new_width = min(mask.size(1), out_new["alpha"].size(1), min(yN[name].size(1) for name in target_names))
+            new_valid = float(mask[:, :new_width].sum().item())
             loss_kd = torch.tensor(0.0, device=device)
             loss_rep = torch.tensor(0.0, device=device)
+            replay_valid = 0.0
+            replay_samples = 0.0
 
             if it_replay is not None:
                 try:
@@ -291,6 +423,9 @@ def main():
                 out_new_r = student(Hr, Mr, er, cr)
                 loss_kd = kd_loss_fn(out_new_r, out_old, target_names, w=beta_kd)
                 loss_rep = representation_loss(out_new_r, yNr, maskr, mean_t, std_t, target_names) * gamma_replay
+                replay_width = min(maskr.size(1), out_new_r["alpha"].size(1), min(yNr[name].size(1) for name in target_names))
+                replay_valid = float(maskr[:, :replay_width].sum().item())
+                replay_samples = float(Hr.size(0))
 
             loss = loss_new + warm * loss_kd + warm * loss_rep
             opt.zero_grad(set_to_none=True)
@@ -298,20 +433,34 @@ def main():
             torch.nn.utils.clip_grad_norm_(lora_params, max_norm=5.0)
             opt.step()
 
-            sum_new += float(loss_new.detach().item())
-            sum_kd += float(loss_kd.detach().item())
-            sum_rep += float(loss_rep.detach().item())
+            sum_new += float(loss_new.detach().item()) * new_valid
+            count_new += new_valid
+            sum_kd += float(loss_kd.detach().item()) * replay_samples
+            count_kd += replay_samples
+            sum_rep += float(loss_rep.detach().item()) * replay_valid
+            count_rep += replay_valid
             sum_total += float(loss.detach().item())
             n_steps += 1
 
+        loss_new_full = evaluate_representation_loss(student, dl_new_eval, device, mean_t, std_t, target_names)
+        if loss_new_full < best_new_full:
+            best_new_full = float(loss_new_full)
+            best_epoch = int(epoch)
+            best_state = deepcopy(student.state_dict())
+
         if epoch % 10 == 0 or epoch == 1 or epoch == epochs:
-            denom = max(n_steps, 1)
             print(
                 f"[fixed-sf LoRA inc] epoch {epoch}/{epochs} "
-                f"loss_total={sum_total / denom:.4f} "
-                f"loss_new={sum_new / denom:.4f} "
-                f"kd={sum_kd / denom:.4f} rep={sum_rep / denom:.4f}"
+                f"train_obj={sum_total / max(n_steps, 1):.4f} "
+                f"loss_new_batch={sum_new / max(count_new, 1.0):.4f} "
+                f"loss_new_full={loss_new_full:.4f} "
+                f"kd={sum_kd / max(count_kd, 1.0):.4f} "
+                f"rep={sum_rep / max(count_rep, 1.0):.4f} "
+                f"best={best_new_full:.4f}@{best_epoch}"
             )
+
+    student.load_state_dict(best_state, strict=True)
+    print(f"[BEST] restored epoch={best_epoch} loss_new_full={best_new_full:.6f}", flush=True)
 
     torch.save(
         {
@@ -336,6 +485,11 @@ def main():
             "embed_excitation_dim": student_cfg.embed_excitation_dim,
             "embed_channel_num": student_cfg.embed_channel_num,
             "embed_channel_dim": student_cfg.embed_channel_dim,
+            "incremental_data_files": [path.name for path in new_data_paths],
+            "replay_dataset_path": str(replay_dataset_path),
+            "correction_mode": correction_mode,
+            "best_epoch": best_epoch,
+            "best_new_full": best_new_full,
         },
         save_ckpt_path,
     )

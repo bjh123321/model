@@ -62,10 +62,12 @@ class Config:
     weight_decay: float = 5e-5
 
     # LoRA incremental fine-tuning
-    incremental_epochs: int = 200
+    incremental_epochs: int = 1000
     incremental_batch_size: int = 16
-    incremental_lr: float = 3e-5
+    incremental_lr: float = 1e-4
     incremental_weight_decay: float = 1e-4
     incremental_beta_kd: float = 0.2
-    incremental_gamma_replay: float = 0.2
+    incremental_gamma_replay: float = 0.1
     incremental_warmup_epochs: int = 10
+    # Complete historical split dataset used as the replay pool in CG+OE mode.
+    incremental_replay_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple
 import math
+import re
 
 import numpy as np
 
@@ -20,10 +21,25 @@ def _parse_float_cell(cell: str) -> float:
     return float(cell)
 
 
-def read_variable_txt(path: Path) -> List[List[float]]:
+SPLIT_DATASET_NAME_RE = re.compile(
+    r"^SF_XGD_(FXD|PW|JFY)_(FDC|DC)_H(\d+)_M(\d+)(?:_(\d+))?\.txt$",
+    re.IGNORECASE,
+)
+SPLIT_EXCITATION_IDS = {
+    "FXD_FDC": 0,
+    "FXD_DC": 1,
+    "PW_FDC": 2,
+    "PW_DC": 3,
+    "JFY_FDC": 4,
+    "JFY_DC": 5,
+}
+
+
+def read_variable_txt(path: Path, strict: bool = False) -> List[List[float]]:
+    path = Path(path)
     rows: List[List[float]] = []
     with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
+        for line_no, raw in enumerate(f, start=1):
             ln = raw.rstrip("\r\n")
             if not ln.strip() or ln.lstrip().startswith("#"):
                 continue
@@ -32,10 +48,83 @@ def read_variable_txt(path: Path) -> List[List[float]]:
                     row = [_parse_float_cell(x) for x in ln.split("\t")]
                 else:
                     row = [float(x) for x in ln.replace(",", " ").split()]
-            except ValueError:
+            except ValueError as exc:
+                if strict:
+                    raise ValueError(f"{path}:{line_no} contains a non-numeric data row") from exc
                 continue
             if len(row) >= 4:
                 rows.append(row)
+            elif strict:
+                raise ValueError(f"{path}:{line_no} has {len(row)} columns; expected at least 4")
+    return rows
+
+
+def _validate_split_dataset_file(path: Path, rows: List[List[float]]) -> None:
+    match = SPLIT_DATASET_NAME_RE.match(path.name)
+    if match is None:
+        raise ValueError(f"Unexpected split-dataset filename: {path.name}")
+    if not rows:
+        raise ValueError(f"Split-dataset file is empty: {path}")
+
+    excitation_name = f"{match.group(1).upper()}_{match.group(2).upper()}"
+    expected_exc_id = SPLIT_EXCITATION_IDS[excitation_name]
+    expected_h_code = int(match.group(3))
+    expected_m_code = int(match.group(4))
+    first_h, first_m = float(rows[0][0]), float(rows[0][1])
+
+    # Filenames store H*100 and M*100 as rounded integer codes. Keep the more
+    # precise H/M values from each row as the actual model inputs.
+    if abs(first_h * 100.0 - expected_h_code) > 0.500001:
+        raise ValueError(f"{path.name}: filename H code does not match row height H={first_h:g}")
+    if abs(first_m * 100.0 - expected_m_code) > 0.500001:
+        raise ValueError(f"{path.name}: filename M code does not match row Mach M={first_m:g}")
+
+    for line_no, row in enumerate(rows, start=1):
+        if abs(float(row[0]) - first_h) > 1e-9 or abs(float(row[1]) - first_m) > 1e-9:
+            raise ValueError(f"{path}:{line_no} has H/M inconsistent with the first row")
+        exc_id = int(round(float(row[2])))
+        if exc_id != expected_exc_id:
+            raise ValueError(
+                f"{path}:{line_no} has exc_id={exc_id}, but filename {excitation_name} expects {expected_exc_id}"
+            )
+
+
+def read_real_dataset(path: Path) -> List[List[float]]:
+    """Read either one legacy txt file or a directory of SF_XGD split txt files."""
+    path = Path(path)
+    if path.is_file():
+        rows = read_variable_txt(path, strict=True)
+        if not rows:
+            raise ValueError(f"Real dataset file contains no usable rows: {path}")
+        if SPLIT_DATASET_NAME_RE.match(path.name):
+            _validate_split_dataset_file(path, rows)
+        print(f"[DATA] loaded real dataset file: files=1, rows={len(rows)}, path={path}", flush=True)
+        return rows
+    if not path.is_dir():
+        raise FileNotFoundError(f"Real dataset path is neither a file nor a directory: {path}")
+
+    files = sorted(
+        (p for p in path.iterdir() if p.is_file() and SPLIT_DATASET_NAME_RE.match(p.name)),
+        key=lambda p: p.name.lower(),
+    )
+    if not files:
+        raise FileNotFoundError(f"No SF_XGD_*.txt split-dataset files found in: {path}")
+
+    rows: List[List[float]] = []
+    for txt_path in files:
+        file_rows = read_variable_txt(txt_path, strict=True)
+        _validate_split_dataset_file(txt_path, file_rows)
+        file_seen_keys = set()
+        for line_no, row in enumerate(file_rows, start=1):
+            key = (float(row[0]), float(row[1]), int(round(float(row[2]))), int(round(float(row[3]))))
+            if key in file_seen_keys:
+                raise ValueError(
+                    f"Duplicate (H, M, excitation, channel) sample {key} within {txt_path}:{line_no}"
+                )
+            file_seen_keys.add(key)
+        rows.extend(file_rows)
+
+    print(f"[DATA] loaded split real dataset: files={len(files)}, rows={len(rows)}, path={path}", flush=True)
     return rows
 
 
