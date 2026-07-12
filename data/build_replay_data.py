@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Set
+from typing import Dict, Iterable, List, Tuple, Set, Any
 import math
 import re
 
@@ -153,6 +153,12 @@ def pick_replay_groups_for_target(
     target_M: float,
     target_excite_id: int,
     all_group_keys: List[Tuple[float, float, int]],
+    primary_h_thr: float = PRIMARY_H_THR,
+    primary_m_thr: float = PRIMARY_M_THR,
+    fallback_h_thr: float = FALLBACK_H_THR,
+    fallback_m_thr: float = FALLBACK_M_THR,
+    max_groups: int = MAX_GROUPS_PER_SELECTED,
+    min_groups: int = MIN_GROUPS_PER_SELECTED,
 ) -> List[Tuple[float, float, int]]:
     """
     为单个新样本挑选 replay 状态点组。
@@ -169,20 +175,20 @@ def pick_replay_groups_for_target(
 
     primary = []
     for H, M, excite_id in same_excite:
-        if abs(H - target_H) <= PRIMARY_H_THR and abs(M - target_M) <= PRIMARY_M_THR:
+        if abs(H - target_H) <= primary_h_thr and abs(M - target_M) <= primary_m_thr:
             primary.append((H, M, excite_id))
 
     use_pool = primary
-    if len(primary) < MIN_GROUPS_PER_SELECTED:
+    if len(primary) < min_groups:
         fallback = []
         for H, M, excite_id in same_excite:
-            if abs(H - target_H) <= FALLBACK_H_THR and abs(M - target_M) <= FALLBACK_M_THR:
+            if abs(H - target_H) <= fallback_h_thr and abs(M - target_M) <= fallback_m_thr:
                 fallback.append((H, M, excite_id))
         use_pool = fallback if fallback else same_excite
 
     use_pool = sorted(
         use_pool,
-        key=lambda k: normalized_distance(k[0], k[1], target_H, target_M)
+        key=lambda k: normalized_distance(k[0], k[1], target_H, target_M, primary_h_thr, primary_m_thr)
     )
 
     # 若 real_dataset 中恰好包含与新样本同一 H/M/excite_id 的历史行，排除掉“完全同点”可避免重复强化
@@ -193,7 +199,63 @@ def pick_replay_groups_for_target(
     if len(filtered) >= 1:
         use_pool = filtered
 
-    return use_pool[:MAX_GROUPS_PER_SELECTED]
+    return use_pool[:max_groups]
+
+
+def select_global_guard_groups(
+    all_group_keys: Iterable[Tuple[float, float, int]],
+    targets: Iterable[Tuple[str, float, float, str, int]],
+    max_groups: int = 48,
+    min_groups_per_excitation: int = 2,
+    seed: int = 42,
+) -> List[Tuple[float, float, int]]:
+    """Deterministically retain excitation strata, boundaries, near and far states."""
+    import random
+
+    target_points = [(t[1], t[2], t[4]) for t in targets]
+    keys = sorted(set(all_group_keys))
+    keys = [k for k in keys if not any(k[2] == e and _same_filename_operating_point(k[0], k[1], h, m) for h, m, e in target_points)]
+    if not keys:
+        # Small-data fallback: never return an empty guard solely due to exclusion.
+        keys = sorted(set(all_group_keys))
+    if not keys:
+        return []
+    rng = random.Random(int(seed))
+    by_exc: Dict[int, List[Tuple[float, float, int]]] = {}
+    for key in keys:
+        by_exc.setdefault(key[2], []).append(key)
+    required_coverage = sum(min(len(group), max(1, int(min_groups_per_excitation))) for group in by_exc.values())
+    limit = max(1, min(max(int(max_groups), required_coverage), len(keys)))
+
+    chosen: List[Tuple[float, float, int]] = []
+    def add(key):
+        if key not in chosen and len(chosen) < limit:
+            chosen.append(key)
+
+    # Boundaries per excitation provide H/M range and cross-excitation coverage.
+    for exc in sorted(by_exc):
+        group = by_exc[exc]
+        boundary = [min(group, key=lambda k: (k[0], k[1])), max(group, key=lambda k: (k[0], k[1])),
+                    min(group, key=lambda k: (k[1], k[0])), max(group, key=lambda k: (k[1], k[0]))]
+        for key in boundary:
+            add(key)
+        remaining = [k for k in group if k not in chosen]
+        rng.shuffle(remaining)
+        for key in remaining[:max(0, int(min_groups_per_excitation) - sum(k[2] == exc for k in chosen))]:
+            add(key)
+
+    # Explicitly mix states nearest to and farthest from the new points.
+    if target_points:
+        distance = lambda k: min(normalized_distance(k[0], k[1], h, m) for h, m, _ in target_points)
+        for key in sorted(keys, key=lambda k: (distance(k), k)):
+            add(key)
+        for key in sorted(keys, key=lambda k: (-distance(k), k)):
+            add(key)
+    remaining = [k for k in keys if k not in chosen]
+    rng.shuffle(remaining)
+    for key in remaining:
+        add(key)
+    return chosen
 
 
 def _targets_from_names(names: Iterable[str]) -> List[Tuple[str, float, float, str, int]]:
@@ -214,7 +276,18 @@ def build_replay_data(
     model_dir: Path | None = None,
     replay_dataset_path: Path | None = None,
     selected_names: Iterable[str] | None = None,
-) -> List[List[float]]:
+    *,
+    structured: bool = False,
+    guard_max_groups: int = 48,
+    guard_min_groups_per_excitation: int = 2,
+    selection_seed: int = 42,
+    primary_h_thr: float = PRIMARY_H_THR,
+    primary_m_thr: float = PRIMARY_M_THR,
+    fallback_h_thr: float = FALLBACK_H_THR,
+    fallback_m_thr: float = FALLBACK_M_THR,
+    max_groups_per_selected: int = MAX_GROUPS_PER_SELECTED,
+    min_groups_per_selected: int = MIN_GROUPS_PER_SELECTED,
+) -> List[List[float]] | Dict[str, Any]:
     base_dir = Path(base_dir)
     selected_list_file = base_dir / "selected_CG_path.txt"
     if replay_dataset_path is None:
@@ -236,7 +309,10 @@ def build_replay_data(
     print(f"[INFO] real_dataset 中可用状态点组数: {len(all_group_keys)}")
 
     for filename, H, M, excite_key, excite_id in targets:
-        selected_keys = pick_replay_groups_for_target(H, M, excite_id, all_group_keys)
+        selected_keys = pick_replay_groups_for_target(
+            H, M, excite_id, all_group_keys, primary_h_thr, primary_m_thr,
+            fallback_h_thr, fallback_m_thr, max_groups_per_selected, min_groups_per_selected,
+        )
         if not selected_keys:
             print(f"[WARN] 未找到 replay 组 | {filename} | H={H:.3f}, M={M:.3f}, excite={excite_key}")
             continue
@@ -267,7 +343,21 @@ def build_replay_data(
         f"[DONE] replay kept in memory: groups={len(chosen_group_keys)}, "
         f"rows={len(replay_rows)}; no replay_data.txt written"
     )
-    return replay_rows
+    if not structured:
+        return replay_rows
+    guard_keys = select_global_guard_groups(
+        all_group_keys, targets, guard_max_groups, guard_min_groups_per_excitation, selection_seed
+    )
+    guard_rows = [
+        [float(value) for value in line.replace(",", " ").split()]
+        for key in guard_keys for line in groups[key]
+    ]
+    return {
+        "local_replay_rows": replay_rows,
+        "global_guard_rows": guard_rows,
+        "local_group_keys": chosen_group_keys,
+        "guard_group_keys": guard_keys,
+    }
 
 
 def main():

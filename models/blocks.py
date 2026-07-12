@@ -62,6 +62,25 @@ class LoRALinear(nn.Module):
         return self.base(x) + self.B(self.A(self.dropout(x))) * self.scale
 
 
+class HMModMLP(nn.Module):
+    """Small non-LoRA MLP dedicated to bounded H/M corrections."""
+    def __init__(self, dims: Iterable[int], dropout: float = 0.0):
+        super().__init__()
+        dims = list(dims)
+        layers = []
+        for index in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[index], dims[index + 1]))
+            if index < len(dims) - 2:
+                layers.append(nn.GELU())
+                if float(dropout) > 0:
+                    layers.append(nn.Dropout(float(dropout)))
+        layers.append(nn.Tanh())
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class LowFidelityHead(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -79,11 +98,51 @@ class LowFidelityHead(nn.Module):
         )
 
         self.mod = None
+        self.hm_mod = None
+        self.exc_gate = None
+        self.ch_gate = None
         if getattr(cfg, "use_modulation", False):
-            self.mod = nn.Sequential(
-                nn.Linear(2, cfg.K_max * SLOT_PARAM_COUNT),
-                nn.Tanh(),
-            )
+            mode = str(getattr(cfg, "modulation_mode", "conditional"))
+            if mode == "legacy":
+                # Keep the original module name and state-dict keys for strict loading.
+                self.mod = nn.Sequential(nn.Linear(2, out_dim), nn.Tanh())
+            elif mode == "conditional":
+                self.hm_mod = HMModMLP(
+                    [2, *list(getattr(cfg, "mod_hidden", [32, 64])), out_dim],
+                    dropout=float(getattr(cfg, "mod_dropout", 0.0)),
+                )
+                self.exc_gate = nn.Linear(cfg.embed_excitation_dim, out_dim)
+                self.ch_gate = nn.Linear(cfg.embed_channel_dim, out_dim)
+                nn.init.zeros_(self.exc_gate.weight)
+                nn.init.zeros_(self.exc_gate.bias)
+                nn.init.zeros_(self.ch_gate.weight)
+                nn.init.zeros_(self.ch_gate.bias)
+                exc_scale = [
+                    float(getattr(cfg, "mod_exc_pole_scale", 0.05)),
+                    float(getattr(cfg, "mod_exc_pole_scale", 0.05)),
+                    *([float(getattr(cfg, "mod_exc_residue_scale", 0.10))] * 3),
+                ] * int(cfg.K_max)
+                channel_pole_scale = (
+                    float(getattr(cfg, "mod_channel_residue_scale", 0.10))
+                    if bool(getattr(cfg, "mod_channel_affects_poles", False)) else 0.0
+                )
+                ch_scale = [
+                    channel_pole_scale,
+                    channel_pole_scale,
+                    *([float(getattr(cfg, "mod_channel_residue_scale", 0.10))] * 3),
+                ] * int(cfg.K_max)
+                self.register_buffer("exc_scale", torch.tensor(exc_scale).view(1, cfg.K_max, SLOT_PARAM_COUNT))
+                self.register_buffer("ch_scale", torch.tensor(ch_scale).view(1, cfg.K_max, SLOT_PARAM_COUNT))
+            else:
+                raise ValueError(f"Unsupported modulation_mode={mode!r}; expected 'legacy' or 'conditional'")
+
+    def conditional_gates(self, exc_emb, ch_emb):
+        if self.exc_gate is None or self.ch_gate is None:
+            raise RuntimeError("Conditional gates are unavailable unless conditional modulation is enabled")
+        shape = (-1, self.cfg.K_max, SLOT_PARAM_COUNT)
+        exc_raw = torch.tanh(self.exc_gate(exc_emb)).view(shape)
+        ch_raw = torch.tanh(self.ch_gate(ch_emb)).view(shape)
+        return 1.0 + exc_raw * self.exc_scale, 1.0 + ch_raw * self.ch_scale
 
     def forward(self, Hn, Mn, exc_emb, ch_emb):
         x = torch.cat([Hn, Mn, exc_emb, ch_emb], dim=1)
@@ -92,6 +151,11 @@ class LowFidelityHead(nn.Module):
             hm = torch.cat([Hn, Mn], dim=1)
             correction = self.cfg.mod_gamma * self.mod(hm).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
             out = out + correction
+        elif self.hm_mod is not None:
+            hm = torch.cat([Hn, Mn], dim=1)
+            hm_corr = self.hm_mod(hm).view(-1, self.cfg.K_max, SLOT_PARAM_COUNT)
+            exc_gate, ch_gate = self.conditional_gates(exc_emb, ch_emb)
+            out = out + self.cfg.mod_gamma * hm_corr * exc_gate * ch_gate
         return {
             "u_alpha": out[..., 0],
             "u_omega": out[..., 1],
@@ -186,6 +250,18 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return trainable, total
+
+
+def count_parameter_groups(model: MFDNN) -> dict[str, int]:
+    low = model.low
+    return {
+        "main_mlp_parameters": sum(p.numel() for p in low.mlp.parameters()),
+        "hm_mod_parameters": sum(p.numel() for p in low.hm_mod.parameters()) if low.hm_mod is not None else sum(p.numel() for p in low.mod.parameters()) if low.mod is not None else 0,
+        "exc_gate_parameters": sum(p.numel() for p in low.exc_gate.parameters()) if low.exc_gate is not None else 0,
+        "ch_gate_parameters": sum(p.numel() for p in low.ch_gate.parameters()) if low.ch_gate is not None else 0,
+        "embedding_parameters": sum(p.numel() for p in model.emb_exc.parameters()) + sum(p.numel() for p in model.emb_ch.parameters()),
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+    }
 
 
 def _copy_tensor(dst: torch.Tensor, src: torch.Tensor, key: str):

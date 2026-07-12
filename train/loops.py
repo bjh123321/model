@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from surrogate_model.config import Config
 from surrogate_model.data.io import OMEGA_N
-from surrogate_model.models.blocks import MFDNN
+from surrogate_model.models.blocks import MFDNN, count_parameter_groups
 from surrogate_model.train.dataloaders import build_single_fidelity_dataloaders
 from surrogate_model.utils.dist_utils import is_main_process
 
@@ -267,7 +267,13 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
         "lora_alpha": float(getattr(model_core.cfg, "lora_alpha", 1.0)),
         "lora_dropout": float(getattr(model_core.cfg, "lora_dropout", 0.0)),
         "use_modulation": bool(getattr(model_core.cfg, "use_modulation", False)),
+        "modulation_mode": str(getattr(model_core.cfg, "modulation_mode", "conditional")),
         "mod_gamma": float(getattr(model_core.cfg, "mod_gamma", 0.0)),
+        "mod_dropout": float(getattr(model_core.cfg, "mod_dropout", 0.0)),
+        "mod_exc_pole_scale": float(getattr(model_core.cfg, "mod_exc_pole_scale", 0.05)),
+        "mod_exc_residue_scale": float(getattr(model_core.cfg, "mod_exc_residue_scale", 0.10)),
+        "mod_channel_residue_scale": float(getattr(model_core.cfg, "mod_channel_residue_scale", 0.10)),
+        "mod_channel_affects_poles": bool(getattr(model_core.cfg, "mod_channel_affects_poles", False)),
         "embed_excitation_num": int(getattr(model_core.cfg, "embed_excitation_num", 0)),
         "embed_excitation_dim": int(getattr(model_core.cfg, "embed_excitation_dim", 0)),
         "embed_channel_num": int(getattr(model_core.cfg, "embed_channel_num", 0)),
@@ -331,6 +337,12 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     val_hist = []
 
     if is_main_process():
+        modulation_fields = (
+            "modulation_mode", "mod_hidden", "mod_gamma", "mod_exc_pole_scale",
+            "mod_exc_residue_scale", "mod_channel_residue_scale", "mod_channel_affects_poles",
+        )
+        print("[MODULATION] " + " ".join(f"{name}={getattr(cfg, name)}" for name in modulation_fields), flush=True)
+        print("[PARAMETERS] " + " ".join(f"{name}={value}" for name, value in count_parameter_groups(model_core).items()), flush=True)
         print(
             f"[Fixed-SF] train_rows={n_train}, val_rows={n_val}, "
             f"pole_target={out_norm.pole_target}, residue_target={out_norm.residue_target}, targets={target_names}",
