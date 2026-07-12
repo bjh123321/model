@@ -23,6 +23,10 @@ from surrogate_model.models.blocks import (
     get_lora_parameters,
     load_base_weights_into_lora_model,
 )
+from surrogate_model.models.checkpoint_utils import (
+    checkpoint_uses_lora,
+    restore_model_config_from_checkpoint,
+)
 
 
 def get_exe_dir() -> Path:
@@ -200,43 +204,11 @@ def restore_safe_or_initial(model, best_state, initial_state):
 
 
 def _restore_cfg_from_checkpoint(ckpt: dict, use_lora: bool) -> Config:
-    cfg = Config()
-    cfg.modulation_mode = str(ckpt.get("modulation_mode", "legacy"))
-    for attr in (
-        "K_max",
-        "embed_excitation_num",
-        "embed_channel_num",
-        "embed_excitation_dim",
-        "embed_channel_dim",
-        "low_hidden",
-        "mod_hidden",
-        "mod_dropout",
-        "mod_exc_pole_scale",
-        "mod_exc_residue_scale",
-        "mod_channel_residue_scale",
-        "mod_channel_affects_poles",
-        "dropout_prob",
-        "lora_rank",
-        "lora_alpha",
-        "lora_dropout",
-        "use_modulation",
-        "mod_gamma",
-        "pole_target",
-        "residue_target",
-    ):
-        if attr in ckpt:
-            setattr(cfg, attr, ckpt[attr])
-    cfg.use_lora = bool(use_lora)
-    return cfg
+    return restore_model_config_from_checkpoint(ckpt, use_lora=use_lora)
 
 
 def _checkpoint_uses_lora(ckpt: dict, state: dict) -> bool:
-    metadata_flag = bool(ckpt.get("use_lora", False)) if isinstance(ckpt, dict) else False
-    state_flag = any(
-        (".A.weight" in key) or (".B.weight" in key) or (".base.weight" in key)
-        for key in state.keys()
-    )
-    return metadata_flag or state_flag
+    return checkpoint_uses_lora(ckpt, state)
 
 
 def _send_finished_udp():

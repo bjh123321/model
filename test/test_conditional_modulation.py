@@ -92,6 +92,7 @@ def test_old_checkpoint_without_mode_restores_legacy_strictly():
     cfg.modulation_mode = "legacy"
     old_model = MFDNN(cfg)
     metadata = {name: getattr(cfg, name) for name in ("K_max", "embed_excitation_num", "embed_channel_num", "embed_excitation_dim", "embed_channel_dim", "low_hidden", "mod_hidden", "use_modulation", "mod_gamma")}
+    metadata["model_state_dict"] = old_model.state_dict()
     restored_cfg = _restore_cfg_from_checkpoint(metadata, use_lora=False)
     restored = MFDNN(restored_cfg)
     restored.load_state_dict(old_model.state_dict(), strict=True)
@@ -103,6 +104,7 @@ def test_conditional_checkpoint_round_trip_predictions_match():
     cfg = Config()
     original = MFDNN(cfg).eval()
     metadata = {name: getattr(cfg, name) for name in ("K_max", "embed_excitation_num", "embed_channel_num", "embed_excitation_dim", "embed_channel_dim", "low_hidden", "mod_hidden", "mod_dropout", "modulation_mode", "mod_exc_pole_scale", "mod_exc_residue_scale", "mod_channel_residue_scale", "mod_channel_affects_poles", "use_modulation", "mod_gamma")}
+    metadata["model_state_dict"] = original.state_dict()
     restored = MFDNN(_restore_cfg_from_checkpoint(metadata, use_lora=False)).eval()
     restored.load_state_dict(original.state_dict(), strict=True)
     inputs = _inputs(cfg, 3)

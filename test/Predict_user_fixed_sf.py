@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from surrogate_model.models.blocks import MFDNN as _RealMFDNN
+from surrogate_model.models.checkpoint_utils import restore_model_config_from_checkpoint
 
 # Reuse the existing prediction script for task parsing, response reconstruction,
 # and PR/HF/HG/HA/VF/VG/VA file writing. Only replace the model-output adapter.
@@ -16,39 +17,36 @@ except ModuleNotFoundError:
     _base = importlib.import_module("surrogate_model.test.Predict_user")
 
 _LAST_STATE = None
+_LAST_CHECKPOINT = None
 _REAL_TORCH_LOAD = _base.torch.load
 
 
 def _capture_torch_load(*args, **kwargs):
-    global _LAST_STATE
+    global _LAST_CHECKPOINT, _LAST_STATE
     ckpt = _REAL_TORCH_LOAD(*args, **kwargs)
     if isinstance(ckpt, dict):
         state = ckpt.get("model_state_dict", ckpt)
         if isinstance(state, dict):
+            _LAST_CHECKPOINT = ckpt
             _LAST_STATE = state
     return ckpt
 
 
 class _MFDNNFromCheckpoint(_RealMFDNN):
-    """Build MFDNN with embedding sizes inferred from the checkpoint state."""
+    """Build MFDNN from the complete structural checkpoint configuration."""
 
     def __init__(self, cfg):
-        state = _LAST_STATE or {}
-        emb_exc = state.get("emb_exc.weight")
-        emb_ch = state.get("emb_ch.weight")
-        if isinstance(emb_exc, torch.Tensor):
-            cfg.embed_excitation_num = int(emb_exc.shape[0])
-            cfg.embed_excitation_dim = int(emb_exc.shape[1])
-        if isinstance(emb_ch, torch.Tensor):
-            cfg.embed_channel_num = int(emb_ch.shape[0])
-            cfg.embed_channel_dim = int(emb_ch.shape[1])
+        if _LAST_CHECKPOINT is None:
+            raise RuntimeError("MFDNN was constructed before a checkpoint was captured")
+        restored_cfg = restore_model_config_from_checkpoint(_LAST_CHECKPOINT)
         print(
             f"[Fixed-SF] model embedding sizes from checkpoint: "
-            f"exc={cfg.embed_excitation_num}x{cfg.embed_excitation_dim}, "
-            f"ch={cfg.embed_channel_num}x{cfg.embed_channel_dim}",
+            f"exc={restored_cfg.embed_excitation_num}x{restored_cfg.embed_excitation_dim}, "
+            f"ch={restored_cfg.embed_channel_num}x{restored_cfg.embed_channel_dim}, "
+            f"modulation_mode={restored_cfg.modulation_mode}, use_lora={restored_cfg.use_lora}",
             flush=True,
         )
-        super().__init__(cfg)
+        super().__init__(restored_cfg)
 
 
 @torch.no_grad()

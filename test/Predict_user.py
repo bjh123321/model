@@ -12,8 +12,7 @@ import pandas as pd
 import torch
 from scipy.signal import lfilter
 
-from surrogate_model.config import Config
-from surrogate_model.models.blocks import MFDNN
+from surrogate_model.models.checkpoint_utils import build_model_from_checkpoint
 from surrogate_model.data.normalizer import Normalizer
 from surrogate_model.data.xlsx_utils import load_signal_type_rows
 from surrogate_model.test.residue_pred import build_BA_from_residues
@@ -1034,11 +1033,8 @@ def main():
     }
 
     # ===== 加载模型 =====
-    cfg = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_norm = Normalizer.load(out_norm_path)
-    cfg.K_max = 3
-    cfg.residue_target = "fixed"
 
     print(f"==> Loading ckpt: {ckpt_path}")
     print(f"==> Prediction output: {args.predict_output}")
@@ -1046,42 +1042,13 @@ def main():
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     except TypeError:
         ckpt = torch.load(ckpt_path, map_location="cpu")
-    state = ckpt.get("model_state_dict", ckpt)
-    if isinstance(ckpt, dict):
-        for attr in (
-            "K_max",
-            "low_hidden",
-            "mod_hidden",
-            "dropout_prob",
-            "use_lora",
-            "lora_rank",
-            "lora_alpha",
-            "lora_dropout",
-            "use_modulation",
-            "mod_gamma",
-            "embed_excitation_num",
-            "embed_excitation_dim",
-            "embed_channel_num",
-            "embed_channel_dim",
-            "pole_target",
-            "residue_target",
-        ):
-            if attr in ckpt:
-                setattr(cfg, attr, ckpt[attr])
-    emb_exc = state.get("emb_exc.weight") if isinstance(state, dict) else None
-    emb_ch = state.get("emb_ch.weight") if isinstance(state, dict) else None
-    if isinstance(emb_exc, torch.Tensor):
-        cfg.embed_excitation_num = int(emb_exc.shape[0])
-        cfg.embed_excitation_dim = int(emb_exc.shape[1])
-    if isinstance(emb_ch, torch.Tensor):
-        cfg.embed_channel_num = int(emb_ch.shape[0])
-        cfg.embed_channel_dim = int(emb_ch.shape[1])
-
-    model = MFDNN(cfg).to(device)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    print(f"Missing keys: {missing}")
-    print(f"Unexpected keys: {unexpected}")
-    model.eval()
+    model = build_model_from_checkpoint(ckpt, device=device, checkpoint_path=ckpt_path)
+    cfg = model.cfg
+    print(
+        f"==> Strict checkpoint load succeeded: modulation_mode={cfg.modulation_mode}, "
+        f"use_lora={cfg.use_lora}, K_max={cfg.K_max}",
+        flush=True,
+    )
 
     in_norm = Normalizer.load(in_norm_path)
     mode_freq_ranges = _load_channel_freq_ranges(csv_path)
