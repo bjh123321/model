@@ -50,7 +50,7 @@ class Config:
     )
 
     # Target representation
-    pole_target: str = "alpha_omega"
+    pole_target: str = "freq_damping"
     residue_target: str = "polar"
 
     epochs_stage1: int = 3000
@@ -62,9 +62,9 @@ class Config:
     weight_decay: float = 5e-5
 
     # LoRA incremental fine-tuning
-    incremental_epochs: int = 1000
+    incremental_epochs: int = 2000
     incremental_batch_size: int = 16
-    incremental_lr: float = 1e-4
+    incremental_lr: float = 5e-3
     incremental_weight_decay: float = 1e-4
     incremental_beta_kd: float = 0.2
     incremental_gamma_replay: float = 0.1
