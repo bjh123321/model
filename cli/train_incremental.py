@@ -43,6 +43,17 @@ def _path_from_ini(cp: configparser.ConfigParser, paths_ini_path: Path, section:
         raise KeyError(f"{paths_ini_path} is missing [{section}] / {key}") from None
 
 
+def resolve_history_dataset_path(base_dir: Path, cli_value: str | None, cfg: Config) -> Path:
+    """Resolve history independently of the location of direct correction files."""
+    configured = getattr(
+        cfg,
+        "incremental_history_dataset_dir",
+        cfg.incremental_replay_dataset_dir,
+    )
+    path = Path(cli_value or configured).expanduser()
+    return path.resolve() if path.is_absolute() else (Path(base_dir) / path).resolve()
+
+
 class RealIncrementalDataset(Dataset):
     def __init__(
         self,
@@ -203,6 +214,26 @@ def restore_safe_or_initial(model, best_state, initial_state):
     return found
 
 
+def iter_incremental_epoch_batches(dl_new, dl_replay):
+    """Cycle the smaller loader so one epoch covers every batch of the larger loader."""
+    if len(dl_new) <= 0 or len(dl_replay) <= 0:
+        raise RuntimeError("New-data and global-replay loaders must both be non-empty")
+    new_iterator = iter(dl_new)
+    replay_iterator = iter(dl_replay)
+    for _ in range(max(len(dl_new), len(dl_replay))):
+        try:
+            batch_new = next(new_iterator)
+        except StopIteration:
+            new_iterator = iter(dl_new)
+            batch_new = next(new_iterator)
+        try:
+            batch_replay = next(replay_iterator)
+        except StopIteration:
+            replay_iterator = iter(dl_replay)
+            batch_replay = next(replay_iterator)
+        yield batch_new, batch_replay
+
+
 def _restore_cfg_from_checkpoint(ckpt: dict, use_lora: bool) -> Config:
     return restore_model_config_from_checkpoint(ckpt, use_lora=use_lora)
 
@@ -258,6 +289,11 @@ def main():
     ap.add_argument("--lambda_guard", type=float, default=None)
     ap.add_argument("--early_stop_patience", type=int, default=None)
     ap.add_argument("--early_stop_min_delta", type=float, default=None)
+    ap.add_argument("--history_dataset", type=str, default=None)
+    ap.add_argument("--replay_fraction", type=float, default=None)
+    ap.add_argument("--split_seed", type=int, default=None)
+    ap.add_argument("--split_manifest", type=str, default=None)
+    ap.add_argument("--rebuild_split", action="store_true")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -266,6 +302,40 @@ def main():
     def resolve_user_path(raw: str) -> Path:
         path = Path(raw.strip()).expanduser()
         return path if path.is_absolute() else (base_dir / path).resolve()
+
+    history_dataset_path = resolve_history_dataset_path(
+        base_dir, args.history_dataset, default_cfg
+    )
+    if not history_dataset_path.exists():
+        raise FileNotFoundError(
+            f"Incremental history dataset does not exist: {history_dataset_path}. "
+            "Set --history_dataset or Config.incremental_history_dataset_dir."
+        )
+    replay_fraction = float(
+        args.replay_fraction
+        if args.replay_fraction is not None
+        else default_cfg.incremental_replay_fraction
+    )
+    split_seed = int(
+        args.split_seed if args.split_seed is not None else default_cfg.incremental_split_seed
+    )
+    split_manifest_path = (
+        resolve_user_path(args.split_manifest) if args.split_manifest else None
+    )
+
+    def build_global_history_split(selected_names=None):
+        return build_replay_data(
+            base_dir,
+            model_dir,
+            history_dataset_path=history_dataset_path,
+            selected_names=selected_names,
+            structured=True,
+            replay_fraction=replay_fraction,
+            split_seed=split_seed,
+            split_manifest_path=split_manifest_path,
+            rebuild_split=bool(args.rebuild_split),
+            reuse_split=bool(default_cfg.incremental_reuse_split),
+        )
 
     direct_data_paths: list[Path] = []
     fourth_raw = lines[3].strip() if len(lines) >= 4 else ""
@@ -281,30 +351,13 @@ def main():
                 raise FileNotFoundError(f"user_input.dat line {line_no} is not an existing dataset file: {path}")
             direct_data_paths.append(path)
 
-        parent_dirs = {path.resolve().parent for path in direct_data_paths}
-        if len(parent_dirs) != 1:
-            raise ValueError(f"Direct correction dataset files must share one parent directory, got: {sorted(map(str, parent_dirs))}")
-        replay_dataset_path = next(iter(parent_dirs))
-        replay_result = build_replay_data(
-            base_dir,
-            model_dir,
-            replay_dataset_path=replay_dataset_path,
-            selected_names=[path.name for path in direct_data_paths],
-            structured=True,
-            guard_max_groups=default_cfg.incremental_guard_max_groups,
-            guard_min_groups_per_excitation=default_cfg.incremental_guard_min_groups_per_excitation,
-            selection_seed=default_cfg.incremental_selection_seed,
-            primary_h_thr=default_cfg.incremental_replay_primary_h_thr,
-            primary_m_thr=default_cfg.incremental_replay_primary_m_thr,
-            fallback_h_thr=default_cfg.incremental_replay_fallback_h_thr,
-            fallback_m_thr=default_cfg.incremental_replay_fallback_m_thr,
-            max_groups_per_selected=default_cfg.incremental_replay_max_groups_per_selected,
-            min_groups_per_selected=default_cfg.incremental_replay_min_groups_per_selected,
+        replay_result = build_global_history_split(
+            selected_names=[path.name for path in direct_data_paths]
         )
         new_data_paths = direct_data_paths
         print(
             f"[CORRECTION] mode=direct_dataset files={len(new_data_paths)} "
-            f"replay_pool={replay_dataset_path}",
+            f"history_dataset={history_dataset_path}",
             flush=True,
         )
     else:
@@ -315,34 +368,21 @@ def main():
                 "falling back to selected_CG_path + OE mode.",
                 flush=True,
             )
-        replay_dataset_path = Path(default_cfg.incremental_replay_dataset_dir).expanduser()
-        if not replay_dataset_path.is_absolute():
-            replay_dataset_path = (base_dir / replay_dataset_path).resolve()
-        if not replay_dataset_path.is_dir():
-            raise FileNotFoundError(f"Configured incremental replay dataset directory does not exist: {replay_dataset_path}")
-
-        # Snapshot replay before generating this run's new split files.
-        replay_result = build_replay_data(
-            base_dir, model_dir, replay_dataset_path=replay_dataset_path, structured=True,
-            guard_max_groups=default_cfg.incremental_guard_max_groups,
-            guard_min_groups_per_excitation=default_cfg.incremental_guard_min_groups_per_excitation,
-            selection_seed=default_cfg.incremental_selection_seed,
-            primary_h_thr=default_cfg.incremental_replay_primary_h_thr,
-            primary_m_thr=default_cfg.incremental_replay_primary_m_thr,
-            fallback_h_thr=default_cfg.incremental_replay_fallback_h_thr,
-            fallback_m_thr=default_cfg.incremental_replay_fallback_m_thr,
-            max_groups_per_selected=default_cfg.incremental_replay_max_groups_per_selected,
-            min_groups_per_selected=default_cfg.incremental_replay_min_groups_per_selected,
-        )
+        # Snapshot the stable history split before generating this run's new files.
+        replay_result = build_global_history_split()
         new_data_paths = batch_process_split(
             data_dir,
             base_dir,
             selected_list,
-            reserved_names_dir=replay_dataset_path,
+            reserved_names_dir=(
+                history_dataset_path
+                if history_dataset_path.is_dir()
+                else history_dataset_path.parent
+            ),
         )
         print(
             f"[CORRECTION] mode=cg_oe files={len(new_data_paths)} "
-            f"output_dir={base_dir} replay_pool={replay_dataset_path}",
+            f"output_dir={base_dir} history_dataset={history_dataset_path}",
             flush=True,
         )
 
@@ -357,9 +397,9 @@ def main():
     lambda_guard = float(args.lambda_guard if args.lambda_guard is not None else default_cfg.incremental_lambda_guard)
     early_stop_patience = int(args.early_stop_patience if args.early_stop_patience is not None else default_cfg.incremental_early_stop_patience)
     early_stop_min_delta = float(args.early_stop_min_delta if args.early_stop_min_delta is not None else default_cfg.incremental_early_stop_min_delta)
-    replay_rows = replay_result["local_replay_rows"]
+    replay_rows = replay_result["global_replay_rows"]
     guard_rows = replay_result["global_guard_rows"]
-    local_group_keys = replay_result["local_group_keys"]
+    replay_group_keys = replay_result["replay_group_keys"]
     guard_group_keys = replay_result["guard_group_keys"]
 
     in_norm = Normalizer.load(model_dir / "Normalizer_Input.pth")
@@ -425,7 +465,7 @@ def main():
 
     dl_new = DataLoader(ds_new, batch_size=batch_size, shuffle=True, drop_last=False)
     dl_new_eval = DataLoader(ds_new, batch_size=batch_size, shuffle=False, drop_last=False)
-    dl_replay = DataLoader(ds_replay, batch_size=batch_size, shuffle=True, drop_last=False) if ds_replay is not None else None
+    dl_replay = DataLoader(ds_replay, batch_size=batch_size, shuffle=True, drop_last=False)
     dl_guard = DataLoader(ds_guard, batch_size=batch_size, shuffle=False, drop_last=False)
 
     target_names = out_norm.target_names()
@@ -444,19 +484,18 @@ def main():
     best_epoch = 0
     best_state = None
     no_improve_epochs = 0
-    print(f"[DATA] new rows/groups={len(ds_new)}/{len(ds_new.group_keys)} local replay rows/groups={len(ds_replay)}/{len(local_group_keys)} global guard rows/groups={len(ds_guard)}/{len(guard_group_keys)}", flush=True)
+    print(f"[DATA] new rows/groups={len(ds_new)}/{len(ds_new.group_keys)} global replay rows/groups={len(ds_replay)}/{len(replay_group_keys)} global guard rows/groups={len(ds_guard)}/{len(guard_group_keys)}", flush=True)
     print(f"[CONFIG] target_names={target_names} beta_kd={beta_kd} gamma_replay={gamma_replay} old_loss_tolerance={old_loss_tolerance} lambda_guard={lambda_guard} learning_rate={lr}", flush=True)
     print(f"[FULL-EVAL] epoch=0 loss_new_full={initial_new_loss:.6f} baseline_guard_loss={baseline_guard_loss:.6f} initial_guard_loss={initial_guard_loss:.6f}", flush=True)
 
     for epoch in range(1, epochs + 1):
         student.train()
-        it_replay = iter(dl_replay) if dl_replay is not None else None
         warm = 1.0 if warmup_epochs <= 0 else min(float(epoch) / float(warmup_epochs), 1.0)
         sum_new = sum_kd = sum_rep = sum_total = 0.0
         count_new = count_kd = count_rep = 0.0
         n_steps = 0
 
-        for batch in dl_new:
+        for batch, batch_r in iter_incremental_epoch_batches(dl_new, dl_replay):
             H, M, e, c, yN, mask = _batch_to_device(batch, device)
             out_new = student(H, M, e, c)
             loss_new = representation_loss(out_new, yN, mask, mean_t, std_t, target_names)
@@ -467,21 +506,15 @@ def main():
             replay_valid = 0.0
             replay_samples = 0.0
 
-            if it_replay is not None:
-                try:
-                    batch_r = next(it_replay)
-                except StopIteration:
-                    it_replay = iter(dl_replay)
-                    batch_r = next(it_replay)
-                Hr, Mr, er, cr, yNr, maskr = _batch_to_device(batch_r, device)
-                with torch.no_grad():
-                    out_old = teacher(Hr, Mr, er, cr)
-                out_new_r = student(Hr, Mr, er, cr)
-                loss_kd = kd_loss_fn(out_new_r, out_old, maskr, std_t, target_names, beta_kd)
-                loss_rep = representation_loss(out_new_r, yNr, maskr, mean_t, std_t, target_names) * gamma_replay
-                replay_width = min(maskr.size(1), out_new_r["alpha"].size(1), min(yNr[name].size(1) for name in target_names))
-                replay_valid = float(maskr[:, :replay_width].sum().item())
-                replay_samples = float(Hr.size(0))
+            Hr, Mr, er, cr, yNr, maskr = _batch_to_device(batch_r, device)
+            with torch.no_grad():
+                out_old = teacher(Hr, Mr, er, cr)
+            out_new_r = student(Hr, Mr, er, cr)
+            loss_kd = kd_loss_fn(out_new_r, out_old, maskr, std_t, target_names, beta_kd)
+            loss_rep = representation_loss(out_new_r, yNr, maskr, mean_t, std_t, target_names) * gamma_replay
+            replay_width = min(maskr.size(1), out_new_r["alpha"].size(1), min(yNr[name].size(1) for name in target_names))
+            replay_valid = float(maskr[:, :replay_width].sum().item())
+            replay_samples = float(Hr.size(0))
 
             loss = loss_new + warm * loss_kd + warm * loss_rep
             opt.zero_grad(set_to_none=True)
@@ -510,7 +543,7 @@ def main():
         else:
             no_improve_epochs += 1
 
-        print(f"[fixed-sf LoRA inc] epoch={epoch}/{epochs} lr={opt.param_groups[0]['lr']:.6g} warm={warm:.4f} loss_new_batch={sum_new/max(count_new,1.0):.6f} loss_new_full={loss_new_full:.6f} loss_local_replay={sum_rep/max(count_rep,1.0):.6f} loss_kd={sum_kd/max(count_kd,1.0):.6f} loss_guard_full={loss_guard_full:.6f} baseline_guard_loss={baseline_guard_loss:.6f} guard_ratio={guard_ratio:.6f} guard_safe={guard_safe} combined_score={combined_score:.6f} best_safe_epoch={best_epoch}", flush=True)
+        print(f"[fixed-sf LoRA inc] epoch={epoch}/{epochs} lr={opt.param_groups[0]['lr']:.6g} warm={warm:.4f} loss_new_batch={sum_new/max(count_new,1.0):.6f} loss_new_full={loss_new_full:.6f} loss_global_replay={sum_rep/max(count_rep,1.0):.6f} loss_kd={sum_kd/max(count_kd,1.0):.6f} loss_guard_full={loss_guard_full:.6f} baseline_guard_loss={baseline_guard_loss:.6f} guard_ratio={guard_ratio:.6f} guard_safe={guard_safe} combined_score={combined_score:.6f} best_safe_epoch={best_epoch}", flush=True)
         if early_stop_patience > 0 and no_improve_epochs >= early_stop_patience:
             print(f"[EARLY-STOP] no safe improvement for {no_improve_epochs} epochs", flush=True)
             break
@@ -547,7 +580,8 @@ def main():
             "embed_channel_num": student_cfg.embed_channel_num,
             "embed_channel_dim": student_cfg.embed_channel_dim,
             "incremental_data_files": [path.name for path in new_data_paths],
-            "replay_dataset_path": str(replay_dataset_path),
+            "replay_dataset_path": str(history_dataset_path),
+            "history_dataset_path": str(history_dataset_path),
             "correction_mode": correction_mode,
             "best_epoch": best_epoch,
             "best_new_full": best_new_full,
@@ -560,8 +594,19 @@ def main():
             "beta_kd": beta_kd,
             "gamma_replay": gamma_replay,
             "incremental_lr": lr,
-            "local_replay_group_keys": [list(k) for k in local_group_keys],
+            "local_replay_group_keys": [list(k) for k in replay_group_keys],
+            "global_replay_group_keys": [list(k) for k in replay_group_keys],
             "global_guard_group_keys": [list(k) for k in guard_group_keys],
+            "incremental_replay_fraction": replay_fraction,
+            "incremental_split_seed": split_seed,
+            "incremental_split_manifest": replay_result["split_manifest_path"],
+            "history_dataset_fingerprint": replay_result["history_dataset_fingerprint"],
+            "replay_group_count": len(replay_group_keys),
+            "guard_group_count": len(guard_group_keys),
+            "replay_row_count": len(replay_rows),
+            "guard_row_count": len(guard_rows),
+            "replay_group_hash": replay_result["replay_group_hash"],
+            "guard_group_hash": replay_result["guard_group_hash"],
         },
         save_ckpt_path,
     )

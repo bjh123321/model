@@ -74,6 +74,12 @@ class Config:
     incremental_lambda_guard: float = 1.0
     incremental_early_stop_patience: int = 50
     incremental_early_stop_min_delta: float = 1e-5
+    incremental_history_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"
+    incremental_replay_fraction: float = 0.75
+    incremental_split_seed: int = 42
+    incremental_reuse_split: bool = True
+    # Deprecated local replay/limited guard controls. Retained for config and
+    # checkpoint compatibility; the global replay/guard split ignores them.
     incremental_guard_max_groups: int = 48
     incremental_guard_min_groups_per_excitation: int = 2
     incremental_replay_primary_h_thr: float = 1.5
@@ -84,5 +90,5 @@ class Config:
     incremental_replay_min_groups_per_selected: int = 3
     incremental_selection_seed: int = 42
     incremental_initial_guard_tolerance: float = 1e-6
-    # Complete historical split dataset used as the replay pool in CG+OE mode.
+    # Deprecated alias for incremental_history_dataset_dir.
     incremental_replay_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"
