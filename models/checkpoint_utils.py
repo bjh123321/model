@@ -13,10 +13,7 @@ from surrogate_model.models.blocks import MFDNN
 STRUCTURE_FIELDS = (
     "K_max", "embed_excitation_num", "embed_excitation_dim", "embed_channel_num",
     "embed_channel_dim", "low_hidden", "dropout_prob", "use_lora", "lora_rank",
-    "lora_alpha", "lora_dropout", "use_modulation", "mod_hidden", "mod_dropout",
-    "mod_gamma", "mod_exc_pole_scale", "mod_exc_residue_scale",
-    "mod_channel_residue_scale", "mod_channel_affects_poles", "pole_target",
-    "residue_target",
+    "lora_alpha", "lora_dropout", "use_modulation", "mod_gamma", "pole_target", "residue_target",
 )
 
 
@@ -40,20 +37,19 @@ def checkpoint_uses_lora(checkpoint: Mapping, state: Mapping | None = None) -> b
     return state_uses_lora
 
 
-def _state_modulation_kind(state: Mapping) -> tuple[bool, bool]:
+def _state_modulation_kind(state: Mapping) -> bool:
     legacy = any(key.startswith("low.mod.") for key in state)
     conditional_parts = {
         "hm_mod": any(key.startswith("low.hm_mod.") for key in state),
         "exc_gate": any(key.startswith("low.exc_gate.") for key in state),
         "ch_gate": any(key.startswith("low.ch_gate.") for key in state),
     }
-    conditional = any(conditional_parts.values())
-    if conditional and not all(conditional_parts.values()):
-        missing = [name for name, present in conditional_parts.items() if not present]
-        raise RuntimeError(f"Conditional checkpoint is incomplete; missing parameter groups: {missing}")
-    if legacy and conditional:
-        raise RuntimeError("Checkpoint contains both legacy low.mod.* and conditional modulation parameters")
-    return legacy, conditional
+    if any(conditional_parts.values()):
+        raise RuntimeError(
+            "This checkpoint uses the deprecated conditional modulation architecture "
+            "and cannot be loaded by the restored single-layer model."
+        )
+    return legacy
 
 
 def _restore_embedding_shape(cfg: Config, checkpoint: Mapping, state: Mapping, key: str, num_attr: str, dim_attr: str):
@@ -78,23 +74,20 @@ def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool 
         if field in checkpoint:
             setattr(cfg, field, checkpoint[field])
 
-    legacy, conditional = _state_modulation_kind(state)
+    legacy = _state_modulation_kind(state)
     metadata_mode = checkpoint.get("modulation_mode")
     metadata_use_modulation = checkpoint.get("use_modulation")
-    if metadata_mode is not None and str(metadata_mode) not in ("legacy", "conditional"):
-        raise RuntimeError(f"Invalid modulation_mode={metadata_mode!r}")
-    if metadata_mode == "legacy" and conditional:
-        raise RuntimeError("modulation_mode='legacy' conflicts with conditional state parameters")
-    if metadata_mode == "conditional" and legacy:
-        raise RuntimeError("modulation_mode='conditional' conflicts with legacy state parameters")
-    if metadata_use_modulation is False and (legacy or conditional):
+    if metadata_mode is not None and str(metadata_mode) != "legacy":
+        raise RuntimeError(
+            "This checkpoint uses the deprecated conditional modulation architecture "
+            "and cannot be loaded by the restored single-layer model."
+        )
+    if metadata_use_modulation is False and legacy:
         raise RuntimeError("use_modulation=False conflicts with modulation parameters present in the state dictionary")
     if legacy:
         cfg.modulation_mode, cfg.use_modulation = "legacy", True
-    elif conditional:
-        cfg.modulation_mode, cfg.use_modulation = "conditional", True
     elif metadata_use_modulation is False:
-        cfg.modulation_mode = str(metadata_mode or "legacy")
+        cfg.modulation_mode = "legacy"
         cfg.use_modulation = False
     else:
         raise RuntimeError("Cannot infer modulation structure: no legacy/conditional state keys and use_modulation is not False")
@@ -127,7 +120,7 @@ def build_model_from_checkpoint(checkpoint: Mapping, *, device=None, checkpoint_
         raise RuntimeError(
             f"Failed to load checkpoint {checkpoint_path} with modulation_mode={cfg.modulation_mode!r}; "
             f"strict loading reported missing/unexpected or shape-mismatched keys: {exc}. "
-            "Possible legacy/conditional or LoRA metadata conflict."
+            "Possible deprecated conditional or LoRA metadata conflict."
         ) from exc
     model.eval()
     return model

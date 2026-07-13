@@ -159,7 +159,6 @@ def main():
     parser.add_argument("--embed_excitation_dim", type=int, default=None)
     parser.add_argument("--embed_channel_dim", type=int, default=None)
     parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
-    parser.add_argument("--mod_hidden", type=_parse_int_list, default=None)
     parser.add_argument("--use_modulation", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--dropout_prob", type=float, default=None)
     parser.add_argument("--mod_gamma", type=float, default=None)
@@ -167,6 +166,12 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--early_stop_patience", type=int, default=None)
     parser.add_argument("--early_stop_min_delta", type=float, default=None)
+    parser.add_argument(
+        "--checkpoint_selection",
+        choices=["validation", "training"],
+        default=None,
+        help="Select the best checkpoint by validation group_FXD loss (default) or total training loss.",
+    )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch_real", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -209,8 +214,6 @@ def main():
         cfg.embed_channel_dim = args.embed_channel_dim
     if args.low_hidden is not None:
         cfg.low_hidden = list(args.low_hidden)
-    if args.mod_hidden is not None:
-        cfg.mod_hidden = list(args.mod_hidden)
     if args.use_modulation is not None:
         cfg.use_modulation = bool(args.use_modulation)
     if args.dropout_prob is not None:
@@ -225,6 +228,8 @@ def main():
         cfg.early_stop_patience_s1 = int(args.early_stop_patience)
     if args.early_stop_min_delta is not None:
         cfg.early_stop_min_delta = float(args.early_stop_min_delta)
+    if args.checkpoint_selection is not None:
+        cfg.checkpoint_selection = str(args.checkpoint_selection)
     if args.epochs is not None:
         cfg.epochs_stage1 = int(args.epochs)
     if args.batch_real is not None:

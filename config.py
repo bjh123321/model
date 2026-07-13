@@ -14,20 +14,14 @@ class Config:
     embed_channel_dim: int = 12
 
     low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
-    mod_hidden: List[int] = field(default_factory=lambda: [32, 64])
     dropout_prob: float = 0
     use_lora: bool = False
     lora_rank: int = 4
     lora_alpha: float = 1.0
     lora_dropout: float = 0.0
     use_modulation: bool = True
-    modulation_mode: str = "conditional"
+    modulation_mode: str = "legacy"
     mod_gamma: float = 0.2
-    mod_dropout: float = 0.0
-    mod_exc_pole_scale: float = 0.05
-    mod_exc_residue_scale: float = 0.10
-    mod_channel_residue_scale: float = 0.10
-    mod_channel_affects_poles: bool = False
     debug_direct_output: bool = False
 
     # Fixed-SF training
@@ -62,6 +56,7 @@ class Config:
     epochs_stage1: int = 3000
     early_stop_patience_s1: int = 500
     early_stop_min_delta: float = 1e-6
+    checkpoint_selection: str = "validation"
 
     # Optim
     lr_low_adam: float = 1e-3

@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import List
+from copy import deepcopy
 
 import numpy as np
 import torch
@@ -28,6 +29,76 @@ def _target_modes(cfg: Config) -> tuple[str, str]:
 def _output_normalizer(parsed: List[ParsedRow], cfg: Config):
     pole_target, residue_target = _target_modes(cfg)
     return compute_output_normalizer_masked(parsed, pole_target=pole_target, residue_target=residue_target)
+
+
+_DAMPING_LIMIT_BY_EXCITATION = {
+    0: 0.15,  # FXD_FDC
+    1: 0.15,  # FXD_DC
+    2: 0.30,  # PW_FDC
+    3: 0.30,  # PW_DC
+    4: 0.30,  # JFY_FDC
+    5: 0.30,  # JFY_DC
+}
+
+
+def _filter_damping_slots(parsed: List[ParsedRow], split_name: str):
+    """Return copied rows with over-limit modal slots masked out."""
+    filtered = []
+    dropped = []
+    for source in parsed:
+        row = deepcopy(source)
+        mask = np.asarray(row.mask, dtype=np.float32).copy()
+        threshold = _DAMPING_LIMIT_BY_EXCITATION.get(int(row.exc_id))
+        if threshold is not None:
+            damping = np.asarray(row.damping, dtype=np.float64)
+            width = min(len(mask), len(damping))
+            for slot in range(width):
+                if mask[slot] > 0.5 and np.isfinite(damping[slot]) and float(damping[slot]) >= threshold:
+                    mask[slot] = 0.0
+                    dropped.append({
+                        "split": split_name,
+                        "H": float(row.H),
+                        "M": float(row.M),
+                        "exc_id": int(row.exc_id),
+                        "ch_id": int(row.ch_id),
+                        "slot_number": slot + 1,
+                        "slot_index": slot,
+                        "damping": float(damping[slot]),
+                        "threshold": float(threshold),
+                    })
+        row.mask = mask
+        row.K_valid = int(np.count_nonzero(mask > 0.5))
+        filtered.append(row)
+    return filtered, dropped
+
+
+def _write_damping_filter_log(out_dir: Path, dropped: list[dict]):
+    if not is_main_process():
+        return
+    path = Path(out_dir) / "damping_slot_filter.log"
+    train_count = sum(item["split"] == "train" for item in dropped)
+    val_count = sum(item["split"] == "validation" for item in dropped)
+    lines = [
+        "DAMPING SLOT FILTER",
+        "FXD exc_id 0/1: discard damping >= 0.15",
+        "PW  exc_id 2/3: discard damping >= 0.30",
+        "JFY exc_id 4/5: discard damping >= 0.30",
+        f"dropped_total={len(dropped)} dropped_train={train_count} dropped_validation={val_count}",
+        "",
+    ]
+    for index, item in enumerate(dropped, 1):
+        lines.append(
+            f"[{index:05d}] split={item['split']} H={item['H']:.9g} M={item['M']:.9g} "
+            f"exc_id={item['exc_id']} ch_id={item['ch_id']} "
+            f"slot_number={item['slot_number']} slot_index={item['slot_index']} "
+            f"damping={item['damping']:.9g} threshold={item['threshold']:.9g}"
+        )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print(
+        f"[DAMPING-FILTER] dropped slots: total={len(dropped)}, "
+        f"train={train_count}, validation={val_count}; log={path}",
+        flush=True,
+    )
 
 
 def _split_real_by_height_max_mach(real_parsed: List[ParsedRow], cfg: Config):
@@ -223,6 +294,10 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         real_train = real_parsed
         real_val = []
 
+    real_train, dropped_train = _filter_damping_slots(real_train, "train")
+    real_val, dropped_val = _filter_damping_slots(real_val, "validation")
+    _write_damping_filter_log(out_dir, dropped_train + dropped_val)
+
     out_norm_real = _output_normalizer(real_train, cfg)
     if is_main_process():
         out_norm_real.save(out_dir / f"Normalizer_Output_Real_Fold{fold_idx}.pth")
@@ -296,6 +371,10 @@ def build_single_fidelity_dataloaders(
     else:
         real_train = real_parsed
         real_val = []
+
+    real_train, dropped_train = _filter_damping_slots(real_train, "train")
+    real_val, dropped_val = _filter_damping_slots(real_val, "validation")
+    _write_damping_filter_log(out_dir, dropped_train + dropped_val)
 
     in_norm_real = compute_input_normalizer_sim(real_train)
     out_norm_real = _output_normalizer(real_train, cfg)

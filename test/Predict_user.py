@@ -399,77 +399,96 @@ def run_infer_batched(
       - rho 输出已 exp
     """
     N = len(H_all)
+    kmax = int(model.cfg.K_max)
+    ch_limit = int(model.emb_ch.num_embeddings)
+    exc_limit = int(model.emb_exc.num_embeddings)
+    all_channels = np.asarray(ch_all, dtype=np.int64)
+    all_excitations = np.asarray(exc_all, dtype=np.int64)
+    bad_channels = sorted(set(all_channels[(all_channels < 0) | (all_channels >= ch_limit)].tolist()))
+    bad_excitations = sorted(set(all_excitations[(all_excitations < 0) | (all_excitations >= exc_limit)].tolist()))
+    if bad_channels or bad_excitations:
+        print(
+            "[WARN] Some requested channels/excitations are outside checkpoint embeddings; "
+            f"they will be written as zero/empty outputs. bad_ch={bad_channels}, bad_exc={bad_excitations}",
+            flush=True,
+        )
     outs_acc = {k: [] for k in ["alpha", "omega", "rho", "sin_theta", "cos_theta", "valid_mask"]}
 
     for s in range(0, N, batch_size):
         e = min(N, s + batch_size)
+        nb = e - s
+        alpha_full = np.zeros((nb, kmax), dtype=np.float64)
+        omega_full = np.zeros((nb, kmax), dtype=np.float64)
+        rho_full = np.zeros((nb, kmax), dtype=np.float64)
+        sin_full = np.zeros((nb, kmax), dtype=np.float64)
+        cos_full = np.ones((nb, kmax), dtype=np.float64)
+        valid_full = np.zeros((nb, kmax), dtype=bool)
 
-        x = torch.tensor(np.stack([H_all[s:e], M_all[s:e]], axis=1), dtype=torch.float32)
-        x_norm = in_norm.transform(x).to(device)
-        Hn = x_norm[:, :1]
-        Mn = x_norm[:, 1:]
+        ch_batch = np.asarray(ch_all[s:e], dtype=np.int64)
+        exc_batch = np.asarray(exc_all[s:e], dtype=np.int64)
+        ch_invalid = (ch_batch < 0) | (ch_batch >= ch_limit)
+        exc_invalid = (exc_batch < 0) | (exc_batch >= exc_limit)
+        valid_input = ~(ch_invalid | exc_invalid)
+        if np.any(valid_input):
+            local_idx = np.where(valid_input)[0]
+            x = torch.tensor(np.stack([H_all[s:e][valid_input], M_all[s:e][valid_input]], axis=1), dtype=torch.float32)
+            x_norm = in_norm.transform(x).to(device)
+            model_out = model(
+                x_norm[:, :1], x_norm[:, 1:],
+                torch.tensor(exc_batch[valid_input], dtype=torch.long, device=device),
+                torch.tensor(ch_batch[valid_input], dtype=torch.long, device=device),
+            )
+            if isinstance(model_out, tuple):
+                outL, outH = model_out
+                out = outL if predict_output == "low" else outH
+            else:
+                out = model_out
+            required = ("alpha", "omega", "rho", "sin_theta", "cos_theta")
+            missing = [key for key in required if key not in out]
+            if missing:
+                available = sorted(out.keys()) if hasattr(out, "keys") else [type(out).__name__]
+                raise KeyError(f"Fixed-SF prediction is missing required outputs {missing}; available fields: {available}")
 
-        exc_t = torch.tensor(exc_all[s:e], dtype=torch.long, device=device)
-        ch_t = torch.tensor(ch_all[s:e], dtype=torch.long, device=device)
+            alpha = np.nan_to_num(out["alpha"].detach().cpu().numpy().astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+            omega_norm = out["omega"].detach().cpu().numpy().astype(np.float64)
+            omega = np.nan_to_num(omega_norm, nan=0.0, posinf=0.0, neginf=0.0) * float(omegaN)
+            rho_raw = out["rho"].detach().cpu().numpy().astype(np.float64)
+            rho = np.exp(np.clip(np.nan_to_num(rho_raw, nan=-80.0, posinf=80.0, neginf=-80.0), -80.0, 80.0))
+            sin_t = out["sin_theta"].detach().cpu().numpy().astype(np.float64)
+            cos_t = out["cos_theta"].detach().cpu().numpy().astype(np.float64)
+            phase_norm = np.sqrt(sin_t * sin_t + cos_t * cos_t + 1e-12)
+            sin_t = np.nan_to_num(sin_t / phase_norm, nan=0.0, posinf=0.0, neginf=0.0)
+            cos_t = np.nan_to_num(cos_t / phase_norm, nan=1.0, posinf=1.0, neginf=1.0)
+            freq = omega / (2.0 * np.pi)
+            damping = -alpha / np.sqrt(np.maximum(alpha * alpha + omega * omega, 1e-12))
+            valid_mask = (
+                np.isfinite(alpha) & np.isfinite(omega) & np.isfinite(rho)
+                & np.isfinite(sin_t) & np.isfinite(cos_t)
+                & (alpha < 0.0) & (omega > 0.0) & (freq > 0.0)
+                & (damping > 0.0) & (damping < 0.5) & (rho > 1e-12)
+            )
+            if mode_freq_ranges is not None:
+                for local_j, ch_idx in enumerate(ch_batch[valid_input]):
+                    ch_name = channels[int(ch_idx)] if 0 <= int(ch_idx) < len(channels) else f"C{int(ch_idx):02d}"
+                    ranges = mode_freq_ranges.get(ch_name, [None] * kmax)
+                    for slot in range(kmax):
+                        rg = ranges[slot] if slot < len(ranges) else None
+                        valid_mask[local_j, slot] = bool(
+                            rg is not None and valid_mask[local_j, slot]
+                            and float(rg[0]) <= float(freq[local_j, slot]) <= float(rg[1])
+                        )
 
-        model_out = model(Hn, Mn, exc_t, ch_t)
-        if isinstance(model_out, tuple):
-            outL, outH = model_out
-            out = outL if predict_output == "low" else outH
-        else:
-            out = model_out
+            alpha_full[local_idx], omega_full[local_idx], rho_full[local_idx] = alpha, omega, rho
+            sin_full[local_idx], cos_full[local_idx], valid_full[local_idx] = sin_t, cos_t, valid_mask
 
-        alpha = out["alpha"].detach().cpu().numpy()
-        omega_norm = out["omega"].detach().cpu().numpy()
-        rho_log = out["rho"].detach().cpu().numpy()
-        sin_t = out["sin_theta"].detach().cpu().numpy()
-        cos_t = out["cos_theta"].detach().cpu().numpy()
+        outs_acc["alpha"].append(alpha_full)
+        outs_acc["omega"].append(omega_full)
+        outs_acc["rho"].append(rho_full)
+        outs_acc["sin_theta"].append(sin_full)
+        outs_acc["cos_theta"].append(cos_full)
+        outs_acc["valid_mask"].append(valid_full.astype(np.float32))
 
-        alpha = np.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
-        omega = np.nan_to_num(omega_norm * float(omegaN), nan=0.0, posinf=0.0, neginf=0.0)
-        freq = omega / (2.0 * np.pi)
-        damping = -alpha / np.sqrt(np.maximum(alpha * alpha + omega * omega, 1e-12))
-        damping = np.nan_to_num(damping, nan=0.0, posinf=0.999, neginf=0.0)
-        rho = np.exp(np.clip(np.nan_to_num(rho_log, nan=-80.0, posinf=80.0, neginf=-80.0), -80.0, 80.0))
-        sin_t = np.nan_to_num(sin_t, nan=0.0, posinf=0.0, neginf=0.0)
-        cos_t = np.nan_to_num(cos_t, nan=0.0, posinf=0.0, neginf=0.0)
-        residue_re = rho * cos_t
-        residue_im = rho * sin_t
-        valid_mask = (
-            np.isfinite(alpha)
-            & np.isfinite(omega)
-            & np.isfinite(rho)
-            & np.isfinite(sin_t)
-            & np.isfinite(cos_t)
-            & np.isfinite(residue_re)
-            & np.isfinite(residue_im)
-            & (freq > 0.0)
-            & (damping > 0.0)
-            & (damping < 0.5)
-            & (rho > 1e-12)
-        )
-        if mode_freq_ranges is not None:
-            for local_i, ch_idx in enumerate(ch_all[s:e]):
-                ch_name = channels[int(ch_idx)] if 0 <= int(ch_idx) < len(channels) else f"C{int(ch_idx):02d}"
-                ranges = mode_freq_ranges.get(ch_name, [None, None, None])
-                for slot in range(valid_mask.shape[1]):
-                    rg = ranges[slot] if slot < len(ranges) else None
-                    if rg is None:
-                        valid_mask[local_i, slot] = False
-                        continue
-                    fmin, fmax = rg
-                    f_val = float(freq[local_i, slot])
-                    valid_mask[local_i, slot] = bool(valid_mask[local_i, slot] and (fmin <= f_val <= fmax))
-
-        outs_acc["alpha"].append(alpha)
-        outs_acc["omega"].append(omega)
-        outs_acc["rho"].append(rho)
-        outs_acc["sin_theta"].append(sin_t)
-        outs_acc["cos_theta"].append(cos_t)
-        outs_acc["valid_mask"].append(valid_mask.astype(np.float32))
-
-    outs = {k: np.concatenate(v, axis=0) for k, v in outs_acc.items()}
-    return outs
+    return {key: np.concatenate(values, axis=0) for key, values in outs_acc.items()}
 
 
 def load_response_output_header(header_path: Path) -> List[str]:
@@ -512,6 +531,7 @@ def save_response_dat(
     response_output_header: List[str],
     exist_thresh: float = 0.5,
     peak_win_sec: float = 1,
+    use_freq_filter: bool = True,
 ):
     """
     保存响应文件：一个 entry 一个文件
@@ -540,52 +560,19 @@ def save_response_dat(
     SS = ((t_ms % 60000) // 1000).astype(np.int64)
     MS = (t_ms % 1000).astype(np.int64)
 
-    theta = np.arctan2(outs_resp["sin_theta"], outs_resp["cos_theta"])  # (34,S)
-
     # 频率范围表（csv）：用于按通道频段筛选模态
-    fr_map = _load_channel_freq_ranges(csv_path)
+    # Frequency filtering has already been applied per original slot in run_infer_batched.
 
     Y_hat = np.zeros((N, C_full), dtype=np.float64)
     for j in range(C_full):
         # 先按存在性筛选
-        mask_ex = outs_resp["valid_mask"][j] > 0.5
-        if not np.any(mask_ex):
-            continue
-
-        a_all = outs_resp["alpha"][j][mask_ex]
-        w_all = outs_resp["omega"][j][mask_ex]
-        r_all = outs_resp["rho"][j][mask_ex]
-        th_all = theta[j][mask_ex]
-
-        freqs_all = w_all / (2 * np.pi)
-
+        Y_hat[:, j], _, _ = _build_yhat_and_slot_strings(
+            outs_resp["alpha"][j], outs_resp["omega"][j], outs_resp["rho"][j],
+            outs_resp["sin_theta"][j], outs_resp["cos_theta"][j],
+            outs_resp["valid_mask"][j], channels[j], csv_path, u, Ts,
+            exist_thresh=exist_thresh, use_freq_filter=use_freq_filter,
+        )
         # 按通道频率范围(csv)筛选：每个频段最多取 1 个（rho 最大）
-        ch_name = channels[j]
-        ranges = fr_map.get(ch_name, [None, None, None])
-
-        chosen_idx, _, _ = _select_modes_by_freq_ranges(
-            freqs_all=freqs_all,
-            alpha_all=a_all,
-            omega_all=w_all,
-            rho_all=r_all,
-            ranges=ranges,
-        )
-        if not chosen_idx:
-            continue
-
-        a_sel = a_all[chosen_idx]
-        w_sel = w_all[chosen_idx]
-        r_sel = r_all[chosen_idx]
-        th_sel = th_all[chosen_idx]
-
-        B, A = build_BA_from_residues(
-            a_sel,
-            w_sel,
-            r_sel,
-            th_sel,
-            Ts,
-        )
-        Y_hat[:, j] = lfilter(B, A, u)
 
     fname = f"PR_{entry.exc_name}_{entry.kind}_{entry.amp_tag}_{entry.H_tag}_{entry.M_tag}_{model_version}.dat"
     fpath = resp_dir / fname
@@ -632,27 +619,17 @@ def save_response_dat(
         ch_idx = int(ch)
         ch_name = channels[ch_idx]
 
-        mask = outs_resp["valid_mask"][ch_idx] > 0.5
-        if not np.any(mask):
+        _, freq_slots, damp_slots = _build_yhat_and_slot_strings(
+            outs_resp["alpha"][ch_idx], outs_resp["omega"][ch_idx], outs_resp["rho"][ch_idx],
+            outs_resp["sin_theta"][ch_idx], outs_resp["cos_theta"][ch_idx],
+            outs_resp["valid_mask"][ch_idx], ch_name, csv_path, u, Ts,
+            exist_thresh=exist_thresh, use_freq_filter=use_freq_filter,
+        )
+        if not any(freq_slots):
             fd_lines.append(f"{ch_name}," + ",".join([""] * 9) + "\n")
             continue
 
-        w_all = outs_resp["omega"][ch_idx, mask]
-        a_all = outs_resp["alpha"][ch_idx, mask]
-        r_all = outs_resp["rho"][ch_idx, mask]
-
-        freqs_all = w_all / (2 * np.pi)
-
         # 按通道频率范围(csv)筛选：每个频段最多取 1 个（rho 最大），并按 csv 列索引占位输出
-        ranges = fr_map.get(ch_name, [None, None, None])
-
-        _, freq_slots, damp_slots = _select_modes_by_freq_ranges(
-            freqs_all=freqs_all,
-            alpha_all=a_all,
-            omega_all=w_all,
-            rho_all=r_all,
-            ranges=ranges,
-        )
 
         # 交替写入 freq,damp,pp（3个槽位 -> 9列；空槽位用逗号占位）
         segs = exc_table.get(entry.kind, [])
@@ -706,49 +683,46 @@ def _build_yhat_and_slot_strings(
     u: np.ndarray,
     Ts: float,
     exist_thresh: float = 0.5,
+    use_freq_filter: bool = True,
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """对单个扫描点/单个通道：
     1) 按存在性与频段范围筛选槽位；
     2) 重构该通道时域响应 y_hat；
     3) 返回 y_hat、freq_slots、damp_slots。
     """
+    kmax = len(alpha_row)
     y_hat = np.zeros((u.shape[0],), dtype=np.float64)
-    freq_slots = ["", "", ""]
-    damp_slots = ["", "", ""]
+    freq_slots = [""] * kmax
+    damp_slots = [""] * kmax
+    selected_alpha, selected_omega, selected_rho, selected_theta = [], [], [], []
 
-    mask = valid_mask_row > 0.5
-    if not np.any(mask):
+    for slot in range(kmax):
+        if not bool(valid_mask_row[slot] > exist_thresh):
+            continue
+        alpha = float(alpha_row[slot])
+        omega = float(omega_row[slot])
+        rho = float(rho_row[slot])
+        theta = float(np.arctan2(sin_row[slot], cos_row[slot]))
+        if not np.all(np.isfinite([alpha, omega, rho, theta])):
+            continue
+        denominator = float(np.hypot(alpha, omega))
+        if denominator <= 0.0:
+            continue
+        freq_slots[slot] = f"{omega / (2.0 * np.pi):.2f}"
+        damp_slots[slot] = f"{(-alpha / denominator) * 200.0:.6f}"
+        selected_alpha.append(alpha)
+        selected_omega.append(omega)
+        selected_rho.append(rho)
+        selected_theta.append(theta)
+
+    if not selected_alpha:
         return y_hat, freq_slots, damp_slots
-
-    a_all = alpha_row[mask]
-    w_all = omega_row[mask]
-    r_all = rho_row[mask]
-    th_all = np.arctan2(sin_row[mask], cos_row[mask])
-    freqs_all = w_all / (2 * np.pi)
-
-    fr_map = _load_channel_freq_ranges(csv_path)
-    ranges = fr_map.get(ch_name, [None, None, None])
-
-    chosen_idx, freq_slots, damp_slots = _select_modes_by_freq_ranges(
-        freqs_all=freqs_all,
-        alpha_all=a_all,
-        omega_all=w_all,
-        rho_all=r_all,
-        ranges=ranges,
-    )
-    if not chosen_idx:
-        return y_hat, freq_slots, damp_slots
-
-    a_sel = a_all[chosen_idx]
-    w_sel = w_all[chosen_idx]
-    r_sel = r_all[chosen_idx]
-    th_sel = th_all[chosen_idx]
 
     B, A = build_BA_from_residues(
-        a_sel,
-        w_sel,
-        r_sel,
-        th_sel,
+        np.asarray(selected_alpha),
+        np.asarray(selected_omega),
+        np.asarray(selected_rho),
+        np.asarray(selected_theta),
         Ts,
     )
     y_hat = lfilter(B, A, u)
@@ -768,6 +742,7 @@ def save_HF_HG_for_entry(
     u: np.ndarray,
     exist_thresh: float = 0.5,
     peak_win_sec: float = 1,
+    use_freq_filter: bool = True,
 ):
     """
     文件每行：H_km, M, ch, freqs... 或 damping...
@@ -816,6 +791,7 @@ def save_HF_HG_for_entry(
                 u=u,
                 Ts=Ts,
                 exist_thresh=exist_thresh,
+                use_freq_filter=use_freq_filter,
             )
 
             pp_slots = ["", "", ""]
@@ -862,6 +838,7 @@ def save_VF_VG_for_entry(
     u: np.ndarray,
     exist_thresh: float = 0.5,
     peak_win_sec: float = 1,
+    use_freq_filter: bool = True,
 ):
     """
     固定 H=entry.H_km 扫 M_axis；通道 = channels_for_exc_plot(entry.exc_id)
@@ -912,6 +889,7 @@ def save_VF_VG_for_entry(
                 u=u,
                 Ts=Ts,
                 exist_thresh=exist_thresh,
+                use_freq_filter=use_freq_filter,
             )
 
             pp_slots = ["", "", ""]
@@ -959,6 +937,12 @@ def main():
         default="low",
         help="Fixed-SF only has low-network output.",
     )
+    parser.add_argument(
+        "--use_freq_filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply per-channel/per-slot frequency ranges when explicitly enabled; direct valid model outputs are the default.",
+    )
     args, _unknown = parser.parse_known_args()
 
     fs = 512
@@ -969,7 +953,7 @@ def main():
     base_dir = get_exe_dir()
     user_input_path = base_dir / "user_input.dat"
     csv_path = base_dir / "mode_freq_range.csv"
-    if not csv_path.exists():
+    if args.use_freq_filter and not csv_path.exists():
         raise FileNotFoundError(f"Fixed-SF prediction requires mode frequency ranges: {csv_path}")
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
@@ -1051,7 +1035,8 @@ def main():
     )
 
     in_norm = Normalizer.load(in_norm_path)
-    mode_freq_ranges = _load_channel_freq_ranges(csv_path)
+    mode_freq_ranges = _load_channel_freq_ranges(csv_path) if args.use_freq_filter else None
+    print(f"==> Frequency range filter enabled: {args.use_freq_filter}", flush=True)
     if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
         raise RuntimeError(f"Normalizer_Input.pth 应为二维 [H, M]，当前 mean={in_norm.mean}, std={in_norm.std}")
 
@@ -1102,7 +1087,8 @@ def main():
         else:
             save_response_dat(
                 entry, Ts, u, outs_resp, csv_path, out_root, model_version,
-                exc_table, response_output_header, exist_thresh
+                exc_table, response_output_header, exist_thresh,
+                use_freq_filter=args.use_freq_filter,
             )
 
         # ---------- B) HF/HG：固定 M 扫 H_axis（裁剪通道） ----------
@@ -1125,7 +1111,8 @@ def main():
             save_HF_HG_for_entry(
                 entry, H_axis, outs_hscan, csv_path,
                 hf_dir, hg_dir, ha_dir, model_version,
-                Ts, exc_table, u, exist_thresh
+                Ts, exc_table, u, exist_thresh,
+                use_freq_filter=args.use_freq_filter,
             )
         else:
             print(f"  [WARN] exc_id={entry.exc_id} 无 plot 通道，跳过 HF/HG")
@@ -1149,7 +1136,8 @@ def main():
             save_VF_VG_for_entry(
                 entry, M_axis, outs_mscan, csv_path,
                 vf_dir, vg_dir, va_dir, model_version,
-                Ts, exc_table, u, exist_thresh
+                Ts, exc_table, u, exist_thresh,
+                use_freq_filter=args.use_freq_filter,
             )
         else:
             print(f"  [WARN] exc_id={entry.exc_id} 无 plot 通道，跳过 VF/VG")

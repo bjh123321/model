@@ -254,26 +254,22 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
         "stage": "fixed_single_fidelity",
         "epoch": int(epoch),
         "best_metric": float(metric),
+        "checkpoint_selection": str(getattr(model_core.cfg, "checkpoint_selection", "validation")),
+        "best_metric_name": str(getattr(model_core.cfg, "_best_metric_name", "loss_val_group_FXD")),
         "model_state_dict": model_core.state_dict(),
         "pole_target": getattr(out_norm, "pole_target", "alpha_omega"),
         "residue_target": getattr(out_norm, "residue_target", "polar"),
         "target_names": out_norm.target_names(),
         "K_max": int(model_core.cfg.K_max),
         "low_hidden": list(getattr(model_core.cfg, "low_hidden", [])),
-        "mod_hidden": list(getattr(model_core.cfg, "mod_hidden", [])),
         "dropout_prob": float(getattr(model_core.cfg, "dropout_prob", 0.0)),
         "use_lora": bool(getattr(model_core.cfg, "use_lora", False)),
         "lora_rank": int(getattr(model_core.cfg, "lora_rank", 0)),
         "lora_alpha": float(getattr(model_core.cfg, "lora_alpha", 1.0)),
         "lora_dropout": float(getattr(model_core.cfg, "lora_dropout", 0.0)),
         "use_modulation": bool(getattr(model_core.cfg, "use_modulation", False)),
-        "modulation_mode": str(getattr(model_core.cfg, "modulation_mode", "conditional")),
+        "modulation_mode": "legacy",
         "mod_gamma": float(getattr(model_core.cfg, "mod_gamma", 0.0)),
-        "mod_dropout": float(getattr(model_core.cfg, "mod_dropout", 0.0)),
-        "mod_exc_pole_scale": float(getattr(model_core.cfg, "mod_exc_pole_scale", 0.05)),
-        "mod_exc_residue_scale": float(getattr(model_core.cfg, "mod_exc_residue_scale", 0.10)),
-        "mod_channel_residue_scale": float(getattr(model_core.cfg, "mod_channel_residue_scale", 0.10)),
-        "mod_channel_affects_poles": bool(getattr(model_core.cfg, "mod_channel_affects_poles", False)),
         "embed_excitation_num": int(getattr(model_core.cfg, "embed_excitation_num", 0)),
         "embed_excitation_dim": int(getattr(model_core.cfg, "embed_excitation_dim", 0)),
         "embed_channel_num": int(getattr(model_core.cfg, "embed_channel_num", 0)),
@@ -332,15 +328,15 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     bad = 0
     patience = int(getattr(cfg, "early_stop_patience_s1", 500))
     min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
+    checkpoint_selection = str(getattr(cfg, "checkpoint_selection", "validation")).lower()
+    if checkpoint_selection not in ("validation", "training"):
+        raise ValueError(f"Unsupported checkpoint_selection={checkpoint_selection!r}")
     logs = []
     train_hist = []
     val_hist = []
 
     if is_main_process():
-        modulation_fields = (
-            "modulation_mode", "mod_hidden", "mod_gamma", "mod_exc_pole_scale",
-            "mod_exc_residue_scale", "mod_channel_residue_scale", "mod_channel_affects_poles",
-        )
+        modulation_fields = ("use_modulation", "mod_gamma", "pole_target", "residue_target")
         print("[MODULATION] " + " ".join(f"{name}={getattr(cfg, name)}" for name in modulation_fields), flush=True)
         print("[PARAMETERS] " + " ".join(f"{name}={value}" for name, value in count_parameter_groups(model_core).items()), flush=True)
         print(
@@ -348,11 +344,9 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             f"pole_target={out_norm.pole_target}, residue_target={out_norm.residue_target}, targets={target_names}",
             flush=True,
         )
-        print(
-            "[VAL] val/best/early-stop use group_FXD (exc_id 0 and 1); "
-            "all excitation scopes are still reported.",
-            flush=True,
-        )
+        selection_text = "loss_train_total" if checkpoint_selection == "training" else "loss_val_group_FXD"
+        print(f"[CHECKPOINT] selection={checkpoint_selection} metric={selection_text}", flush=True)
+        print("[VAL] all excitation scopes are still reported.", flush=True)
         if sched is not None:
             print("[LR] ReduceLROnPlateau monitors train_loss: factor=0.5 patience=20 min_lr=1e-6", flush=True)
 
@@ -388,7 +382,12 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         val_group_fxd = val_scope_losses.get("group_FXD")
         val_loss = None if val_group_fxd is None else val_group_fxd["loss"]
         val_parts = _part_dict_zero(target_names) if val_group_fxd is None else val_group_fxd["parts"]
-        metric = val_loss if val_loss is not None else train_loss
+        if checkpoint_selection == "training":
+            metric = train_loss
+            cfg._best_metric_name = "loss_train_total"
+        else:
+            metric = val_loss if val_loss is not None else train_loss
+            cfg._best_metric_name = "loss_val_group_FXD" if val_loss is not None else "loss_train_total_fallback"
         if sched is not None:
             sched.step(train_loss)
         train_hist.append(train_loss)
