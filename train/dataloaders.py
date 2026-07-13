@@ -14,6 +14,7 @@ from surrogate_model.data.io import ParsedRow
 from surrogate_model.data.normalizer import compute_input_normalizer_sim, compute_output_normalizer_masked
 from surrogate_model.data.datasets import ModalDataset, collate_modal
 from surrogate_model.utils.dist_utils import is_main_process
+from surrogate_model.utils.model_artifacts import group_key_from_parsed
 
 
 def _ddp_ready() -> bool:
@@ -226,6 +227,67 @@ def _loader_kwargs(cfg: Config):
     return kwargs
 
 
+def split_single_fidelity_rows(
+    real_parsed: List[ParsedRow], cfg: Config, kfold: int = 0, fold_idx: int = 0
+):
+    """Resolve the exact train/validation membership used by fixed-SF training."""
+    explicit_train = getattr(cfg, "explicit_train_group_keys", None)
+    explicit_validation = getattr(cfg, "explicit_validation_group_keys", None)
+    if explicit_train is not None or explicit_validation is not None:
+        train_keys = {tuple(map(int, key)) for key in (explicit_train or [])}
+        validation_keys = {tuple(map(int, key)) for key in (explicit_validation or [])}
+        overlap = train_keys & validation_keys
+        if overlap:
+            raise ValueError(f"Explicit train/validation group keys overlap: {sorted(overlap)}")
+        available = {group_key_from_parsed(row) for row in real_parsed}
+        unknown = (train_keys | validation_keys) - available
+        if unknown:
+            raise ValueError(f"Explicit split references missing groups: {sorted(unknown)}")
+        unassigned = available - train_keys - validation_keys
+        train_keys.update(unassigned)
+        real_train = [row for row in real_parsed if group_key_from_parsed(row) in train_keys]
+        real_val = [row for row in real_parsed if group_key_from_parsed(row) in validation_keys]
+        if not real_train:
+            raise RuntimeError("Explicit split produced an empty training set")
+        if bool(getattr(cfg, "require_validation", False)) and not real_val:
+            raise RuntimeError(
+                "Correction groups removed every validation group; refusing to switch checkpoint selection silently."
+            )
+        return real_train, real_val, "inherited_manifest"
+
+    use_val_split = bool(getattr(cfg, "use_val_split", False))
+    val_ratio = float(getattr(cfg, "val_ratio", 0.2))
+    seed = int(getattr(cfg, "val_seed", 42))
+    val_strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
+    if not use_val_split:
+        return real_parsed, [], "disabled"
+    if val_strategy == "height_mach_kfold":
+        train, val, _ = _split_by_height_mach_groups(real_parsed, cfg, kfold, fold_idx, "real")
+        return train, val, val_strategy
+    if val_strategy == "height_max_mach":
+        train, val, _ = _split_real_by_height_max_mach(real_parsed, cfg)
+        return train, val, val_strategy
+    if val_strategy == "height_mach_points":
+        train, val, _ = _split_real_by_height_mach_points(real_parsed, cfg)
+        return train, val, val_strategy
+    if kfold > 1 and len(real_parsed) > 1:
+        kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
+        indices = list(range(len(real_parsed)))
+        train_idx, val_idx = list(kf.split(indices))[fold_idx]
+        return [real_parsed[i] for i in train_idx], [real_parsed[i] for i in val_idx], "row_kfold"
+    if 0.0 < val_ratio < 1.0 and len(real_parsed) > 1:
+        rng = np.random.default_rng(seed + 1000)
+        indices = np.arange(len(real_parsed))
+        rng.shuffle(indices)
+        n_val = max(1, int(round(len(real_parsed) * val_ratio)))
+        return (
+            [real_parsed[i] for i in indices[n_val:]],
+            [real_parsed[i] for i in indices[:n_val]],
+            "random_rows",
+        )
+    return real_parsed, [], "disabled"
+
+
 def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow], cfg: Config,
                       kfold: int, fold_idx: int, device: torch.device, out_dir: Path):
     in_norm_sim = compute_input_normalizer_sim(sim_parsed)
@@ -332,45 +394,19 @@ def build_single_fidelity_dataloaders(
     device: torch.device,
     out_dir: Path,
 ):
-    use_val_split = bool(getattr(cfg, "use_val_split", False))
-    val_ratio = float(getattr(cfg, "val_ratio", 0.2))
-    seed = int(getattr(cfg, "val_seed", 42))
-    val_strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
-
-    if use_val_split:
-        if val_strategy == "height_mach_kfold":
-            real_train, real_val, real_info = _split_by_height_mach_groups(real_parsed, cfg, kfold, fold_idx, "real")
-            if is_main_process():
-                print(f"[VAL] real height_mach_kfold: val_groups={len(real_info)}, train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
-        elif val_strategy == "height_max_mach":
-            real_train, real_val, split_info = _split_real_by_height_max_mach(real_parsed, cfg)
-            if is_main_process():
-                detail = ", ".join(f"H={h:g}, maxM={m:g}, val_rows={n}" for h, m, n in split_info)
-                print(f"[VAL] real split by height max Mach: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
-        elif val_strategy == "height_mach_points":
-            real_train, real_val, split_info = _split_real_by_height_mach_points(real_parsed, cfg)
-            if is_main_process():
-                detail = ", ".join(f"H={h:g}, M={m:g}, val_rows={n}" for h, m, n in split_info)
-                print(f"[VAL] real split by specified height-Mach points: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
-        elif kfold > 1 and len(real_parsed) > 1:
-            kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
-            indices = list(range(len(real_parsed)))
-            train_idx, val_idx = list(kf.split(indices))[fold_idx]
-            real_train = [real_parsed[i] for i in train_idx]
-            real_val = [real_parsed[i] for i in val_idx]
-        elif (0.0 < val_ratio < 1.0) and (len(real_parsed) > 1):
-            rng = np.random.default_rng(seed + 1000)
-            idx = np.arange(len(real_parsed))
-            rng.shuffle(idx)
-            n_val = max(1, int(round(len(real_parsed) * val_ratio)))
-            real_train = [real_parsed[i] for i in idx[n_val:]]
-            real_val = [real_parsed[i] for i in idx[:n_val]]
-        else:
-            real_train = real_parsed
-            real_val = []
-    else:
-        real_train = real_parsed
-        real_val = []
+    real_train, real_val, split_strategy = split_single_fidelity_rows(
+        real_parsed, cfg, kfold, fold_idx
+    )
+    cfg._last_split_metadata = {
+        "split_strategy": split_strategy,
+        "train_group_keys": sorted({group_key_from_parsed(row) for row in real_train}),
+        "validation_group_keys": sorted({group_key_from_parsed(row) for row in real_val}),
+    }
+    if is_main_process():
+        print(
+            f"[VAL] strategy={split_strategy} train_rows={len(real_train)} val_rows={len(real_val)}",
+            flush=True,
+        )
 
     real_train, dropped_train = _filter_damping_slots(real_train, "train")
     real_val, dropped_val = _filter_damping_slots(real_val, "validation")
@@ -378,9 +414,6 @@ def build_single_fidelity_dataloaders(
 
     in_norm_real = compute_input_normalizer_sim(real_train)
     out_norm_real = _output_normalizer(real_train, cfg)
-    if is_main_process():
-        in_norm_real.save(out_dir / "Normalizer_Input_Real.pth")
-        out_norm_real.save(out_dir / f"Normalizer_Output_Real_Fold{fold_idx}.pth")
 
     real_tr = ModalDataset(real_train, cfg.K_max, in_norm_real, out_norm_real)
     real_va = ModalDataset(real_val, cfg.K_max, in_norm_real, out_norm_real)

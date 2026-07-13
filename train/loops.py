@@ -246,7 +246,7 @@ def _write_train_log(path: Path, rows, target_names):
 def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_norm, epoch: int, metric: float):
     model_save_path = Path(getattr(args, "model_save_path", "") or (out_dir / f"{out_dir.name}.pth"))
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
-    normalizer_dir = Path(getattr(args, "normalizer_dir", "") or out_dir.parent)
+    normalizer_dir = Path(getattr(args, "normalizer_dir", "") or out_dir)
     normalizer_dir.mkdir(parents=True, exist_ok=True)
     in_norm.save(normalizer_dir / "Normalizer_Input.pth")
     out_norm.save(normalizer_dir / "Normalizer_Output.pth")
@@ -264,9 +264,6 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
         "low_hidden": list(getattr(model_core.cfg, "low_hidden", [])),
         "dropout_prob": float(getattr(model_core.cfg, "dropout_prob", 0.0)),
         "use_lora": bool(getattr(model_core.cfg, "use_lora", False)),
-        "lora_rank": int(getattr(model_core.cfg, "lora_rank", 0)),
-        "lora_alpha": float(getattr(model_core.cfg, "lora_alpha", 1.0)),
-        "lora_dropout": float(getattr(model_core.cfg, "lora_dropout", 0.0)),
         "use_modulation": bool(getattr(model_core.cfg, "use_modulation", False)),
         "modulation_mode": "legacy",
         "mod_gamma": float(getattr(model_core.cfg, "mod_gamma", 0.0)),
@@ -277,6 +274,15 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
         "fold": getattr(args, "fold_index", None),
         "num_folds": getattr(args, "num_folds", None),
     }
+    if payload["use_lora"]:
+        payload.update(
+            {
+                "lora_rank": int(getattr(model_core.cfg, "lora_rank", 0)),
+                "lora_alpha": float(getattr(model_core.cfg, "lora_alpha", 1.0)),
+                "lora_dropout": float(getattr(model_core.cfg, "lora_dropout", 0.0)),
+            }
+        )
+    payload.update(dict(getattr(args, "checkpoint_metadata", {}) or {}))
     torch.save(payload, model_save_path)
     deploy_model_save_path = getattr(args, "deploy_model_save_path", "")
     if deploy_model_save_path:
@@ -316,6 +322,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
 
     target_names = out_norm.target_names()
     model_core = MFDNN(cfg).to(device)
+    for parameter in model_core.parameters():
+        parameter.requires_grad_(True)
     model = model_core
     mean = torch.as_tensor(out_norm.mean, dtype=torch.float32, device=device)
     std = torch.as_tensor(out_norm.std, dtype=torch.float32, device=device).clamp_min(1e-8)
@@ -339,6 +347,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         modulation_fields = ("use_modulation", "mod_gamma", "pole_target", "residue_target")
         print("[MODULATION] " + " ".join(f"{name}={getattr(cfg, name)}" for name in modulation_fields), flush=True)
         print("[PARAMETERS] " + " ".join(f"{name}={value}" for name, value in count_parameter_groups(model_core).items()), flush=True)
+        print(f"[INITIALIZATION] random; all_parameters_trainable={all(p.requires_grad for p in model_core.parameters())}", flush=True)
         print(
             f"[Fixed-SF] train_rows={n_train}, val_rows={n_val}, "
             f"pole_target={out_norm.pole_target}, residue_target={out_norm.residue_target}, targets={target_names}",
@@ -425,6 +434,13 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         _write_train_log(Path(getattr(args, "train_log_path", "") or (out_dir / "train_log.csv")), logs, target_names)
         print(f"[OK] model saved to: {model_path}", flush=True)
         print(f"[OK] normalizers saved to: {norm_dir}", flush=True)
+    cfg._last_training_result = {
+        "best_epoch": int(best_epoch),
+        "best_metric": float(best),
+        "best_metric_name": str(getattr(cfg, "_best_metric_name", "")),
+        "final_train_loss": None if not train_hist else float(train_hist[-1]),
+        "final_validation_loss": None if not val_hist or val_hist[-1] != val_hist[-1] else float(val_hist[-1]),
+    }
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     return best, train_hist, val_hist

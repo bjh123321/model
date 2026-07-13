@@ -16,7 +16,16 @@ import torch.distributed as dist
 from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
+from surrogate_model.train.dataloaders import split_single_fidelity_rows
+from surrogate_model.train.full_training_runner import run_full_training
 from surrogate_model.train.loops import train_one_fold
+from surrogate_model.utils.model_artifacts import (
+    atomic_write_json,
+    build_dataset_manifest,
+    build_input_dataset_snapshot,
+    group_key_from_parsed,
+    load_json,
+)
 
 
 def _parse_int_list(raw: str) -> list[int]:
@@ -201,7 +210,7 @@ def main():
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     args, _unknown = parser.parse_known_args()
 
-    _ddp_setup()
+    ddp_enabled, rank, _world_size = _ddp_setup()
     _enable_fast_cuda(args)
 
     real_rows = read_real_dataset(real_dataset_path)
@@ -265,6 +274,52 @@ def main():
     num_folds = args.kfold if (cfg.val_split_strategy == "height_mach_kfold" and args.kfold > 1) else 1
 
     model_root = Path(args.out_dir)
+    preview_train, preview_val, split_strategy = split_single_fidelity_rows(real_parsed, cfg, 0, 0)
+    train_group_keys = sorted({group_key_from_parsed(row) for row in preview_train})
+    validation_group_keys = sorted({group_key_from_parsed(row) for row in preview_val})
+    if num_folds == 1:
+        cfg.explicit_train_group_keys = train_group_keys
+        cfg.explicit_validation_group_keys = validation_group_keys
+    if not ddp_enabled or rank == 0:
+        relative_files_by_group = build_input_dataset_snapshot(
+            real_dataset_path, model_root / "dataset_snapshot"
+        )
+        manifest = build_dataset_manifest(
+            rows=real_rows,
+            model_version=model_version,
+            snapshot_dir=model_root / "dataset_snapshot",
+            train_group_keys=train_group_keys,
+            validation_group_keys=validation_group_keys,
+            split_strategy=split_strategy,
+            relative_files_by_group=relative_files_by_group,
+        )
+        atomic_write_json(model_root / "dataset_manifest.json", manifest)
+    if ddp_enabled:
+        dist.barrier()
+    if ddp_enabled and rank != 0:
+        manifest = load_json(model_root / "dataset_manifest.json")
+
+    if num_folds == 1:
+        run_full_training(
+            cfg=cfg,
+            parsed_rows=real_parsed,
+            model_version=model_version,
+            version_dir=model_root,
+            args=args,
+            dataset_metadata={
+                "manifest": manifest,
+                "training_mode": "base_full_training",
+                "target_names": (
+                    (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
+                    + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
+                ),
+            },
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+        _send_finished_udp()
+        return
+
     kfold_rows = []
     for fold in range(num_folds):
         if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:

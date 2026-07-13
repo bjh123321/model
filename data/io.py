@@ -108,6 +108,16 @@ def read_real_dataset(path: Path) -> List[List[float]]:
         key=lambda p: p.name.lower(),
     )
     if not files:
+        consolidated = path / "real_dataset.txt"
+        if consolidated.is_file():
+            rows = read_variable_txt(consolidated, strict=True)
+            if not rows:
+                raise ValueError(f"Real dataset file contains no usable rows: {consolidated}")
+            print(
+                f"[DATA] loaded snapshot real dataset: files=1, rows={len(rows)}, path={consolidated}",
+                flush=True,
+            )
+            return rows
         raise FileNotFoundError(f"No SF_XGD_*.txt split-dataset files found in: {path}")
 
     rows: List[List[float]] = []

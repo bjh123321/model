@@ -973,9 +973,18 @@ def main():
     # ===== 模型文件路径 =====
     model_dir = _path_from_config(cp, paths_ini_path, "MX_XGD")
 
-    ckpt_path = Path(args.model_path).expanduser() if args.model_path else model_dir / model_version / (model_version + ".pth")
-    in_norm_path =  model_dir / "Normalizer_Input.pth"
-    out_norm_path = model_dir / "Normalizer_Output.pth"
+    version_dir = model_dir / model_version
+    ckpt_path = Path(args.model_path).expanduser() if args.model_path else version_dir / (model_version + ".pth")
+    in_norm_path = version_dir / "Normalizer_Input.pth"
+    out_norm_path = version_dir / "Normalizer_Output.pth"
+    if not in_norm_path.is_file() or not out_norm_path.is_file():
+        legacy_input = model_dir / "Normalizer_Input.pth"
+        legacy_output = model_dir / "Normalizer_Output.pth"
+        print(
+            f"[LEGACY-NORMALIZER] version-local normalizers are missing; using {model_dir}",
+            flush=True,
+        )
+        in_norm_path, out_norm_path = legacy_input, legacy_output
     data_header_dir = _path_from_config(cp, paths_ini_path, "DataHeader")
     response_output_header = load_response_output_header(data_header_dir / "sc.dat")
 

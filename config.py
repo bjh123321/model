@@ -62,33 +62,5 @@ class Config:
     lr_low_adam: float = 1e-3
     weight_decay: float = 5e-5
 
-    # LoRA incremental fine-tuning
-    incremental_epochs: int = 2000
-    incremental_batch_size: int = 16
-    incremental_lr: float = 3e-4
-    incremental_weight_decay: float = 1e-4
-    incremental_beta_kd: float = 0.2
-    incremental_gamma_replay: float = 0.1
-    incremental_warmup_epochs: int = 10
-    incremental_old_loss_tolerance: float = 0.05
-    incremental_lambda_guard: float = 1.0
-    incremental_early_stop_patience: int = 50
-    incremental_early_stop_min_delta: float = 1e-5
+    # One-time migration source for parent versions created before dataset snapshots.
     incremental_history_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"
-    incremental_replay_fraction: float = 0.75
-    incremental_split_seed: int = 42
-    incremental_reuse_split: bool = True
-    # Deprecated local replay/limited guard controls. Retained for config and
-    # checkpoint compatibility; the global replay/guard split ignores them.
-    incremental_guard_max_groups: int = 48
-    incremental_guard_min_groups_per_excitation: int = 2
-    incremental_replay_primary_h_thr: float = 1.5
-    incremental_replay_primary_m_thr: float = 0.10
-    incremental_replay_fallback_h_thr: float = 2.5
-    incremental_replay_fallback_m_thr: float = 0.15
-    incremental_replay_max_groups_per_selected: int = 6
-    incremental_replay_min_groups_per_selected: int = 3
-    incremental_selection_seed: int = 42
-    incremental_initial_guard_tolerance: float = 1e-6
-    # Deprecated alias for incremental_history_dataset_dir.
-    incremental_replay_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"

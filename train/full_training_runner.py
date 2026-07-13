@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import copy
+import random
+from pathlib import Path
+from typing import Mapping
+
+import numpy as np
+import torch
+import torch.distributed as dist
+
+from surrogate_model.train.loops import train_one_fold
+from surrogate_model.utils.dist_utils import is_main_process
+from surrogate_model.utils.model_artifacts import atomic_write_json, load_json, read_code_metadata, sha256_file
+
+
+def _model_config(cfg) -> dict:
+    return {
+        "model_type": "MFDNN_fixed_single_fidelity",
+        "K_max": int(cfg.K_max),
+        "low_hidden": list(cfg.low_hidden),
+        "dropout_prob": float(cfg.dropout_prob),
+        "embed_excitation_num": int(cfg.embed_excitation_num),
+        "embed_excitation_dim": int(cfg.embed_excitation_dim),
+        "embed_channel_num": int(cfg.embed_channel_num),
+        "embed_channel_dim": int(cfg.embed_channel_dim),
+        "use_modulation": bool(cfg.use_modulation),
+        "modulation_type": "single_linear_hm",
+        "mod_gamma": float(cfg.mod_gamma),
+        "use_lora": False,
+    }
+
+
+def _training_values(cfg, args) -> dict:
+    requested_device = str(getattr(args, "device", "auto"))
+    actual_device = "cuda" if requested_device != "cpu" and torch.cuda.is_available() else "cpu"
+    return {
+        "optimizer": "AdamW",
+        "learning_rate": float(cfg.lr_low_adam),
+        "weight_decay": float(cfg.weight_decay),
+        "batch_size": int(cfg.batch_real),
+        "epochs": int(cfg.epochs_stage1),
+        "scheduler": {
+            "name": "ReduceLROnPlateau",
+            "monitor": "training_loss",
+            "mode": "min",
+            "factor": 0.5,
+            "patience": 20,
+            "min_lr": 1e-6,
+        },
+        "gradient_clip_norm": 5.0,
+        "seed": int(getattr(cfg, "val_seed", 42)),
+        "num_workers": int(cfg.num_workers),
+        "prefetch": int(cfg.prefetch),
+        "device": actual_device,
+        "checkpoint_selection": str(cfg.checkpoint_selection),
+        "early_stop_patience": int(cfg.early_stop_patience_s1),
+        "early_stop_min_delta": float(cfg.early_stop_min_delta),
+        "validation_split": {
+            "strategy": str(getattr(cfg, "val_split_strategy", "")),
+            "ratio": float(getattr(cfg, "val_ratio", 0.0)),
+            "seed": int(getattr(cfg, "val_seed", 42)),
+        },
+    }
+
+
+def run_full_training(
+    *,
+    cfg,
+    parsed_rows,
+    model_version: str,
+    version_dir: Path,
+    args,
+    dataset_metadata: Mapping,
+):
+    """Shared fixed-SF training path for base models and correction full retraining."""
+    version_dir = Path(version_dir)
+    version_dir.mkdir(parents=True, exist_ok=True)
+    cfg.use_lora = False
+    seed = int(getattr(cfg, "val_seed", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    run_args = copy.copy(args)
+    run_args.out_dir = str(version_dir)
+    run_args.normalizer_dir = str(version_dir)
+    run_args.model_save_path = str(version_dir / f"{model_version}.pth")
+    run_args.train_log_path = str(version_dir / "train_log.csv")
+    run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
+    run_args.fold_index = 0
+    run_args.num_folds = 1
+
+    manifest = dataset_metadata["manifest"]
+    training_mode = str(dataset_metadata.get("training_mode", "base_full_training"))
+    correction = training_mode == "correction_full_retrain"
+    checkpoint_metadata = {
+        "stage": (
+            "fixed_single_fidelity_correction_full_retrain"
+            if correction
+            else "fixed_single_fidelity"
+        ),
+        "training_mode": training_mode,
+        "initialization_mode": "random",
+        "model_version": model_version,
+        "parent_model_version": dataset_metadata.get("parent_model_version"),
+        "parent_checkpoint_used_for_weights": False,
+        "use_lora": False,
+        "dataset_manifest": "dataset_manifest.json",
+        "dataset_fingerprint": manifest["dataset_fingerprint"],
+        "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
+        "dataset_snapshot_root": "dataset_snapshot",
+        "training_config": "training_config.json",
+        "normalizer_input": "Normalizer_Input.pth",
+        "normalizer_output": "Normalizer_Output.pth",
+        "corrected_group_keys": dataset_metadata.get("corrected_group_keys", []),
+        "replaced_group_keys": dataset_metadata.get("replaced_group_keys", []),
+        "added_group_keys": dataset_metadata.get("added_group_keys", []),
+    }
+    run_args.checkpoint_metadata = checkpoint_metadata
+    best, train_hist, val_hist = train_one_fold(0, cfg, parsed_rows, run_args)
+
+    training_config_path = version_dir / "training_config.json"
+    if is_main_process():
+        input_path = version_dir / "Normalizer_Input.pth"
+        output_path = version_dir / "Normalizer_Output.pth"
+        selection = dict(getattr(cfg, "_last_training_result", {}))
+        training_config = {
+            "schema_version": 1,
+            "model_version": model_version,
+            "parent_model_version": dataset_metadata.get("parent_model_version"),
+            "training_mode": training_mode,
+            "initialization": {
+                "mode": "random",
+                "parent_checkpoint_used_for_weights": False,
+            },
+            "dataset": {
+                "manifest": "dataset_manifest.json",
+                "dataset_fingerprint": manifest["dataset_fingerprint"],
+                "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
+                "snapshot_root": "dataset_snapshot",
+            },
+            "model": _model_config(cfg),
+            "targets": {
+                "pole_target": str(cfg.pole_target),
+                "residue_target": str(cfg.residue_target),
+                "target_names": list(dataset_metadata.get("target_names", [])),
+            },
+            "normalizers": {
+                "input_file": "Normalizer_Input.pth",
+                "output_file": "Normalizer_Output.pth",
+                "fit_on": "training_split_only",
+                "input_sha256": sha256_file(input_path),
+                "output_sha256": sha256_file(output_path),
+            },
+            "training": _training_values(cfg, args),
+            "selection": selection,
+            "code": read_code_metadata(Path(__file__).resolve().parents[1]),
+        }
+        atomic_write_json(training_config_path, training_config)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if not is_main_process():
+        training_config = load_json(training_config_path)
+    return {
+        "best_metric": best,
+        "train_history": train_hist,
+        "validation_history": val_hist,
+        "training_config": training_config,
+    }
