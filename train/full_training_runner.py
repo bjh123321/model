@@ -64,6 +64,85 @@ def _training_values(cfg, args) -> dict:
     }
 
 
+def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) -> dict:
+    manifest = dataset_metadata["manifest"]
+    training_mode = str(dataset_metadata.get("training_mode", "base_full_training"))
+    correction = training_mode == "correction_full_retrain"
+    return {
+        "stage": (
+            "fixed_single_fidelity_correction_full_retrain"
+            if correction
+            else "fixed_single_fidelity"
+        ),
+        "training_mode": training_mode,
+        "initialization_mode": "random",
+        "model_version": model_version,
+        "parent_model_version": dataset_metadata.get("parent_model_version"),
+        "parent_checkpoint_used_for_weights": False,
+        "use_lora": False,
+        "dataset_manifest": "dataset_manifest.json",
+        "dataset_fingerprint": manifest["dataset_fingerprint"],
+        "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
+        "dataset_snapshot_root": "dataset_snapshot",
+        "training_config": "training_config.json",
+        "normalizer_input": "Normalizer_Input.pth",
+        "normalizer_output": "Normalizer_Output.pth",
+        "corrected_group_keys": dataset_metadata.get("corrected_group_keys", []),
+        "replaced_group_keys": dataset_metadata.get("replaced_group_keys", []),
+        "added_group_keys": dataset_metadata.get("added_group_keys", []),
+    }
+
+
+def write_training_config(
+    *,
+    cfg,
+    args,
+    model_version: str,
+    version_dir: Path,
+    dataset_metadata: Mapping,
+) -> dict:
+    """Write the standard provenance/config artifact from effective training values."""
+    version_dir = Path(version_dir)
+    manifest = dataset_metadata["manifest"]
+    training_mode = str(dataset_metadata.get("training_mode", "base_full_training"))
+    input_path = version_dir / "Normalizer_Input.pth"
+    output_path = version_dir / "Normalizer_Output.pth"
+    training_config = {
+        "schema_version": 1,
+        "model_version": model_version,
+        "parent_model_version": dataset_metadata.get("parent_model_version"),
+        "training_mode": training_mode,
+        "initialization": {
+            "mode": "random",
+            "parent_checkpoint_used_for_weights": False,
+        },
+        "dataset": {
+            "manifest": "dataset_manifest.json",
+            "dataset_fingerprint": manifest["dataset_fingerprint"],
+            "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
+            "snapshot_root": "dataset_snapshot",
+        },
+        "model": _model_config(cfg),
+        "targets": {
+            "pole_target": str(cfg.pole_target),
+            "residue_target": str(cfg.residue_target),
+            "target_names": list(dataset_metadata.get("target_names", [])),
+        },
+        "normalizers": {
+            "input_file": "Normalizer_Input.pth",
+            "output_file": "Normalizer_Output.pth",
+            "fit_on": "training_split_only",
+            "input_sha256": sha256_file(input_path),
+            "output_sha256": sha256_file(output_path),
+        },
+        "training": _training_values(cfg, args),
+        "selection": dict(getattr(cfg, "_last_training_result", {})),
+        "code": read_code_metadata(Path(__file__).resolve().parents[1]),
+    }
+    atomic_write_json(version_dir / "training_config.json", training_config)
+    return training_config
+
+
 def run_full_training(
     *,
     cfg,
@@ -93,73 +172,20 @@ def run_full_training(
     run_args.fold_index = 0
     run_args.num_folds = 1
 
-    manifest = dataset_metadata["manifest"]
-    training_mode = str(dataset_metadata.get("training_mode", "base_full_training"))
-    correction = training_mode == "correction_full_retrain"
-    checkpoint_metadata = {
-        "stage": (
-            "fixed_single_fidelity_correction_full_retrain"
-            if correction
-            else "fixed_single_fidelity"
-        ),
-        "training_mode": training_mode,
-        "initialization_mode": "random",
-        "model_version": model_version,
-        "parent_model_version": dataset_metadata.get("parent_model_version"),
-        "parent_checkpoint_used_for_weights": False,
-        "use_lora": False,
-        "dataset_manifest": "dataset_manifest.json",
-        "dataset_fingerprint": manifest["dataset_fingerprint"],
-        "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
-        "dataset_snapshot_root": "dataset_snapshot",
-        "training_config": "training_config.json",
-        "normalizer_input": "Normalizer_Input.pth",
-        "normalizer_output": "Normalizer_Output.pth",
-        "corrected_group_keys": dataset_metadata.get("corrected_group_keys", []),
-        "replaced_group_keys": dataset_metadata.get("replaced_group_keys", []),
-        "added_group_keys": dataset_metadata.get("added_group_keys", []),
-    }
-    run_args.checkpoint_metadata = checkpoint_metadata
+    run_args.checkpoint_metadata = build_checkpoint_metadata(
+        model_version=model_version, dataset_metadata=dataset_metadata
+    )
     best, train_hist, val_hist = train_one_fold(0, cfg, parsed_rows, run_args)
 
     training_config_path = version_dir / "training_config.json"
     if is_main_process():
-        input_path = version_dir / "Normalizer_Input.pth"
-        output_path = version_dir / "Normalizer_Output.pth"
-        selection = dict(getattr(cfg, "_last_training_result", {}))
-        training_config = {
-            "schema_version": 1,
-            "model_version": model_version,
-            "parent_model_version": dataset_metadata.get("parent_model_version"),
-            "training_mode": training_mode,
-            "initialization": {
-                "mode": "random",
-                "parent_checkpoint_used_for_weights": False,
-            },
-            "dataset": {
-                "manifest": "dataset_manifest.json",
-                "dataset_fingerprint": manifest["dataset_fingerprint"],
-                "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
-                "snapshot_root": "dataset_snapshot",
-            },
-            "model": _model_config(cfg),
-            "targets": {
-                "pole_target": str(cfg.pole_target),
-                "residue_target": str(cfg.residue_target),
-                "target_names": list(dataset_metadata.get("target_names", [])),
-            },
-            "normalizers": {
-                "input_file": "Normalizer_Input.pth",
-                "output_file": "Normalizer_Output.pth",
-                "fit_on": "training_split_only",
-                "input_sha256": sha256_file(input_path),
-                "output_sha256": sha256_file(output_path),
-            },
-            "training": _training_values(cfg, args),
-            "selection": selection,
-            "code": read_code_metadata(Path(__file__).resolve().parents[1]),
-        }
-        atomic_write_json(training_config_path, training_config)
+        training_config = write_training_config(
+            cfg=cfg,
+            args=args,
+            model_version=model_version,
+            version_dir=version_dir,
+            dataset_metadata=dataset_metadata,
+        )
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
     if not is_main_process():

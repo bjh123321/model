@@ -24,6 +24,7 @@ from surrogate_model.utils.model_artifacts import (
     load_json,
     merge_dataset_rows,
     resolve_parent_dataset,
+    validate_new_version_directory,
 )
 
 
@@ -174,6 +175,7 @@ def main():
     new_version_dir = model_dir / new_model_version
     if not base_version_dir.is_dir():
         raise FileNotFoundError(f"Parent model version does not exist: {base_version_dir}")
+    validate_new_version_directory(base_version_dir, new_version_dir)
     args = _parser().parse_args()
     if args.device is None:
         args.device = "auto"

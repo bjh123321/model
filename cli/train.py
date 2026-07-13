@@ -17,7 +17,11 @@ from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
-from surrogate_model.train.full_training_runner import run_full_training
+from surrogate_model.train.full_training_runner import (
+    build_checkpoint_metadata,
+    run_full_training,
+    write_training_config,
+)
 from surrogate_model.train.loops import train_one_fold
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
@@ -321,6 +325,14 @@ def main():
         return
 
     kfold_rows = []
+    dataset_metadata = {
+        "manifest": manifest,
+        "training_mode": "base_full_training",
+        "target_names": (
+            (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
+            + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
+        ),
+    }
     for fold in range(num_folds):
         if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
             print(f"========== Fold {fold + 1}/{num_folds} ==========")
@@ -334,7 +346,10 @@ def main():
             run_args.model_save_path = str(fold_dir / "model_best.pth")
             run_args.train_log_path = str(fold_dir / "train_log.csv")
             run_args.deploy_model_save_path = str(model_root / f"{model_root.name}.pth")
-            run_args.deploy_normalizer_dir = str(model_root.parent)
+            run_args.deploy_normalizer_dir = str(model_root)
+            run_args.checkpoint_metadata = build_checkpoint_metadata(
+                model_version=model_version, dataset_metadata=dataset_metadata
+            )
         best, train_hist, val_hist = train_one_fold(fold, cfg, real_parsed, run_args)
         if num_folds > 1:
             kfold_rows.append(
@@ -352,6 +367,13 @@ def main():
 
     if num_folds > 1 and ((not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0):
         _write_kfold_summary(model_root / "kfold_summary.csv", kfold_rows)
+        write_training_config(
+            cfg=cfg,
+            args=args,
+            model_version=model_version,
+            version_dir=model_root,
+            dataset_metadata=dataset_metadata,
+        )
 
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()

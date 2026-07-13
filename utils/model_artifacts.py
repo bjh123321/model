@@ -344,3 +344,15 @@ def resolve_parent_dataset(base_version_dir: Path, history_dataset: Path | None)
         flush=True,
     )
     return history_dataset, None
+
+
+def validate_new_version_directory(base_version_dir: Path, new_version_dir: Path) -> None:
+    """Refuse correction targets that could overwrite a parent or an existing version."""
+    base_version_dir = Path(base_version_dir).resolve()
+    new_version_dir = Path(new_version_dir).resolve()
+    if new_version_dir == base_version_dir:
+        raise ValueError("new_model_version must differ from base_model_version")
+    if new_version_dir.exists():
+        raise FileExistsError(
+            f"New model version already exists; refusing to overwrite version artifacts: {new_version_dir}"
+        )

@@ -11,8 +11,13 @@ import torch
 from surrogate_model.cli import train, train_incremental
 from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
+from surrogate_model.models.blocks import MFDNN
 from surrogate_model.train.dataloaders import build_single_fidelity_dataloaders
-from surrogate_model.train.full_training_runner import run_full_training
+from surrogate_model.train.full_training_runner import (
+    build_checkpoint_metadata,
+    run_full_training,
+    write_training_config,
+)
 from surrogate_model.utils.model_artifacts import (
     build_dataset_manifest,
     build_dataset_snapshot,
@@ -20,7 +25,9 @@ from surrogate_model.utils.model_artifacts import (
     dataset_fingerprint,
     group_rows,
     merge_dataset_rows,
+    resolve_parent_dataset,
     sha256_file,
+    validate_new_version_directory,
 )
 
 
@@ -74,6 +81,86 @@ class DatasetVersioningTests(unittest.TestCase):
             self.assertEqual(mapping[(300, 90, 0)], ["dataset_snapshot/real_dataset.txt"])
             self.assertEqual(read_real_dataset(root / "snapshot"), [row(3.0, 0.9, 0, 0)])
 
+    def test_same_parent_and_child_version_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            version = Path(temp) / "v1"
+            version.mkdir()
+            with self.assertRaisesRegex(ValueError, "must differ"):
+                validate_new_version_directory(version, version)
+
+    def test_existing_child_version_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / "v1"
+            child = root / "v2"
+            parent.mkdir()
+            child.mkdir()
+            with self.assertRaisesRegex(FileExistsError, "refusing to overwrite"):
+                validate_new_version_directory(parent, child)
+
+    def test_consecutive_correction_reads_immediate_parent_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            v1_rows = [row(3.0, 0.9, 0, 0), row(4.0, 1.0, 0, 0)]
+            build_dataset_snapshot(v1_rows, root / "v1" / "dataset_snapshot")
+            v2_rows, _ = merge_dataset_rows(v1_rows, [row(3.0, 0.9, 0, 0, -2.0)])
+            build_dataset_snapshot(v2_rows, root / "v2" / "dataset_snapshot")
+            v3_rows, _ = merge_dataset_rows(
+                read_real_dataset(root / "v2" / "dataset_snapshot"),
+                [row(5.0, 1.1, 0, 0, -3.0)],
+            )
+            grouped = group_rows(v3_rows, source="v3")
+            self.assertEqual(grouped[(300, 90, 0)][0][4], -2.0)
+            self.assertIn((500, 110, 0), grouped)
+
+    def test_manifest_records_lineage_changes_and_correction_split(self):
+        rows = [row(3.0, 0.9, 0, 0), row(4.0, 1.0, 0, 0)]
+        with tempfile.TemporaryDirectory() as temp:
+            snapshot = Path(temp) / "dataset_snapshot"
+            build_dataset_snapshot(rows, snapshot)
+            parent = {"dataset_version": "v1_dataset", "dataset_fingerprint": "sha256:parent"}
+            replacement = {"group_key": [300, 90, 0], "old_sha256": "a", "new_sha256": "b"}
+            manifest = build_dataset_manifest(
+                rows=rows,
+                model_version="v2",
+                snapshot_dir=snapshot,
+                train_group_keys=[(300, 90, 0)],
+                validation_group_keys=[(400, 100, 0)],
+                correction_group_keys=[(300, 90, 0)],
+                parent_manifest=parent,
+                parent_model_version="v1",
+                changes={"replaced_groups": [replacement], "added_groups": [], "removed_groups": []},
+            )
+            self.assertEqual(manifest["parent_dataset_version"], "v1_dataset")
+            self.assertEqual(manifest["created_from_model"], "v1")
+            self.assertIn([300, 90, 0], manifest["splits"]["train_group_keys"])
+            self.assertNotIn([300, 90, 0], manifest["splits"]["validation_group_keys"])
+            self.assertEqual(manifest["changes"]["replaced_groups"], [replacement])
+
+    def test_fingerprint_changes_when_split_identity_changes(self):
+        groups = [{"group_key": [300, 98, 1], "sha256": "sha256:a", "rows": 1}]
+        train = {"train_group_keys": [[300, 98, 1]], "validation_group_keys": []}
+        validation = {"train_group_keys": [], "validation_group_keys": [[300, 98, 1]]}
+        self.assertNotEqual(dataset_fingerprint(groups, train), dataset_fingerprint(groups, validation))
+
+    def test_legacy_parent_uses_explicit_history_dataset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            parent = root / "v1"
+            parent.mkdir()
+            history = root / "history.txt"
+            history.write_text("3\t0.9\t0\t0\t-1\t20\t1\t0.25\n", encoding="utf-8")
+            source, manifest = resolve_parent_dataset(parent, history)
+            self.assertEqual(source, history)
+            self.assertIsNone(manifest)
+
+    def test_legacy_parent_without_history_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "v1"
+            parent.mkdir()
+            with self.assertRaisesRegex(FileNotFoundError, "--history_dataset"):
+                resolve_parent_dataset(parent, None)
+
 
 class FullRetrainTests(unittest.TestCase):
     def test_incremental_entry_has_no_lora_replay_teacher_or_parent_weight_load(self):
@@ -91,6 +178,73 @@ class FullRetrainTests(unittest.TestCase):
         prediction_source = (Path(__file__).parent / "Predict_user.py").read_text(encoding="utf-8")
         self.assertIn('version_dir / "Normalizer_Input.pth"', prediction_source)
         self.assertIn('version_dir / "Normalizer_Output.pth"', prediction_source)
+
+    def test_incremental_cli_contains_full_training_overrides_only(self):
+        option_strings = {
+            option
+            for action in train_incremental._parser()._actions
+            for option in action.option_strings
+        }
+        for required in ("--epochs", "--batch_real", "--lr", "--checkpoint_selection", "--history_dataset"):
+            self.assertIn(required, option_strings)
+        for removed in ("--lora_rank", "--beta_kd", "--gamma_replay", "--replay_fraction"):
+            self.assertNotIn(removed, option_strings)
+
+    def test_shared_runner_is_the_only_single_fold_training_bridge(self):
+        runner_source = inspect.getsource(run_full_training)
+        self.assertIn("train_one_fold(0, cfg, parsed_rows, run_args)", runner_source)
+        self.assertIn("run_full_training", inspect.getsource(train.main))
+        self.assertIn("run_full_training", inspect.getsource(train_incremental.main))
+
+    def test_fresh_model_defaults_to_all_parameters_trainable(self):
+        cfg = Config()
+        cfg.use_lora = False
+        model = MFDNN(cfg)
+        self.assertTrue(all(parameter.requires_grad for parameter in model.parameters()))
+
+    def test_checkpoint_metadata_is_plain_randomly_initialized_model(self):
+        manifest = {"dataset_fingerprint": "sha256:dataset"}
+        metadata = build_checkpoint_metadata(
+            model_version="v2",
+            dataset_metadata={
+                "manifest": manifest,
+                "training_mode": "correction_full_retrain",
+                "parent_model_version": "v1",
+            },
+        )
+        self.assertEqual(metadata["initialization_mode"], "random")
+        self.assertFalse(metadata["parent_checkpoint_used_for_weights"])
+        self.assertFalse(metadata["use_lora"])
+        self.assertNotIn("lora_rank", metadata)
+
+    def test_training_config_records_effective_values_and_hashes(self):
+        cfg = Config()
+        cfg.use_lora = False
+        cfg.lr_low_adam = 0.0123
+        cfg.batch_real = 7
+        cfg._last_training_result = {"best_epoch": 3, "best_metric": 1.25}
+        args = SimpleNamespace(device="cpu")
+        with tempfile.TemporaryDirectory() as temp:
+            version_dir = Path(temp)
+            (version_dir / "Normalizer_Input.pth").write_bytes(b"input-normalizer")
+            (version_dir / "Normalizer_Output.pth").write_bytes(b"output-normalizer")
+            payload = write_training_config(
+                cfg=cfg,
+                args=args,
+                model_version="v2",
+                version_dir=version_dir,
+                dataset_metadata={
+                    "manifest": {"dataset_fingerprint": "sha256:dataset"},
+                    "training_mode": "correction_full_retrain",
+                    "parent_model_version": "v1",
+                    "target_names": ["freq", "damping", "rho", "sin_theta", "cos_theta"],
+                },
+            )
+            self.assertEqual(payload["training"]["learning_rate"], 0.0123)
+            self.assertEqual(payload["training"]["batch_size"], 7)
+            self.assertEqual(payload["normalizers"]["fit_on"], "training_split_only")
+            self.assertTrue(payload["normalizers"]["input_sha256"].startswith("sha256:"))
+            self.assertEqual(payload["selection"]["best_epoch"], 3)
 
     def test_dataloader_has_no_normalizer_write_side_effect(self):
         parsed, _ = parse_rows_to_struct([row(3.0, 0.9, 0, 0), row(4.0, 1.0, 0, 0)])
@@ -165,6 +319,7 @@ class FullRetrainTests(unittest.TestCase):
             checkpoint = torch.load(version_dir / "v2.pth", map_location="cpu")
             self.assertFalse(checkpoint["use_lora"])
             self.assertEqual(checkpoint["training_mode"], "correction_full_retrain")
+            self.assertEqual(checkpoint["initialization_mode"], "random")
             self.assertFalse(checkpoint["parent_checkpoint_used_for_weights"])
             for key in ("peft_type", "beta_kd", "gamma_replay", "guard_ratio", "lora_rank"):
                 self.assertNotIn(key, checkpoint)
