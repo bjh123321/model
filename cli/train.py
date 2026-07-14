@@ -96,26 +96,6 @@ def _default_model_dir(base_dir: Path, paths_ini_path: Path) -> Path:
     return fallback
 
 
-def _resolve_real_dataset_path(base_dir: Path, raw_value: str) -> Path:
-    candidate = Path(raw_value).expanduser()
-    if candidate.exists():
-        return candidate
-    local_real = base_dir / "real_dataset.txt"
-    if local_real.exists():
-        print(
-            f"[WARN] user_input.dat line 3 is not an existing dataset path: {raw_value!r}; "
-            f"using local dataset: {local_real}",
-            flush=True,
-        )
-        return local_real
-    raise FileNotFoundError(
-        "Real dataset file was not found. For base training, user_input.dat line 3 "
-        f"must be a real_dataset.txt path, or {local_real} must exist. "
-        "If this user_input.dat is for model correction, run "
-        "`python -m surrogate_model.cli.train_incremental` instead."
-    )
-
-
 def _enable_fast_cuda(args) -> torch.device:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("Device was set to cuda, but torch.cuda.is_available() is False.")
@@ -150,12 +130,17 @@ def main():
     user_input_path = base_dir / "user_input.dat"
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    if len(lines) < 3:
-        raise ValueError("user_input.dat needs at least 3 lines: paths.ini, model_version, real_dataset_path")
+    if len(lines) < 2:
+        raise ValueError("user_input.dat needs at least 2 lines: paths.ini, model_version")
 
     paths_ini_path = Path(lines[0].strip()).expanduser()
     model_version = lines[1].strip()
-    real_dataset_path = _resolve_real_dataset_path(base_dir, lines[2].strip())
+    real_dataset_path = base_dir / "real_dataset"
+    if not real_dataset_path.is_dir():
+        raise FileNotFoundError(
+            f"Base training requires a real_dataset directory next to the CLI entry: "
+            f"{real_dataset_path}"
+        )
     model_dir = _default_model_dir(base_dir, paths_ini_path)
 
     parser = argparse.ArgumentParser()
