@@ -126,6 +126,43 @@ def _send_finished_udp():
         sock.close()
 
 
+def _resume_model_ready(output_dir: Path, excitation_id: int, channel_id: int) -> tuple[bool, str]:
+    required = (
+        "model.pth",
+        "Normalizer_Input.pth",
+        "Normalizer_Output.pth",
+        "training_config.json",
+        "train_log.csv",
+    )
+    missing = [name for name in required if not (output_dir / name).is_file()]
+    if missing:
+        return False, f"missing {', '.join(missing)}"
+    try:
+        try:
+            checkpoint = torch.load(output_dir / "model.pth", map_location="cpu", weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(output_dir / "model.pth", map_location="cpu")
+        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+            return False, "checkpoint has no model_state_dict"
+        for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
+            if key in checkpoint and int(checkpoint[key]) != int(expected):
+                return False, f"checkpoint {key}={checkpoint[key]} does not match {expected}"
+        for filename in ("Normalizer_Input.pth", "Normalizer_Output.pth"):
+            normalizer = torch.load(output_dir / filename, map_location="cpu", weights_only=True)
+            if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
+                return False, f"invalid {filename}"
+        training_config = load_json(output_dir / "training_config.json")
+        if int(training_config.get("excitation_id", excitation_id)) != int(excitation_id):
+            return False, "training_config excitation_id mismatch"
+        if int(training_config.get("channel_id", channel_id)) != int(channel_id):
+            return False, "training_config channel_id mismatch"
+        if (output_dir / "train_log.csv").stat().st_size <= 0:
+            return False, "empty train_log.csv"
+    except Exception as exc:
+        return False, f"artifact validation failed: {type(exc).__name__}: {exc}"
+    return True, "complete"
+
+
 def main():
     base_dir = get_exe_dir()
     user_input_path = base_dir / "user_input.dat"
@@ -164,6 +201,11 @@ def main():
         help="Select the best checkpoint by validation group_FXD loss (default) or total training loss.",
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip channel models whose checkpoint, normalizers, config, and log are complete.",
+    )
     parser.add_argument("--batch_real", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--prefetch", type=int, default=None)
@@ -301,6 +343,21 @@ def main():
         label = f"{excitation_name(excitation_id)}/{channel_name(channel_id)}"
         print(f"========== Model {index}/{len(combinations)}: {label}, rows={len(combo_rows)} ==========", flush=True)
         try:
+            if args.resume:
+                ready, reason = _resume_model_ready(output_dir, excitation_id, channel_id)
+                if ready:
+                    trained_models.append(
+                        model_entry(
+                            excitation_id=excitation_id,
+                            channel_id=channel_id,
+                            row_count=len(combo_rows),
+                            status="resumed",
+                        )
+                    )
+                    print(f"[RESUME] complete model retained: {output_dir}", flush=True)
+                    continue
+                if output_dir.exists():
+                    print(f"[RESUME] {label} will be retrained: {reason}", flush=True)
             if not combo_cfg.explicit_train_group_keys:
                 raise RuntimeError("No training operating points are available for this combination")
             if combo_cfg.require_validation and not combo_cfg.explicit_validation_group_keys:
