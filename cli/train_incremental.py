@@ -32,6 +32,7 @@ from surrogate_model.utils.model_artifacts import (
     validate_new_version_directory,
 )
 from surrogate_model.utils.excitation_channel_models import (
+    channel_name,
     combination_dir,
     combinations_in_rows,
     copy_parent_model_directories,
@@ -339,7 +340,7 @@ def main():
             row for row in parsed_rows
             if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
         ]
-        label = f"{excitation_name(excitation_id)}/channel_{channel_id:02d}"
+        label = f"{excitation_name(excitation_id)}/{channel_name(channel_id)}"
         final_dir = combination_dir(new_version_dir, excitation_id, channel_id)
         training_dir = final_dir.parent / f".{final_dir.name}.training"
         if training_dir.exists():

@@ -26,6 +26,7 @@ from surrogate_model.utils.model_artifacts import (
     load_json,
 )
 from surrogate_model.utils.excitation_channel_models import (
+    channel_name,
     combination_dir,
     combinations_in_rows,
     excitation_name,
@@ -297,7 +298,7 @@ def main():
         combo_cfg.require_validation = combo_cfg.checkpoint_selection == "validation"
         combo_cfg.validation_metric_scope = "all"
         output_dir = combination_dir(model_root, excitation_id, channel_id)
-        label = f"{excitation_name(excitation_id)}/channel_{channel_id:02d}"
+        label = f"{excitation_name(excitation_id)}/{channel_name(channel_id)}"
         print(f"========== Model {index}/{len(combinations)}: {label}, rows={len(combo_rows)} ==========", flush=True)
         try:
             if not combo_cfg.explicit_train_group_keys:

@@ -20,10 +20,25 @@ EXCITATION_NAMES = {
     5: "JFY_DC",
 }
 
+CHANNEL_NAMES = (
+    "LW1", "LW2", "LW3", "LAI", "RW1", "RW2", "RW3", "RAI",
+    "LVT1", "LVT2", "LVT3", "LVT4", "LRY", "LRY1", "RVT1", "RVT2",
+    "RVT3", "RVT4", "RRY", "RRY1", "LHT1", "LHT4", "LHT2", "LHT3",
+    "RHT1", "RHT4", "RHT2", "RHT3", "F1Z", "F1Y", "ZWL1Y", "ZWL1Z",
+    "YWL1Y", "YWL1Z",
+)
+
 
 def excitation_name(excitation_id: int) -> str:
     excitation_id = int(excitation_id)
     return EXCITATION_NAMES.get(excitation_id, f"EXC_{excitation_id}")
+
+
+def channel_name(channel_id: int) -> str:
+    channel_id = int(channel_id)
+    if 0 <= channel_id < len(CHANNEL_NAMES):
+        return CHANNEL_NAMES[channel_id]
+    return f"channel_{channel_id:02d}"
 
 
 def combination_from_row(row) -> tuple[int, int]:
@@ -35,11 +50,11 @@ def combinations_in_rows(rows: Iterable) -> list[tuple[int, int]]:
 
 
 def combination_dir(version_dir: Path, excitation_id: int, channel_id: int) -> Path:
-    return Path(version_dir) / excitation_name(excitation_id) / f"channel_{int(channel_id):02d}"
+    return Path(version_dir) / excitation_name(excitation_id) / channel_name(channel_id)
 
 
 def combination_relative_dir(excitation_id: int, channel_id: int) -> str:
-    return f"{excitation_name(excitation_id)}/channel_{int(channel_id):02d}"
+    return f"{excitation_name(excitation_id)}/{channel_name(channel_id)}"
 
 
 def model_entry(
@@ -55,6 +70,7 @@ def model_entry(
         "excitation_id": int(excitation_id),
         "excitation_name": excitation_name(excitation_id),
         "channel_id": int(channel_id),
+        "channel_name": channel_name(channel_id),
         "relative_dir": relative_dir,
         "checkpoint": f"{relative_dir}/model.pth",
         "normalizer_input": f"{relative_dir}/Normalizer_Input.pth",

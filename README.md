@@ -40,13 +40,13 @@ that is present in the input dataset.  The model-version directory is organized 
   dataset_manifest.json
   models_manifest.json
   training_failures.json
-  FXD_FDC/channel_08/
+  FXD_FDC/LVT1/
     model.pth
     Normalizer_Input.pth
     Normalizer_Output.pth
     training_config.json
     train_log.csv
-  PW_FDC/channel_20/
+  PW_FDC/LHT1/
     ...
 ```
 
