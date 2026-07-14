@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import configparser
 import math
+import os
+import shutil
 import socket
 import sys
+import traceback
 from pathlib import Path
 
 import torch
@@ -26,6 +30,16 @@ from surrogate_model.utils.model_artifacts import (
     merge_dataset_rows,
     resolve_parent_dataset,
     validate_new_version_directory,
+)
+from surrogate_model.utils.excitation_channel_models import (
+    combination_dir,
+    combinations_in_rows,
+    copy_parent_model_directories,
+    excitation_name,
+    inventory_index,
+    load_model_inventory,
+    model_entry,
+    write_model_inventory,
 )
 
 
@@ -60,9 +74,16 @@ def _send_finished_udp():
         sock.close()
 
 
-def _restore_parent_configuration(base_version_dir: Path) -> tuple[Config, dict | None]:
+def _restore_parent_configuration(
+    base_version_dir: Path, parent_inventory: dict | None = None
+) -> tuple[Config, dict | None]:
     cfg = Config()
     training_path = base_version_dir / "training_config.json"
+    checkpoint_path = base_version_dir / f"{base_version_dir.name}.pth"
+    if parent_inventory is not None and parent_inventory.get("models"):
+        representative = parent_inventory["models"][0]
+        training_path = base_version_dir / representative["training_config"]
+        checkpoint_path = base_version_dir / representative["checkpoint"]
     if training_path.is_file():
         parent_training = load_json(training_path)
         model = parent_training.get("model", {})
@@ -100,7 +121,6 @@ def _restore_parent_configuration(base_version_dir: Path) -> tuple[Config, dict 
             cfg.val_seed = validation["seed"]
         return cfg, parent_training
 
-    checkpoint_path = base_version_dir / f"{base_version_dir.name}.pth"
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Parent checkpoint does not exist: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -178,6 +198,8 @@ def main():
     if not base_version_dir.is_dir():
         raise FileNotFoundError(f"Parent model version does not exist: {base_version_dir}")
     validate_new_version_directory(base_version_dir, new_version_dir)
+    parent_inventory = load_model_inventory(base_version_dir)
+    parent_models = inventory_index(parent_inventory)
     args = _parser().parse_args()
     if args.device is None:
         args.device = "auto"
@@ -185,7 +207,9 @@ def main():
     args.debug_overfit_n = 0
     args.debug_overfit_offset = 0
 
-    cfg, parent_training = _restore_parent_configuration(base_version_dir)
+    cfg, _representative_parent_training = _restore_parent_configuration(
+        base_version_dir, parent_inventory
+    )
     _apply_cli_overrides(cfg, args)
 
     def resolve_user_path(raw: str) -> Path:
@@ -256,38 +280,8 @@ def main():
     all_keys = set(group_rows(merged_rows, source="merged dataset"))
     train_keys = (train_keys & all_keys) | correction_keys | (all_keys - train_keys - validation_keys)
     validation_keys &= all_keys
-    if not validation_keys:
-        parent_final_train_loss = (
-            None if parent_training is None
-            else parent_training.get("selection", {}).get("final_train_loss")
-        )
-        try:
-            parent_final_train_loss = float(parent_final_train_loss)
-        except (TypeError, ValueError):
-            raise RuntimeError(
-                "Correction groups removed every validation group, but the parent training "
-                "configuration has no numeric selection.final_train_loss for early stopping."
-            ) from None
-        if not math.isfinite(parent_final_train_loss) or parent_final_train_loss < 0:
-            raise RuntimeError(
-                "Parent selection.final_train_loss must be a finite non-negative number, "
-                f"got {parent_final_train_loss!r}."
-            )
-        cfg.checkpoint_selection = "training"
-        cfg.require_validation = False
-        cfg.parent_train_loss_target = parent_final_train_loss
-        if args.epochs_after_parent_loss < 0:
-            raise ValueError("--epochs_after_parent_loss must be non-negative")
-        cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
-        print(
-            "[CORRECTION] inherited validation was exhausted; using every group for training. "
-            f"Early stop: train_loss <= {parent_final_train_loss:.9g}, then "
-            f"{cfg.epochs_after_parent_loss} more epochs.",
-            flush=True,
-        )
-    cfg.explicit_train_group_keys = sorted(train_keys)
-    cfg.explicit_validation_group_keys = sorted(validation_keys)
-    cfg.require_validation = bool(validation_keys)
+    if args.epochs_after_parent_loss < 0:
+        raise ValueError("--epochs_after_parent_loss must be non-negative")
 
     build_dataset_snapshot(merged_rows, new_version_dir / "dataset_snapshot")
     replaced_records = [
@@ -330,22 +324,148 @@ def main():
         (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
         + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
     )
-    run_full_training(
-        cfg=cfg,
-        parsed_rows=parsed_rows,
+    inherited_models = copy_parent_model_directories(
+        base_version_dir, new_version_dir, parent_inventory
+    )
+    result_models = {
+        (int(item["excitation_id"]), int(item["channel_id"])): item
+        for item in inherited_models
+    }
+    failures = []
+    correction_parsed, _ = parse_rows_to_struct(correction_rows)
+    affected_combinations = combinations_in_rows(correction_parsed)
+    for index, (excitation_id, channel_id) in enumerate(affected_combinations, 1):
+        combo_rows = [
+            row for row in parsed_rows
+            if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
+        ]
+        label = f"{excitation_name(excitation_id)}/channel_{channel_id:02d}"
+        final_dir = combination_dir(new_version_dir, excitation_id, channel_id)
+        training_dir = final_dir.parent / f".{final_dir.name}.training"
+        if training_dir.exists():
+            shutil.rmtree(training_dir)
+        print(
+            f"========== Correction model {index}/{len(affected_combinations)}: "
+            f"{label}, merged_rows={len(combo_rows)} ==========",
+            flush=True,
+        )
+        try:
+            parent_entry = parent_models.get((excitation_id, channel_id))
+            if parent_entry is not None:
+                combo_cfg, parent_training = _restore_parent_configuration(
+                    base_version_dir, {"models": [parent_entry]}
+                )
+            else:
+                combo_cfg, parent_training = copy.deepcopy(cfg), None
+            _apply_cli_overrides(combo_cfg, args)
+            combo_cfg.validation_metric_scope = "all"
+            available_keys = {group_key_from_parsed(row) for row in combo_rows}
+            combo_train_keys = set(train_keys) & available_keys
+            combo_validation_keys = set(validation_keys) & available_keys
+            if not combo_rows or not combo_train_keys:
+                raise RuntimeError("No merged training data is available for this combination")
+
+            if combo_validation_keys:
+                combo_cfg.explicit_train_group_keys = sorted(combo_train_keys)
+                combo_cfg.explicit_validation_group_keys = sorted(combo_validation_keys)
+                combo_cfg.require_validation = True
+            else:
+                parent_final_train_loss = (
+                    None if parent_training is None
+                    else parent_training.get("selection", {}).get("final_train_loss")
+                )
+                try:
+                    parent_final_train_loss = float(parent_final_train_loss)
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "No validation data remains and the parent channel model has no numeric "
+                        "selection.final_train_loss for early stopping"
+                    ) from None
+                if not math.isfinite(parent_final_train_loss) or parent_final_train_loss < 0:
+                    raise RuntimeError(
+                        "Parent channel selection.final_train_loss must be finite and non-negative, "
+                        f"got {parent_final_train_loss!r}"
+                    )
+                combo_cfg.checkpoint_selection = "training"
+                combo_cfg.explicit_train_group_keys = sorted(available_keys)
+                combo_cfg.explicit_validation_group_keys = []
+                combo_cfg.require_validation = False
+                combo_cfg.parent_train_loss_target = parent_final_train_loss
+                combo_cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
+                print(
+                    f"[CORRECTION] {label}: all rows train; train_loss target="
+                    f"{parent_final_train_loss:.9g}, then {combo_cfg.epochs_after_parent_loss} epochs.",
+                    flush=True,
+                )
+
+            combo_correction_keys = {
+                group_key_from_parsed(row) for row in correction_parsed
+                if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
+            }
+            run_full_training(
+                cfg=combo_cfg,
+                parsed_rows=combo_rows,
+                model_version=new_model_version,
+                version_dir=training_dir,
+                args=args,
+                dataset_metadata={
+                    "manifest": manifest,
+                    "dataset_manifest_path": "../../dataset_manifest.json",
+                    "training_mode": "correction_full_retrain",
+                    "model_filename": "model.pth",
+                    "parent_model_version": base_model_version,
+                    "parent_dataset_fingerprint": None if parent_manifest is None else parent_manifest.get("dataset_fingerprint"),
+                    "excitation_id": excitation_id,
+                    "excitation_name": excitation_name(excitation_id),
+                    "channel_id": channel_id,
+                    "corrected_group_keys": [list(key) for key in sorted(combo_correction_keys)],
+                    "replaced_group_keys": [list(key) for key in merge_info["replaced_group_keys"]],
+                    "added_group_keys": [list(key) for key in merge_info["added_group_keys"]],
+                    "target_names": target_names,
+                },
+            )
+            if final_dir.exists():
+                shutil.rmtree(final_dir)
+            os.replace(training_dir, final_dir)
+            result_models[(excitation_id, channel_id)] = model_entry(
+                excitation_id=excitation_id,
+                channel_id=channel_id,
+                row_count=len(combo_rows),
+                status="corrected",
+                source_model_version=base_model_version,
+            )
+        except Exception as exc:
+            if training_dir.exists():
+                shutil.rmtree(training_dir)
+            failures.append(
+                {
+                    "excitation_id": excitation_id,
+                    "excitation_name": excitation_name(excitation_id),
+                    "channel_id": channel_id,
+                    "row_count": len(combo_rows),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "parent_model_retained": (excitation_id, channel_id) in result_models,
+                }
+            )
+            print(f"[SKIP] {label}: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    write_model_inventory(
+        new_version_dir,
         model_version=new_model_version,
-        version_dir=new_version_dir,
-        args=args,
-        dataset_metadata={
-            "manifest": manifest,
-            "training_mode": "correction_full_retrain",
-            "parent_model_version": base_model_version,
-            "parent_dataset_fingerprint": None if parent_manifest is None else parent_manifest.get("dataset_fingerprint"),
-            "corrected_group_keys": [list(key) for key in sorted(correction_keys)],
-            "replaced_group_keys": [list(key) for key in merge_info["replaced_group_keys"]],
-            "added_group_keys": [list(key) for key in merge_info["added_group_keys"]],
-            "target_names": target_names,
-        },
+        parent_model_version=base_model_version,
+        models=result_models.values(),
+        failures=failures,
+    )
+    print(
+        f"[MODEL-INVENTORY] total={len(result_models)} corrected="
+        f"{sum(item.get('status') == 'corrected' for item in result_models.values())} "
+        f"skipped={len(failures)} path={new_version_dir / 'models_manifest.json'}",
+        flush=True,
     )
     _send_finished_udp()
 

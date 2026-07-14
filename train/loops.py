@@ -362,7 +362,8 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             f"pole_target={out_norm.pole_target}, residue_target={out_norm.residue_target}, targets={target_names}",
             flush=True,
         )
-        selection_text = "loss_train_total" if checkpoint_selection == "training" else "loss_val_group_FXD"
+        validation_scope = str(getattr(cfg, "validation_metric_scope", "group_FXD"))
+        selection_text = "loss_train_total" if checkpoint_selection == "training" else f"loss_val_{validation_scope}"
         print(f"[CHECKPOINT] selection={checkpoint_selection} metric={selection_text}", flush=True)
         if parent_loss_target is not None:
             print(
@@ -403,15 +404,16 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         train_parts = _mean_parts(part_sum, count, target_names)
         train_scope_losses = _finalize_scope_accum(_allreduce_scope_accum(train_scope_accum, device), target_names)
         val_scope_losses = _eval_model_scopes(model, val_dl, device, mean, std, target_names)
-        val_group_fxd = val_scope_losses.get("group_FXD")
-        val_loss = None if val_group_fxd is None else val_group_fxd["loss"]
-        val_parts = _part_dict_zero(target_names) if val_group_fxd is None else val_group_fxd["parts"]
+        validation_scope = str(getattr(cfg, "validation_metric_scope", "group_FXD"))
+        val_selection = val_scope_losses.get(validation_scope)
+        val_loss = None if val_selection is None else val_selection["loss"]
+        val_parts = _part_dict_zero(target_names) if val_selection is None else val_selection["parts"]
         if checkpoint_selection == "training":
             metric = train_loss
             cfg._best_metric_name = "loss_train_total"
         else:
             metric = val_loss if val_loss is not None else train_loss
-            cfg._best_metric_name = "loss_val_group_FXD" if val_loss is not None else "loss_train_total_fallback"
+            cfg._best_metric_name = f"loss_val_{validation_scope}" if val_loss is not None else "loss_train_total_fallback"
         if sched is not None:
             sched.step(train_loss)
         train_hist.append(train_loss)

@@ -18,6 +18,7 @@ from surrogate_model.data.xlsx_utils import load_signal_type_rows
 from surrogate_model.test.residue_pred import build_BA_from_residues
 # from Error import calc_relative_error
 from surrogate_model.test.pp_utils import build_exc_seg_list, calc_pp_for_freq
+from surrogate_model.utils.excitation_channel_models import inventory_index, load_model_inventory
 
 
 def get_exe_dir():
@@ -375,7 +376,7 @@ def build_u_from_kind(kind: str, amp_scale: float, fs: int, table: Dict[str, Lis
 # ============================================================
 
 @torch.no_grad()
-def run_infer_batched(
+def _run_infer_single_model_batched(
     model,
     in_norm,
     omegaN: float,
@@ -489,6 +490,119 @@ def run_infer_batched(
         outs_acc["valid_mask"].append(valid_full.astype(np.float32))
 
     return {key: np.concatenate(values, axis=0) for key, values in outs_acc.items()}
+
+
+class ExcitationChannelModelRegistry:
+    def __init__(self, version_dir: Path, device: torch.device):
+        self.version_dir = Path(version_dir)
+        self.device = device
+        self.inventory = load_model_inventory(self.version_dir)
+        self.entries = inventory_index(self.inventory)
+        if not self.entries:
+            raise RuntimeError(f"No usable excitation/channel models are listed in {self.version_dir}")
+        self._cache = {}
+        self._missing_warned = set()
+
+    def get(self, excitation_id: int, channel_id: int):
+        key = (int(excitation_id), int(channel_id))
+        if key in self._cache:
+            return self._cache[key]
+        entry = self.entries.get(key)
+        if entry is None:
+            if key not in self._missing_warned:
+                print(
+                    f"[WARN] No model for excitation_id={key[0]}, channel_id={key[1]}; "
+                    "zero/empty output will be used.",
+                    flush=True,
+                )
+                self._missing_warned.add(key)
+            return None
+        checkpoint_path = self.version_dir / entry["checkpoint"]
+        input_normalizer_path = self.version_dir / entry["normalizer_input"]
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        selected_model = build_model_from_checkpoint(
+            checkpoint, device=self.device, checkpoint_path=checkpoint_path
+        )
+        input_normalizer = Normalizer.load(input_normalizer_path)
+        if len(input_normalizer.mean) != 2 or len(input_normalizer.std) != 2:
+            raise RuntimeError(
+                f"{input_normalizer_path} must describe [H, M], got "
+                f"mean={input_normalizer.mean}, std={input_normalizer.std}"
+            )
+        self._cache[key] = (selected_model, input_normalizer)
+        print(
+            f"[MODEL] loaded excitation_id={key[0]} channel_id={key[1]}: {checkpoint_path}",
+            flush=True,
+        )
+        return self._cache[key]
+
+    @property
+    def kmax(self) -> int:
+        bundle = self.get(*min(self.entries))
+        return int(bundle[0].cfg.K_max)
+
+
+@torch.no_grad()
+def run_infer_batched(
+    model,
+    in_norm,
+    omegaN: float,
+    device: torch.device,
+    H_all: np.ndarray,
+    M_all: np.ndarray,
+    exc_all: np.ndarray,
+    ch_all: np.ndarray,
+    batch_size: int = 20000,
+    predict_output: str = "low",
+    mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+):
+    if not isinstance(model, ExcitationChannelModelRegistry):
+        return _run_infer_single_model_batched(
+            model, in_norm, omegaN, device, H_all, M_all, exc_all, ch_all,
+            batch_size=batch_size,
+            predict_output=predict_output,
+            mode_freq_ranges=mode_freq_ranges,
+        )
+
+    registry = model
+    count = len(H_all)
+    kmax = registry.kmax
+    combined = {
+        "alpha": np.zeros((count, kmax), dtype=np.float64),
+        "omega": np.zeros((count, kmax), dtype=np.float64),
+        "rho": np.zeros((count, kmax), dtype=np.float64),
+        "sin_theta": np.zeros((count, kmax), dtype=np.float64),
+        "cos_theta": np.ones((count, kmax), dtype=np.float64),
+        "valid_mask": np.zeros((count, kmax), dtype=np.float32),
+    }
+    exc_values = np.asarray(exc_all, dtype=np.int64)
+    channel_values = np.asarray(ch_all, dtype=np.int64)
+    combinations = sorted(set(zip(exc_values.tolist(), channel_values.tolist())))
+    for excitation_id, channel_id in combinations:
+        selected = (exc_values == excitation_id) & (channel_values == channel_id)
+        bundle = registry.get(excitation_id, channel_id)
+        if bundle is None:
+            continue
+        selected_model, selected_normalizer = bundle
+        output = _run_infer_single_model_batched(
+            selected_model,
+            selected_normalizer,
+            omegaN,
+            device,
+            np.asarray(H_all)[selected],
+            np.asarray(M_all)[selected],
+            exc_values[selected],
+            channel_values[selected],
+            batch_size=batch_size,
+            predict_output=predict_output,
+            mode_freq_ranges=mode_freq_ranges,
+        )
+        for name in combined:
+            combined[name][selected] = output[name]
+    return combined
 
 
 def load_response_output_header(header_path: Path) -> List[str]:
@@ -929,7 +1043,7 @@ def main():
         dest="model_path",
         type=str,
         default=None,
-        help="Optional checkpoint path. Defaults to MX_XGD/model_version/model_version.pth from user_input.dat.",
+        help="Optional excitation/channel model-version directory. Defaults to MX_XGD/model_version.",
     )
     parser.add_argument(
         "--predict_output",
@@ -974,17 +1088,13 @@ def main():
     model_dir = _path_from_config(cp, paths_ini_path, "MX_XGD")
 
     version_dir = model_dir / model_version
-    ckpt_path = Path(args.model_path).expanduser() if args.model_path else version_dir / (model_version + ".pth")
-    in_norm_path = version_dir / "Normalizer_Input.pth"
-    out_norm_path = version_dir / "Normalizer_Output.pth"
-    if not in_norm_path.is_file() or not out_norm_path.is_file():
-        legacy_input = model_dir / "Normalizer_Input.pth"
-        legacy_output = model_dir / "Normalizer_Output.pth"
-        print(
-            f"[LEGACY-NORMALIZER] version-local normalizers are missing; using {model_dir}",
-            flush=True,
-        )
-        in_norm_path, out_norm_path = legacy_input, legacy_output
+    if args.model_path:
+        version_dir = Path(args.model_path).expanduser()
+        if version_dir.is_file():
+            raise ValueError(
+                "--model_path must point to an excitation/channel model-version directory, "
+                "not a single checkpoint file"
+            )
     data_header_dir = _path_from_config(cp, paths_ini_path, "DataHeader")
     response_output_header = load_response_output_header(data_header_dir / "sc.dat")
 
@@ -1027,27 +1137,12 @@ def main():
 
     # ===== 加载模型 =====
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_norm = Normalizer.load(out_norm_path)
-
-    print(f"==> Loading ckpt: {ckpt_path}")
+    print(f"==> Loading excitation/channel model inventory: {version_dir}")
     print(f"==> Prediction output: {args.predict_output}")
-    try:
-        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-    model = build_model_from_checkpoint(ckpt, device=device, checkpoint_path=ckpt_path)
-    cfg = model.cfg
-    print(
-        f"==> Strict checkpoint load succeeded: modulation_mode={cfg.modulation_mode}, "
-        f"use_lora={cfg.use_lora}, K_max={cfg.K_max}",
-        flush=True,
-    )
-
-    in_norm = Normalizer.load(in_norm_path)
+    model = ExcitationChannelModelRegistry(version_dir, device)
+    in_norm = None
     mode_freq_ranges = _load_channel_freq_ranges(csv_path) if args.use_freq_filter else None
     print(f"==> Frequency range filter enabled: {args.use_freq_filter}", flush=True)
-    if len(in_norm.mean) != 2 or len(in_norm.std) != 2:
-        raise RuntimeError(f"Normalizer_Input.pth 应为二维 [H, M]，当前 mean={in_norm.mean}, std={in_norm.std}")
 
     # ===== 读取 ini → entries =====
     sortie_num, entries = load_task_from_ini(task_ini_path, EXC_NAME_TO_ID)

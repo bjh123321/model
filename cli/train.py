@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import configparser
 import copy
-import csv
 import multiprocessing as mp
 import os
 import socket
 import sys
+import traceback
 from pathlib import Path
 
 import torch
@@ -17,18 +17,20 @@ from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
-from surrogate_model.train.full_training_runner import (
-    build_checkpoint_metadata,
-    run_full_training,
-    write_training_config,
-)
-from surrogate_model.train.loops import train_one_fold
+from surrogate_model.train.full_training_runner import run_full_training
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
     build_input_dataset_snapshot,
     group_key_from_parsed,
     load_json,
+)
+from surrogate_model.utils.excitation_channel_models import (
+    combination_dir,
+    combinations_in_rows,
+    excitation_name,
+    model_entry,
+    write_model_inventory,
 )
 
 
@@ -141,16 +143,6 @@ def _send_finished_udp():
         print(f"[WARN] UDP notification failed: {exc}")
     finally:
         sock.close()
-
-
-def _write_kfold_summary(path: Path, rows: list[dict]):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fields = ["fold", "best_metric", "final_train_loss", "final_val_loss", "model_path", "train_log_path"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fields})
 
 
 def main():
@@ -275,15 +267,10 @@ def main():
     cfg.embed_channel_num = real_stats["channel_num"]
     cfg.embed_excitation_num = real_stats["excitation_num"]
 
-    num_folds = args.kfold if (cfg.val_split_strategy == "height_mach_kfold" and args.kfold > 1) else 1
-
     model_root = Path(args.out_dir)
     preview_train, preview_val, split_strategy = split_single_fidelity_rows(real_parsed, cfg, 0, 0)
     train_group_keys = sorted({group_key_from_parsed(row) for row in preview_train})
     validation_group_keys = sorted({group_key_from_parsed(row) for row in preview_val})
-    if num_folds == 1:
-        cfg.explicit_train_group_keys = train_group_keys
-        cfg.explicit_validation_group_keys = validation_group_keys
     if not ddp_enabled or rank == 0:
         relative_files_by_group = build_input_dataset_snapshot(
             real_dataset_path, model_root / "dataset_snapshot"
@@ -303,76 +290,87 @@ def main():
     if ddp_enabled and rank != 0:
         manifest = load_json(model_root / "dataset_manifest.json")
 
-    if num_folds == 1:
-        run_full_training(
-            cfg=cfg,
-            parsed_rows=real_parsed,
+    if args.kfold > 1:
+        raise ValueError("Per-excitation/channel training currently requires --kfold 0 or 1")
+
+    target_names = (
+        (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
+        + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
+    )
+    trained_models = []
+    failures = []
+    combinations = combinations_in_rows(real_parsed)
+    for index, (excitation_id, channel_id) in enumerate(combinations, 1):
+        combo_rows = [
+            row for row in real_parsed
+            if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
+        ]
+        combo_cfg = copy.deepcopy(cfg)
+        available_keys = {group_key_from_parsed(row) for row in combo_rows}
+        combo_cfg.explicit_train_group_keys = sorted(set(train_group_keys) & available_keys)
+        combo_cfg.explicit_validation_group_keys = sorted(set(validation_group_keys) & available_keys)
+        combo_cfg.require_validation = combo_cfg.checkpoint_selection == "validation"
+        combo_cfg.validation_metric_scope = "all"
+        output_dir = combination_dir(model_root, excitation_id, channel_id)
+        label = f"{excitation_name(excitation_id)}/channel_{channel_id:02d}"
+        print(f"========== Model {index}/{len(combinations)}: {label}, rows={len(combo_rows)} ==========", flush=True)
+        try:
+            if not combo_cfg.explicit_train_group_keys:
+                raise RuntimeError("No training operating points are available for this combination")
+            if combo_cfg.require_validation and not combo_cfg.explicit_validation_group_keys:
+                raise RuntimeError("No validation operating points are available for this combination")
+            run_full_training(
+                cfg=combo_cfg,
+                parsed_rows=combo_rows,
+                model_version=model_version,
+                version_dir=output_dir,
+                args=args,
+                dataset_metadata={
+                    "manifest": manifest,
+                    "dataset_manifest_path": "../../dataset_manifest.json",
+                    "training_mode": "base_full_training",
+                    "model_filename": "model.pth",
+                    "excitation_id": excitation_id,
+                    "excitation_name": excitation_name(excitation_id),
+                    "channel_id": channel_id,
+                    "target_names": target_names,
+                },
+            )
+            trained_models.append(
+                model_entry(
+                    excitation_id=excitation_id,
+                    channel_id=channel_id,
+                    row_count=len(combo_rows),
+                    status="trained",
+                )
+            )
+        except Exception as exc:
+            failure = {
+                "excitation_id": excitation_id,
+                "excitation_name": excitation_name(excitation_id),
+                "channel_id": channel_id,
+                "row_count": len(combo_rows),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            failures.append(failure)
+            print(f"[SKIP] {label}: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    if (not ddp_enabled) or rank == 0:
+        write_model_inventory(
+            model_root,
             model_version=model_version,
-            version_dir=model_root,
-            args=args,
-            dataset_metadata={
-                "manifest": manifest,
-                "training_mode": "base_full_training",
-                "target_names": (
-                    (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
-                    + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
-                ),
-            },
+            models=trained_models,
+            failures=failures,
         )
-        if dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
-        _send_finished_udp()
-        return
-
-    kfold_rows = []
-    dataset_metadata = {
-        "manifest": manifest,
-        "training_mode": "base_full_training",
-        "target_names": (
-            (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
-            + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
-        ),
-    }
-    for fold in range(num_folds):
-        if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
-            print(f"========== Fold {fold + 1}/{num_folds} ==========")
-        run_args = copy.copy(args)
-        run_args.fold_index = fold
-        run_args.num_folds = num_folds
-        if num_folds > 1:
-            fold_dir = model_root / f"fold_{fold}"
-            run_args.out_dir = str(fold_dir / "checkpoints")
-            run_args.normalizer_dir = str(fold_dir)
-            run_args.model_save_path = str(fold_dir / "model_best.pth")
-            run_args.train_log_path = str(fold_dir / "train_log.csv")
-            run_args.deploy_model_save_path = str(model_root / f"{model_root.name}.pth")
-            run_args.deploy_normalizer_dir = str(model_root)
-            run_args.checkpoint_metadata = build_checkpoint_metadata(
-                model_version=model_version, dataset_metadata=dataset_metadata
-            )
-        best, train_hist, val_hist = train_one_fold(fold, cfg, real_parsed, run_args)
-        if num_folds > 1:
-            kfold_rows.append(
-                {
-                    "fold": fold,
-                    "best_metric": best,
-                    "final_train_loss": train_hist[-1] if train_hist else "",
-                    "final_val_loss": val_hist[-1] if val_hist else "",
-                    "model_path": run_args.model_save_path,
-                    "train_log_path": run_args.train_log_path,
-                }
-            )
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    if num_folds > 1 and ((not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0):
-        _write_kfold_summary(model_root / "kfold_summary.csv", kfold_rows)
-        write_training_config(
-            cfg=cfg,
-            args=args,
-            model_version=model_version,
-            version_dir=model_root,
-            dataset_metadata=dataset_metadata,
+        print(
+            f"[MODEL-INVENTORY] trained={len(trained_models)} skipped={len(failures)} "
+            f"path={model_root / 'models_manifest.json'}",
+            flush=True,
         )
 
     if dist.is_available() and dist.is_initialized():

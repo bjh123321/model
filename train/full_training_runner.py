@@ -78,7 +78,7 @@ def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) 
     manifest = dataset_metadata["manifest"]
     training_mode = str(dataset_metadata.get("training_mode", "base_full_training"))
     correction = training_mode == "correction_full_retrain"
-    return {
+    metadata = {
         "stage": (
             "fixed_single_fidelity_correction_full_retrain"
             if correction
@@ -90,7 +90,7 @@ def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) 
         "parent_model_version": dataset_metadata.get("parent_model_version"),
         "parent_checkpoint_used_for_weights": False,
         "use_lora": False,
-        "dataset_manifest": "dataset_manifest.json",
+        "dataset_manifest": str(dataset_metadata.get("dataset_manifest_path", "dataset_manifest.json")),
         "dataset_fingerprint": manifest["dataset_fingerprint"],
         "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
         "dataset_snapshot_root": "dataset_snapshot",
@@ -101,6 +101,12 @@ def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) 
         "replaced_group_keys": dataset_metadata.get("replaced_group_keys", []),
         "added_group_keys": dataset_metadata.get("added_group_keys", []),
     }
+    if "excitation_id" in dataset_metadata:
+        metadata["excitation_id"] = int(dataset_metadata["excitation_id"])
+        metadata["excitation_name"] = str(dataset_metadata.get("excitation_name", ""))
+    if "channel_id" in dataset_metadata:
+        metadata["channel_id"] = int(dataset_metadata["channel_id"])
+    return metadata
 
 
 def write_training_config(
@@ -122,12 +128,15 @@ def write_training_config(
         "model_version": model_version,
         "parent_model_version": dataset_metadata.get("parent_model_version"),
         "training_mode": training_mode,
+        "excitation_id": dataset_metadata.get("excitation_id"),
+        "excitation_name": dataset_metadata.get("excitation_name"),
+        "channel_id": dataset_metadata.get("channel_id"),
         "initialization": {
             "mode": "random",
             "parent_checkpoint_used_for_weights": False,
         },
         "dataset": {
-            "manifest": "dataset_manifest.json",
+            "manifest": str(dataset_metadata.get("dataset_manifest_path", "dataset_manifest.json")),
             "dataset_fingerprint": manifest["dataset_fingerprint"],
             "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
             "snapshot_root": "dataset_snapshot",
@@ -176,7 +185,7 @@ def run_full_training(
     run_args = copy.copy(args)
     run_args.out_dir = str(version_dir)
     run_args.normalizer_dir = str(version_dir)
-    run_args.model_save_path = str(version_dir / f"{model_version}.pth")
+    run_args.model_save_path = str(version_dir / str(dataset_metadata.get("model_filename", f"{model_version}.pth")))
     run_args.train_log_path = str(version_dir / "train_log.csv")
     run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
     run_args.fold_index = 0
