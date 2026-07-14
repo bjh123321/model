@@ -19,7 +19,8 @@ class Config:
     lora_rank: int = 4
     lora_alpha: float = 1.0
     lora_dropout: float = 0.0
-    use_modulation: bool = True
+    lora_target_hidden_indices: Tuple[int, ...] = (2,)
+    use_modulation: bool = False
     modulation_mode: str = "legacy"
     mod_gamma: float = 0.2
     debug_direct_output: bool = False

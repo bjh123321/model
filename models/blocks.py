@@ -19,14 +19,28 @@ class MLP(nn.Module):
         lora_rank: int = 4,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
+        lora_target_hidden_indices: Iterable[int] | None = None,
     ):
         super().__init__()
         dims = list(dims)
+        hidden_count = len(dims) - 2
+        if lora_target_hidden_indices is None:
+            targets = tuple(range(1, hidden_count))
+        else:
+            targets = tuple(sorted({int(index) for index in lora_target_hidden_indices}))
+        invalid = [index for index in targets if index < 0 or index >= hidden_count]
+        if use_lora and invalid:
+            raise ValueError(
+                f"LoRA target hidden indices {invalid} are outside [0, {hidden_count - 1}]"
+            )
+        self.lora_target_hidden_indices = targets
+        self.hidden_linear_module_indices = []
         layers = []
-        for i in range(len(dims) - 2):
+        for i in range(hidden_count):
+            self.hidden_linear_module_indices.append(len(layers))
             linear = (
                 LoRALinear(dims[i], dims[i + 1], lora_rank, lora_alpha, lora_dropout)
-                if use_lora and i > 0
+                if use_lora and i in targets
                 else nn.Linear(dims[i], dims[i + 1])
             )
             layers += [linear, nn.GELU()]
@@ -76,6 +90,7 @@ class LowFidelityHead(nn.Module):
             lora_rank=int(getattr(cfg, "lora_rank", 4)),
             lora_alpha=float(getattr(cfg, "lora_alpha", 1.0)),
             lora_dropout=float(getattr(cfg, "lora_dropout", 0.0)),
+            lora_target_hidden_indices=getattr(cfg, "lora_target_hidden_indices", (2,)),
         )
 
         self.mod = None

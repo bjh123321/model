@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import re
 from pathlib import Path
 from typing import Mapping
 
@@ -13,7 +14,8 @@ from surrogate_model.models.blocks import MFDNN
 STRUCTURE_FIELDS = (
     "K_max", "embed_excitation_num", "embed_excitation_dim", "embed_channel_num",
     "embed_channel_dim", "low_hidden", "dropout_prob", "use_lora", "lora_rank",
-    "lora_alpha", "lora_dropout", "use_modulation", "mod_gamma", "pole_target", "residue_target",
+    "lora_alpha", "lora_dropout", "lora_target_hidden_indices", "use_modulation",
+    "mod_gamma", "pole_target", "residue_target",
 )
 
 
@@ -35,6 +37,52 @@ def checkpoint_uses_lora(checkpoint: Mapping, state: Mapping | None = None) -> b
             f"but state_uses_lora={state_uses_lora}"
         )
     return state_uses_lora
+
+
+def infer_lora_target_hidden_indices(state: Mapping) -> tuple[int, ...]:
+    """Infer logical hidden-layer indices from sequential module positions in a LoRA state."""
+    linear_pattern = re.compile(r"^low\.mlp\.net\.(\d+)\.(?:base\.)?weight$")
+    lora_pattern = re.compile(r"^low\.mlp\.net\.(\d+)\.A\.weight$")
+    linear_modules = sorted(
+        {int(match.group(1)) for key in state for match in [linear_pattern.match(key)] if match}
+    )
+    lora_modules = sorted(
+        {int(match.group(1)) for key in state for match in [lora_pattern.match(key)] if match}
+    )
+    if not lora_modules:
+        return ()
+    logical_index = {module_index: index for index, module_index in enumerate(linear_modules[:-1])}
+    unknown = [module_index for module_index in lora_modules if module_index not in logical_index]
+    if unknown:
+        raise RuntimeError(f"Cannot map checkpoint LoRA module positions to hidden layers: {unknown}")
+    return tuple(logical_index[module_index] for module_index in lora_modules)
+
+
+def _restore_lora_structure(cfg: Config, checkpoint: Mapping, state: Mapping) -> None:
+    detected_targets = infer_lora_target_hidden_indices(state)
+    metadata_targets = checkpoint.get("lora_target_hidden_indices")
+    if metadata_targets is not None:
+        metadata_targets = tuple(int(index) for index in metadata_targets)
+        if metadata_targets != detected_targets:
+            raise RuntimeError(
+                "Checkpoint LoRA target metadata conflicts with state dictionary: "
+                f"metadata={metadata_targets}, detected={detected_targets}"
+            )
+    cfg.lora_target_hidden_indices = detected_targets
+
+    ranks = {
+        int(tensor.shape[0])
+        for key, tensor in state.items()
+        if key.endswith(".A.weight") and isinstance(tensor, torch.Tensor) and tensor.ndim == 2
+    }
+    if len(ranks) != 1:
+        raise RuntimeError(f"Checkpoint LoRA layers do not share one rank: {sorted(ranks)}")
+    detected_rank = next(iter(ranks))
+    if "lora_rank" in checkpoint and int(checkpoint["lora_rank"]) != detected_rank:
+        raise RuntimeError(
+            f"Checkpoint lora_rank={checkpoint['lora_rank']} conflicts with state rank={detected_rank}"
+        )
+    cfg.lora_rank = detected_rank
 
 
 def _state_modulation_kind(state: Mapping) -> bool:
@@ -101,6 +149,8 @@ def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool 
     _restore_embedding_shape(cfg, checkpoint, state, "emb_ch.weight", "embed_channel_num", "embed_channel_dim")
 
     detected_lora = checkpoint_uses_lora(checkpoint, state)
+    if detected_lora:
+        _restore_lora_structure(cfg, checkpoint, state)
     if use_lora is None:
         cfg.use_lora = detected_lora
     else:
