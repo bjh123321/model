@@ -54,6 +54,10 @@ that is present in the input dataset.  The model-version directory is organized 
 dataset.  A combination without a usable train/validation split is skipped and
 recorded in `training_failures.json`; other combinations continue training.
 
+Use `python -m surrogate_model.cli.train --resume` to keep channel models whose
+checkpoint, normalizers, training config, and log are complete, and retrain only
+missing or incomplete combinations.
+
 `cli.train_incremental` requires a parent version containing
 `models_manifest.json`.  It copies every parent channel model into the new version,
 then retrains only the excitation/channel combinations present in the correction
