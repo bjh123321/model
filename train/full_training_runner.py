@@ -34,7 +34,7 @@ def _model_config(cfg) -> dict:
 def _training_values(cfg, args) -> dict:
     requested_device = str(getattr(args, "device", "auto"))
     actual_device = "cuda" if requested_device != "cpu" and torch.cuda.is_available() else "cpu"
-    return {
+    values = {
         "optimizer": "AdamW",
         "learning_rate": float(cfg.lr_low_adam),
         "weight_decay": float(cfg.weight_decay),
@@ -62,6 +62,16 @@ def _training_values(cfg, args) -> dict:
             "seed": int(getattr(cfg, "val_seed", 42)),
         },
     }
+    parent_loss_target = getattr(cfg, "parent_train_loss_target", None)
+    if parent_loss_target is not None:
+        values["parent_loss_early_stop"] = {
+            "target_loss": float(parent_loss_target),
+            "epochs_after_target": int(getattr(cfg, "epochs_after_parent_loss", 0)),
+            "target_reached_epoch": getattr(cfg, "_last_training_result", {}).get(
+                "parent_loss_reached_epoch"
+            ),
+        }
+    return values
 
 
 def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) -> dict:

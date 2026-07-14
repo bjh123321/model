@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import math
 import socket
 import sys
 from pathlib import Path
@@ -144,6 +145,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--early_stop_patience", type=int, default=None)
     parser.add_argument("--early_stop_min_delta", type=float, default=None)
+    parser.add_argument("--epochs_after_parent_loss", type=int, default=50)
     parser.add_argument("--checkpoint_selection", choices=["validation", "training"], default=None)
     parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
     parser.add_argument("--dropout_prob", type=float, default=None)
@@ -183,7 +185,7 @@ def main():
     args.debug_overfit_n = 0
     args.debug_overfit_offset = 0
 
-    cfg, _parent_training = _restore_parent_configuration(base_version_dir)
+    cfg, parent_training = _restore_parent_configuration(base_version_dir)
     _apply_cli_overrides(cfg, args)
 
     def resolve_user_path(raw: str) -> Path:
@@ -255,12 +257,37 @@ def main():
     train_keys = (train_keys & all_keys) | correction_keys | (all_keys - train_keys - validation_keys)
     validation_keys &= all_keys
     if not validation_keys:
-        raise RuntimeError(
-            "Correction groups removed every validation group; refusing to switch to training-loss selection."
+        parent_final_train_loss = (
+            None if parent_training is None
+            else parent_training.get("selection", {}).get("final_train_loss")
+        )
+        try:
+            parent_final_train_loss = float(parent_final_train_loss)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Correction groups removed every validation group, but the parent training "
+                "configuration has no numeric selection.final_train_loss for early stopping."
+            ) from None
+        if not math.isfinite(parent_final_train_loss) or parent_final_train_loss < 0:
+            raise RuntimeError(
+                "Parent selection.final_train_loss must be a finite non-negative number, "
+                f"got {parent_final_train_loss!r}."
+            )
+        cfg.checkpoint_selection = "training"
+        cfg.require_validation = False
+        cfg.parent_train_loss_target = parent_final_train_loss
+        if args.epochs_after_parent_loss < 0:
+            raise ValueError("--epochs_after_parent_loss must be non-negative")
+        cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
+        print(
+            "[CORRECTION] inherited validation was exhausted; using every group for training. "
+            f"Early stop: train_loss <= {parent_final_train_loss:.9g}, then "
+            f"{cfg.epochs_after_parent_loss} more epochs.",
+            flush=True,
         )
     cfg.explicit_train_group_keys = sorted(train_keys)
     cfg.explicit_validation_group_keys = sorted(validation_keys)
-    cfg.require_validation = True
+    cfg.require_validation = bool(validation_keys)
 
     build_dataset_snapshot(merged_rows, new_version_dir / "dataset_snapshot")
     replaced_records = [
@@ -288,7 +315,11 @@ def main():
             "added_groups": added_records,
             "removed_groups": [],
         },
-        split_strategy="inherited_parent_manifest",
+        split_strategy=(
+            "all_data_training_parent_loss_early_stop"
+            if not validation_keys
+            else "inherited_parent_manifest"
+        ),
     )
     manifest["split_changes"]["removed_from_validation"] = [
         list(key) for key in sorted(removed_from_validation)

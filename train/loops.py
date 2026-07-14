@@ -339,6 +339,15 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     checkpoint_selection = str(getattr(cfg, "checkpoint_selection", "validation")).lower()
     if checkpoint_selection not in ("validation", "training"):
         raise ValueError(f"Unsupported checkpoint_selection={checkpoint_selection!r}")
+    parent_loss_target = getattr(cfg, "parent_train_loss_target", None)
+    epochs_after_parent_loss = int(getattr(cfg, "epochs_after_parent_loss", 0))
+    if parent_loss_target is not None:
+        parent_loss_target = float(parent_loss_target)
+        if checkpoint_selection != "training":
+            raise ValueError("parent_train_loss_target requires checkpoint_selection='training'")
+        if epochs_after_parent_loss < 0:
+            raise ValueError("epochs_after_parent_loss must be non-negative")
+    parent_loss_reached_epoch = None
     logs = []
     train_hist = []
     val_hist = []
@@ -355,6 +364,12 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         )
         selection_text = "loss_train_total" if checkpoint_selection == "training" else "loss_val_group_FXD"
         print(f"[CHECKPOINT] selection={checkpoint_selection} metric={selection_text}", flush=True)
+        if parent_loss_target is not None:
+            print(
+                f"[EARLY-STOP] target parent train_loss={parent_loss_target:.9g}; "
+                f"stop after {epochs_after_parent_loss} additional epochs",
+                flush=True,
+            )
         print("[VAL] all excitation scopes are still reported.", flush=True)
         if sched is not None:
             print("[LR] ReduceLROnPlateau monitors train_loss: factor=0.5 patience=20 min_lr=1e-6", flush=True)
@@ -420,11 +435,31 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         else:
             bad += 1
 
+        if parent_loss_target is not None and parent_loss_reached_epoch is None and train_loss <= parent_loss_target:
+            parent_loss_reached_epoch = epoch + 1
+            if is_main_process():
+                print(
+                    f"[EARLY-STOP] parent train-loss target reached at epoch "
+                    f"{parent_loss_reached_epoch}; countdown started.",
+                    flush=True,
+                )
+
         if is_main_process() and ((epoch + 1) == 1 or (epoch + 1) % 10 == 0 or bad == 0):
             vt = "nan" if val_loss is None else f"{val_loss:.6f}"
             print(f"[Fold {fold + 1}] Epoch {epoch + 1}/{cfg.epochs_stage1} train={train_loss:.6f} val={vt} best={best:.6f}@{best_epoch} lr={opt.param_groups[0]['lr']:.3e}", flush=True)
 
-        if patience > 0 and bad >= patience:
+        if (
+            parent_loss_reached_epoch is not None
+            and (epoch + 1) - parent_loss_reached_epoch >= epochs_after_parent_loss
+        ):
+            if is_main_process():
+                print(
+                    f"[EARLY-STOP] completed {epochs_after_parent_loss} epochs after reaching "
+                    "the parent train-loss target.",
+                    flush=True,
+                )
+            break
+        if parent_loss_target is None and patience > 0 and bad >= patience:
             break
 
     if best_state is not None:
@@ -440,6 +475,9 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
         "best_metric_name": str(getattr(cfg, "_best_metric_name", "")),
         "final_train_loss": None if not train_hist else float(train_hist[-1]),
         "final_validation_loss": None if not val_hist or val_hist[-1] != val_hist[-1] else float(val_hist[-1]),
+        "parent_train_loss_target": parent_loss_target,
+        "parent_loss_reached_epoch": parent_loss_reached_epoch,
+        "epochs_after_parent_loss": epochs_after_parent_loss if parent_loss_target is not None else None,
     }
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
