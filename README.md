@@ -63,9 +63,28 @@ organized as:
 dataset.  A combination without a usable train/validation split is skipped and
 recorded in `training_failures.json`; other combinations continue training.
 
-Use `python -m surrogate_model.cli.train --resume` to keep channel models whose
-checkpoint, normalizers, training config, and log are complete, and retrain only
-missing or incomplete combinations.
+Use component-level parallel training on one or more GPUs with, for example:
+
+```bash
+python -m surrogate_model.cli.train --parallel_workers 4
+```
+
+`parallel_workers` accepts any positive integer. On a single GPU, benchmark `2`,
+`3`, and `4` and use the value with the best completed-networks/hour throughput.
+Set DataLoader workers conservatively when several training processes share one
+machine, for example `--parallel_workers 4 --num_workers 0`.
+
+Use `python -m surrogate_model.cli.train --resume --parallel_workers 4` after an
+interruption. Every component whose checkpoint, normalizers, training config, and
+log are complete is retained; only missing or incomplete components are queued.
+An interrupted component restarts from its first epoch because optimizer/scheduler
+state is not persisted. The parent process refreshes `models_manifest.json` whenever
+a complete four-component excitation/channel bundle becomes available, so completed
+bundles can be used for prediction before the full queue finishes.
+
+Do not start multiple identical training commands against the same output directory.
+The built-in component queue is the supported parallel path; `torchrun`/DDP is
+rejected for this independent-model workflow.
 
 `cli.train_incremental` requires a parent version containing
 `models_manifest.json`.  It copies every parent channel model into the new version,

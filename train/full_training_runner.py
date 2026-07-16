@@ -179,77 +179,106 @@ def run_full_training(
     """Train the four independent FDR component networks for one excitation/channel."""
     version_dir = Path(version_dir)
     version_dir.mkdir(parents=True, exist_ok=True)
-    parent_targets = dict(getattr(cfg, "parent_train_loss_targets", {}) or {})
     results = {}
-    for component_index, (component, target_names) in enumerate(FDR_COMPONENT_TARGETS.items()):
-        component_cfg = copy.deepcopy(cfg)
-        component_cfg.use_lora = False
-        component_cfg.model_type = "TargetMFDNN"
-        component_cfg.target_component = component
-        component_cfg.model_target_names = list(target_names)
-        if parent_targets:
-            if component not in parent_targets:
-                raise RuntimeError(f"Missing parent train-loss target for FDR component {component!r}")
-            component_cfg.parent_train_loss_target = float(parent_targets[component])
-        elif hasattr(component_cfg, "parent_train_loss_target"):
-            delattr(component_cfg, "parent_train_loss_target")
-
-        seed = int(getattr(component_cfg, "val_seed", 42)) + component_index
-        random.seed(seed)
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-        component_dir = version_dir / component
-        component_dir.mkdir(parents=True, exist_ok=True)
-        component_metadata = dict(dataset_metadata)
-        component_metadata.update(
-            {
-                "model_filename": "model.pth",
-                "target_component": component,
-                "target_names": list(target_names),
-            }
+    for component in FDR_COMPONENT_TARGETS:
+        results[component] = run_component_training(
+            cfg=cfg,
+            parsed_rows=parsed_rows,
+            model_version=model_version,
+            version_dir=version_dir,
+            args=args,
+            dataset_metadata=dataset_metadata,
+            component=component,
         )
-
-        run_args = copy.copy(args)
-        run_args.out_dir = str(component_dir)
-        run_args.normalizer_dir = str(component_dir)
-        run_args.model_save_path = str(component_dir / "model.pth")
-        run_args.train_log_path = str(component_dir / "train_log.csv")
-        run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
-        run_args.fold_index = 0
-        run_args.num_folds = 1
-        run_args.checkpoint_metadata = build_checkpoint_metadata(
-            model_version=model_version, dataset_metadata=component_metadata
-        )
-        if is_main_process():
-            print(
-                f"========== FDR component {component_index + 1}/{len(FDR_COMPONENT_TARGETS)}: "
-                f"{component}, targets={list(target_names)} ==========",
-                flush=True,
-            )
-        best, train_hist, val_hist = train_one_fold(
-            0, component_cfg, parsed_rows, run_args
-        )
-
-        training_config_path = component_dir / "training_config.json"
-        if is_main_process():
-            training_config = write_training_config(
-                cfg=component_cfg,
-                args=args,
-                model_version=model_version,
-                version_dir=component_dir,
-                dataset_metadata=component_metadata,
-            )
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-        if not is_main_process():
-            training_config = load_json(training_config_path)
-        results[component] = {
-            "best_metric": best,
-            "train_history": train_hist,
-            "validation_history": val_hist,
-            "training_config": training_config,
-        }
     return {"components": results}
+
+
+def run_component_training(
+    *,
+    cfg,
+    parsed_rows,
+    model_version: str,
+    version_dir: Path,
+    args,
+    dataset_metadata: Mapping,
+    component: str,
+):
+    """Train one independently resumable FDR component network."""
+    if component not in FDR_COMPONENT_TARGETS:
+        raise ValueError(
+            f"Unsupported FDR component {component!r}; expected {list(FDR_COMPONENT_TARGETS)}"
+        )
+    component_index = list(FDR_COMPONENT_TARGETS).index(component)
+    target_names = FDR_COMPONENT_TARGETS[component]
+    version_dir = Path(version_dir)
+    component_dir = version_dir / component
+    component_dir.mkdir(parents=True, exist_ok=True)
+
+    component_cfg = copy.deepcopy(cfg)
+    component_cfg.use_lora = False
+    component_cfg.model_type = "TargetMFDNN"
+    component_cfg.target_component = component
+    component_cfg.model_target_names = list(target_names)
+    parent_targets = dict(getattr(component_cfg, "parent_train_loss_targets", {}) or {})
+    if parent_targets:
+        if component not in parent_targets:
+            raise RuntimeError(f"Missing parent train-loss target for FDR component {component!r}")
+        component_cfg.parent_train_loss_target = float(parent_targets[component])
+    elif hasattr(component_cfg, "parent_train_loss_target"):
+        delattr(component_cfg, "parent_train_loss_target")
+
+    seed = int(getattr(component_cfg, "val_seed", 42)) + component_index
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    component_metadata = dict(dataset_metadata)
+    component_metadata.update(
+        {
+            "model_filename": "model.pth",
+            "target_component": component,
+            "target_names": list(target_names),
+        }
+    )
+    run_args = copy.copy(args)
+    run_args.out_dir = str(component_dir)
+    run_args.normalizer_dir = str(component_dir)
+    run_args.model_save_path = str(component_dir / "model.pth")
+    run_args.train_log_path = str(component_dir / "train_log.csv")
+    run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
+    run_args.fold_index = 0
+    run_args.num_folds = 1
+    run_args.checkpoint_metadata = build_checkpoint_metadata(
+        model_version=model_version, dataset_metadata=component_metadata
+    )
+    if is_main_process():
+        print(
+            f"========== FDR component {component_index + 1}/{len(FDR_COMPONENT_TARGETS)}: "
+            f"{component}, targets={list(target_names)} ==========",
+            flush=True,
+        )
+    best, train_hist, val_hist = train_one_fold(
+        0, component_cfg, parsed_rows, run_args
+    )
+
+    training_config_path = component_dir / "training_config.json"
+    if is_main_process():
+        training_config = write_training_config(
+            cfg=component_cfg,
+            args=args,
+            model_version=model_version,
+            version_dir=component_dir,
+            dataset_metadata=component_metadata,
+        )
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    if not is_main_process():
+        training_config = load_json(training_config_path)
+    return {
+        "best_metric": best,
+        "train_history": train_hist,
+        "validation_history": val_hist,
+        "training_config": training_config,
+    }

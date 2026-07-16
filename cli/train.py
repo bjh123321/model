@@ -8,6 +8,7 @@ import os
 import socket
 import sys
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -17,7 +18,7 @@ from surrogate_model.config import Config
 from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
-from surrogate_model.train.full_training_runner import run_full_training
+from surrogate_model.train.full_training_runner import run_component_training
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -127,44 +128,96 @@ def _send_finished_udp():
         sock.close()
 
 
-def _resume_model_ready(output_dir: Path, excitation_id: int, channel_id: int) -> tuple[bool, str]:
+def _resume_component_ready(
+    output_dir: Path,
+    excitation_id: int,
+    channel_id: int,
+    component: str,
+) -> tuple[bool, str]:
     try:
         required = (
             "model.pth", "Normalizer_Input.pth", "Normalizer_Output.pth",
             "training_config.json", "train_log.csv",
         )
-        for component, target_names in FDR_COMPONENT_TARGETS.items():
-            component_dir = output_dir / component
-            missing = [name for name in required if not (component_dir / name).is_file()]
-            if missing:
-                return False, f"{component}: missing {', '.join(missing)}"
-            try:
-                checkpoint = torch.load(component_dir / "model.pth", map_location="cpu", weights_only=True)
-            except TypeError:
-                checkpoint = torch.load(component_dir / "model.pth", map_location="cpu")
-            if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
-                return False, f"{component}: checkpoint has no model_state_dict"
-            if checkpoint.get("model_type") != "TargetMFDNN":
-                return False, f"{component}: checkpoint is not TargetMFDNN"
-            if tuple(checkpoint.get("target_names", ())) != tuple(target_names):
-                return False, f"{component}: checkpoint target_names mismatch"
-            for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
-                if key in checkpoint and int(checkpoint[key]) != int(expected):
-                    return False, f"{component}: checkpoint {key}={checkpoint[key]} does not match {expected}"
-            for filename in ("Normalizer_Input.pth", "Normalizer_Output.pth"):
-                normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
-                if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
-                    return False, f"{component}: invalid {filename}"
-            training_config = load_json(component_dir / "training_config.json")
-            if int(training_config.get("excitation_id", excitation_id)) != int(excitation_id):
-                return False, f"{component}: training_config excitation_id mismatch"
-            if int(training_config.get("channel_id", channel_id)) != int(channel_id):
-                return False, f"{component}: training_config channel_id mismatch"
-            if (component_dir / "train_log.csv").stat().st_size <= 0:
-                return False, f"{component}: empty train_log.csv"
+        target_names = FDR_COMPONENT_TARGETS[component]
+        component_dir = output_dir / component
+        missing = [name for name in required if not (component_dir / name).is_file()]
+        if missing:
+            return False, f"missing {', '.join(missing)}"
+        try:
+            checkpoint = torch.load(component_dir / "model.pth", map_location="cpu", weights_only=True)
+        except TypeError:
+            checkpoint = torch.load(component_dir / "model.pth", map_location="cpu")
+        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+            return False, "checkpoint has no model_state_dict"
+        if checkpoint.get("model_type") != "TargetMFDNN":
+            return False, "checkpoint is not TargetMFDNN"
+        if tuple(checkpoint.get("target_names", ())) != tuple(target_names):
+            return False, "checkpoint target_names mismatch"
+        for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
+            if key in checkpoint and int(checkpoint[key]) != int(expected):
+                return False, f"checkpoint {key}={checkpoint[key]} does not match {expected}"
+        for filename in ("Normalizer_Input.pth", "Normalizer_Output.pth"):
+            normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
+            if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
+                return False, f"invalid {filename}"
+        training_config = load_json(component_dir / "training_config.json")
+        if int(training_config.get("excitation_id", excitation_id)) != int(excitation_id):
+            return False, "training_config excitation_id mismatch"
+        if int(training_config.get("channel_id", channel_id)) != int(channel_id):
+            return False, "training_config channel_id mismatch"
+        if (component_dir / "train_log.csv").stat().st_size <= 0:
+            return False, "empty train_log.csv"
     except Exception as exc:
         return False, f"artifact validation failed: {type(exc).__name__}: {exc}"
     return True, "complete"
+
+
+def _resume_model_ready(output_dir: Path, excitation_id: int, channel_id: int) -> tuple[bool, str]:
+    for component in FDR_COMPONENT_TARGETS:
+        ready, reason = _resume_component_ready(
+            output_dir, excitation_id, channel_id, component
+        )
+        if not ready:
+            return False, f"{component}: {reason}"
+    return True, "complete"
+
+
+def _train_component_worker(task: dict) -> dict:
+    """Process-pool entry point; each task owns one unique component directory."""
+    torch.set_num_threads(1)
+    try:
+        run_component_training(
+            cfg=task["cfg"],
+            parsed_rows=task["parsed_rows"],
+            model_version=task["model_version"],
+            version_dir=Path(task["version_dir"]),
+            args=task["args"],
+            dataset_metadata=task["dataset_metadata"],
+            component=task["component"],
+        )
+        return {
+            "ok": True,
+            "excitation_id": task["excitation_id"],
+            "channel_id": task["channel_id"],
+            "component": task["component"],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "excitation_id": task["excitation_id"],
+            "channel_id": task["channel_id"],
+            "component": task["component"],
+            "error_type": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    finally:
+        if (
+            str(getattr(task["args"], "device", "auto")) != "cpu"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.empty_cache()
 
 
 def main():
@@ -208,7 +261,13 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Skip channel models whose checkpoint, normalizers, config, and log are complete.",
+        help="Skip each FDR component whose checkpoint, normalizers, config, and log are complete.",
+    )
+    parser.add_argument(
+        "--parallel_workers",
+        type=int,
+        default=1,
+        help="Number of independent FDR component networks to train concurrently.",
     )
     parser.add_argument("--batch_real", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -237,8 +296,16 @@ def main():
     parser.add_argument("--debug_overfit_offset", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     args, _unknown = parser.parse_known_args()
+    if int(args.parallel_workers) <= 0:
+        raise ValueError("--parallel_workers must be a positive integer")
 
     ddp_enabled, rank, _world_size = _ddp_setup()
+    if ddp_enabled:
+        dist.destroy_process_group()
+        raise RuntimeError(
+            "torchrun/DDP is not supported for independent FDR component tasks; "
+            "run ordinary python with --parallel_workers instead."
+        )
     _enable_fast_cuda(args)
 
     real_rows = read_real_dataset(real_dataset_path)
@@ -273,6 +340,13 @@ def main():
         cfg.batch_real = int(args.batch_real)
     if args.num_workers is not None:
         cfg.num_workers = int(args.num_workers)
+    elif int(args.parallel_workers) > 1:
+        cfg.num_workers = 0
+        print(
+            "[PARALLEL] --num_workers was not specified; using 0 per training process "
+            "to avoid CPU oversubscription.",
+            flush=True,
+        )
     if args.prefetch is not None:
         cfg.prefetch = int(args.prefetch)
     if args.pole_target is not None:
@@ -330,10 +404,14 @@ def main():
         raise ValueError("Per-excitation/channel training currently requires --kfold 0 or 1")
 
     target_names = [name for names in FDR_COMPONENT_TARGETS.values() for name in names]
-    trained_models = []
+    trained_models = {}
     failures = []
+    tasks = []
+    component_states = {}
+    combination_info = {}
     combinations = combinations_in_rows(real_parsed)
     for index, (excitation_id, channel_id) in enumerate(combinations, 1):
+        key = (excitation_id, channel_id)
         combo_rows = [
             row for row in real_parsed
             if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
@@ -346,77 +424,181 @@ def main():
         combo_cfg.validation_metric_scope = "all"
         output_dir = combination_dir(model_root, excitation_id, channel_id)
         label = f"{excitation_name(excitation_id)}/{channel_name(channel_id)}"
-        print(f"========== Model {index}/{len(combinations)}: {label}, rows={len(combo_rows)} ==========", flush=True)
+        print(
+            f"========== Queue model {index}/{len(combinations)}: "
+            f"{label}, rows={len(combo_rows)} ==========",
+            flush=True,
+        )
+        combination_info[key] = {"row_count": len(combo_rows), "label": label}
+        component_states[key] = {}
         try:
-            if args.resume:
-                ready, reason = _resume_model_ready(output_dir, excitation_id, channel_id)
-                if ready:
-                    trained_models.append(
-                        model_entry(
-                            excitation_id=excitation_id,
-                            channel_id=channel_id,
-                            row_count=len(combo_rows),
-                            status="resumed",
-                        )
-                    )
-                    print(f"[RESUME] complete model retained: {output_dir}", flush=True)
-                    continue
-                if output_dir.exists():
-                    print(f"[RESUME] {label} will be retrained: {reason}", flush=True)
             if not combo_cfg.explicit_train_group_keys:
                 raise RuntimeError("No training operating points are available for this combination")
             if combo_cfg.require_validation and not combo_cfg.explicit_validation_group_keys:
                 raise RuntimeError("No validation operating points are available for this combination")
-            run_full_training(
-                cfg=combo_cfg,
-                parsed_rows=combo_rows,
-                model_version=model_version,
-                version_dir=output_dir,
-                args=args,
-                dataset_metadata={
-                    "manifest": manifest,
-                    "dataset_manifest_path": "../../../dataset_manifest.json",
-                    "training_mode": "base_full_training",
-                    "model_filename": "model.pth",
+        except Exception as exc:
+            failures.append(
+                {
                     "excitation_id": excitation_id,
                     "excitation_name": excitation_name(excitation_id),
                     "channel_id": channel_id,
-                    "target_names": target_names,
-                },
+                    "row_count": len(combo_rows),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
             )
-            trained_models.append(
-                model_entry(
-                    excitation_id=excitation_id,
-                    channel_id=channel_id,
-                    row_count=len(combo_rows),
-                    status="trained",
-                )
-            )
-        except Exception as exc:
-            failure = {
-                "excitation_id": excitation_id,
-                "excitation_name": excitation_name(excitation_id),
-                "channel_id": channel_id,
-                "row_count": len(combo_rows),
-                "error_type": type(exc).__name__,
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-            }
-            failures.append(failure)
             print(f"[SKIP] {label}: {type(exc).__name__}: {exc}", flush=True)
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            for component in FDR_COMPONENT_TARGETS:
+                component_states[key][component] = "failed"
+            continue
 
-    if (not ddp_enabled) or rank == 0:
+        dataset_metadata = {
+            "manifest": manifest,
+            "dataset_manifest_path": "../../../dataset_manifest.json",
+            "training_mode": "base_full_training",
+            "model_filename": "model.pth",
+            "excitation_id": excitation_id,
+            "excitation_name": excitation_name(excitation_id),
+            "channel_id": channel_id,
+            "target_names": target_names,
+        }
+        for component in FDR_COMPONENT_TARGETS:
+            if args.resume:
+                ready, reason = _resume_component_ready(
+                    output_dir, excitation_id, channel_id, component
+                )
+                if ready:
+                    component_states[key][component] = "resumed"
+                    print(f"[RESUME] retained {label}/{component}", flush=True)
+                    continue
+                if (output_dir / component).exists():
+                    print(f"[RESUME] retrain {label}/{component}: {reason}", flush=True)
+            component_states[key][component] = "pending"
+            tasks.append(
+                {
+                    "cfg": combo_cfg,
+                    "parsed_rows": combo_rows,
+                    "model_version": model_version,
+                    "version_dir": str(output_dir),
+                    "args": args,
+                    "dataset_metadata": dataset_metadata,
+                    "excitation_id": excitation_id,
+                    "channel_id": channel_id,
+                    "component": component,
+                }
+            )
+
+        if all(state == "resumed" for state in component_states[key].values()):
+            trained_models[key] = model_entry(
+                excitation_id=excitation_id,
+                channel_id=channel_id,
+                row_count=len(combo_rows),
+                status="resumed",
+            )
+
+    def write_progress_inventory():
         write_model_inventory(
             model_root,
             model_version=model_version,
-            models=trained_models,
+            models=trained_models.values(),
             failures=failures,
         )
+
+    def handle_task_result(result: dict):
+        key = (int(result["excitation_id"]), int(result["channel_id"]))
+        component = str(result["component"])
+        info = combination_info[key]
+        if result.get("ok"):
+            ready, reason = _resume_component_ready(
+                combination_dir(model_root, *key), *key, component
+            )
+            if ready:
+                component_states[key][component] = "trained"
+                print(f"[TASK-OK] {info['label']}/{component}", flush=True)
+            else:
+                result = {
+                    **result,
+                    "ok": False,
+                    "error_type": "ArtifactValidationError",
+                    "error": reason,
+                    "traceback": "",
+                }
+        if not result.get("ok"):
+            component_states[key][component] = "failed"
+            failure = {
+                "excitation_id": key[0],
+                "excitation_name": excitation_name(key[0]),
+                "channel_id": key[1],
+                "component": component,
+                "row_count": info["row_count"],
+                "error_type": result.get("error_type", "WorkerError"),
+                "error": result.get("error", "Unknown component worker failure"),
+                "traceback": result.get("traceback", ""),
+            }
+            failures.append(failure)
+            print(
+                f"[TASK-FAIL] {info['label']}/{component}: "
+                f"{failure['error_type']}: {failure['error']}",
+                flush=True,
+            )
+
+        if all(
+            state in {"resumed", "trained"}
+            for state in component_states[key].values()
+        ):
+            status = (
+                "resumed"
+                if all(state == "resumed" for state in component_states[key].values())
+                else "trained"
+            )
+            trained_models[key] = model_entry(
+                excitation_id=key[0],
+                channel_id=key[1],
+                row_count=info["row_count"],
+                status=status,
+            )
+            print(f"[MODEL-COMPLETE] {info['label']} status={status}", flush=True)
+        write_progress_inventory()
+
+    write_progress_inventory()
+    print(
+        f"[PARALLEL] workers={args.parallel_workers} pending_components={len(tasks)} "
+        f"resumed_models={len(trained_models)}",
+        flush=True,
+    )
+    if int(args.parallel_workers) == 1:
+        for task in tasks:
+            handle_task_result(_train_component_worker(task))
+    elif tasks:
+        context = mp.get_context("spawn")
+        future_tasks = {}
+        with ProcessPoolExecutor(
+            max_workers=min(int(args.parallel_workers), len(tasks)),
+            mp_context=context,
+        ) as executor:
+            for task in tasks:
+                future_tasks[executor.submit(_train_component_worker, task)] = task
+            for future in as_completed(future_tasks):
+                task = future_tasks[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "ok": False,
+                        "excitation_id": task["excitation_id"],
+                        "channel_id": task["channel_id"],
+                        "component": task["component"],
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                handle_task_result(result)
+
+    if (not ddp_enabled) or rank == 0:
+        write_progress_inventory()
         print(
-            f"[MODEL-INVENTORY] trained={len(trained_models)} skipped={len(failures)} "
+            f"[MODEL-INVENTORY] complete={len(trained_models)} failures={len(failures)} "
             f"path={model_root / 'models_manifest.json'}",
             flush=True,
         )
