@@ -54,7 +54,7 @@ class Config:
     pole_target: str = "freq_damping"
     residue_target: str = "polar"
 
-    epochs_stage1: int = 3000
+    epochs_stage1: int = 5000
     early_stop_patience_s1: int = 500
     early_stop_min_delta: float = 1e-6
     checkpoint_selection: str = "validation"

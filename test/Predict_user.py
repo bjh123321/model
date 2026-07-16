@@ -583,6 +583,10 @@ def run_infer_batched(
     combinations = sorted(set(zip(exc_values.tolist(), channel_values.tolist())))
     for excitation_id, channel_id in combinations:
         selected = (exc_values == excitation_id) & (channel_values == channel_id)
+        if (excitation_id, channel_id) not in registry.entries:
+            # Each excitation only has models for its applicable response channels.
+            # Missing inventory combinations intentionally retain the zero/empty output.
+            continue
         bundle = registry.get(excitation_id, channel_id)
         if bundle is None:
             continue
