@@ -27,6 +27,8 @@ from surrogate_model.utils.model_artifacts import (
     load_json,
 )
 from surrogate_model.utils.excitation_channel_models import (
+    CHANNEL_NAMES,
+    EXCITATION_NAMES,
     FDR_COMPONENT_TARGETS,
     channel_name,
     combination_dir,
@@ -46,6 +48,46 @@ def _parse_int_list(raw: str) -> list[int]:
     if not values:
         raise argparse.ArgumentTypeError("expected comma-separated integers")
     return values
+
+
+def _resolve_id_selection(raw_values, id_to_name: dict[int, str], label: str):
+    """Resolve repeatable comma/semicolon-separated names or numeric IDs."""
+    if not raw_values:
+        return None
+    tokens = []
+    for raw in raw_values:
+        tokens.extend(
+            part.strip()
+            for part in str(raw).replace(";", ",").split(",")
+            if part.strip()
+        )
+    name_to_id = {str(name).upper(): int(identifier) for identifier, name in id_to_name.items()}
+    selected = set()
+    invalid = []
+    for token in tokens:
+        try:
+            identifier = int(token)
+        except ValueError:
+            identifier = name_to_id.get(token.upper())
+        if identifier is None or int(identifier) not in id_to_name:
+            invalid.append(token)
+        else:
+            selected.add(int(identifier))
+    if invalid:
+        available = ", ".join(f"{identifier}:{name}" for identifier, name in id_to_name.items())
+        raise ValueError(f"Unknown {label} selector(s) {invalid}; available: {available}")
+    if not selected:
+        raise ValueError(f"At least one {label} selector is required")
+    return selected
+
+
+def _filter_combinations(combinations, selected_excitations=None, selected_channels=None):
+    return [
+        (excitation_id, channel_id)
+        for excitation_id, channel_id in combinations
+        if (selected_excitations is None or excitation_id in selected_excitations)
+        and (selected_channels is None or channel_id in selected_channels)
+    ]
 
 
 def get_exe_dir() -> Path:
@@ -269,6 +311,20 @@ def main():
         default=1,
         help="Number of independent FDR component networks to train concurrently.",
     )
+    parser.add_argument(
+        "--excitation",
+        "--excitations",
+        action="append",
+        default=None,
+        help="Train only selected excitation names or IDs; repeat or separate with commas.",
+    )
+    parser.add_argument(
+        "--channel",
+        "--channels",
+        action="append",
+        default=None,
+        help="Train only selected response-channel names or IDs; repeat or separate with commas.",
+    )
     parser.add_argument("--batch_real", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--prefetch", type=int, default=None)
@@ -409,7 +465,56 @@ def main():
     tasks = []
     component_states = {}
     combination_info = {}
-    combinations = combinations_in_rows(real_parsed)
+    all_combinations = combinations_in_rows(real_parsed)
+    selected_excitations = _resolve_id_selection(
+        args.excitation, EXCITATION_NAMES, "excitation"
+    )
+    selected_channels = _resolve_id_selection(
+        args.channel,
+        {index: name for index, name in enumerate(CHANNEL_NAMES)},
+        "channel",
+    )
+    combinations = _filter_combinations(
+        all_combinations, selected_excitations, selected_channels
+    )
+    if not combinations:
+        raise RuntimeError(
+            "The excitation/channel selectors matched no combinations in the dataset"
+        )
+    selected_keys = set(combinations)
+    if selected_excitations is not None or selected_channels is not None:
+        print(
+            f"[SELECTION] selected_combinations={len(combinations)}/{len(all_combinations)} "
+            f"excitations={sorted(selected_excitations) if selected_excitations is not None else 'all'} "
+            f"channels={sorted(selected_channels) if selected_channels is not None else 'all'}",
+            flush=True,
+        )
+        rows_by_combination = {
+            key: [
+                row for row in real_parsed
+                if (int(row.exc_id), int(row.ch_id)) == key
+            ]
+            for key in all_combinations
+        }
+        for excitation_id, channel_id in all_combinations:
+            key = (excitation_id, channel_id)
+            if key in selected_keys:
+                continue
+            output_dir = combination_dir(model_root, excitation_id, channel_id)
+            ready, _reason = _resume_model_ready(
+                output_dir, excitation_id, channel_id
+            )
+            if ready:
+                trained_models[key] = model_entry(
+                    excitation_id=excitation_id,
+                    channel_id=channel_id,
+                    row_count=len(rows_by_combination[key]),
+                    status="retained",
+                )
+        print(
+            f"[SELECTION] retained_unselected_complete_models={len(trained_models)}",
+            flush=True,
+        )
     for index, (excitation_id, channel_id) in enumerate(combinations, 1):
         key = (excitation_id, channel_id)
         combo_rows = [

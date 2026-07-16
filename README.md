@@ -86,6 +86,20 @@ Do not start multiple identical training commands against the same output direct
 The built-in component queue is the supported parallel path; `torchrun`/DDP is
 rejected for this independent-model workflow.
 
+Train only selected excitations and/or response channels by name or numeric ID:
+
+```bash
+python -m surrogate_model.cli.train --excitation FXD_DC --channel LVT1,LVT2 --parallel_workers 4
+python -m surrogate_model.cli.train --excitation 0,1 --channels 8,9,10 --parallel_workers 3
+```
+
+Selectors are case-insensitive, repeatable, and may be comma- or semicolon-separated.
+Omit one selector to include every value on that axis. Complete unselected bundles
+are retained in `models_manifest.json`. To retrain selected models using validation
+loss for checkpoint selection, omit `--resume` and pass
+`--checkpoint_selection validation`; adding `--resume` retains already-complete
+components even if they were originally selected by training loss.
+
 `cli.train_incremental` requires a parent version containing
 `models_manifest.json`.  It copies every parent channel model into the new version,
 then retrains only the excitation/channel combinations present in the correction
