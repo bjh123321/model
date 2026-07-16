@@ -181,6 +181,64 @@ class MFDNN(nn.Module):
         return torch.cat([u_alpha, u_omega, u_rho, u_sin_theta, u_cos_theta], dim=-1)
 
 
+class TargetHead(nn.Module):
+    """One independent head for one FDR target component."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.target_names = tuple(str(name) for name in cfg.model_target_names)
+        if not self.target_names:
+            raise ValueError("model_target_names must not be empty")
+        in_dim = 2 + cfg.embed_excitation_dim + cfg.embed_channel_dim
+        out_dim = cfg.K_max * len(self.target_names)
+        self.mlp = MLP(
+            [in_dim] + list(cfg.low_hidden) + [out_dim],
+            dropout=cfg.dropout_prob,
+            use_lora=bool(getattr(cfg, "use_lora", False)),
+            lora_rank=int(getattr(cfg, "lora_rank", 4)),
+            lora_alpha=float(getattr(cfg, "lora_alpha", 1.0)),
+            lora_dropout=float(getattr(cfg, "lora_dropout", 0.0)),
+            lora_target_hidden_indices=getattr(cfg, "lora_target_hidden_indices", (2,)),
+        )
+        self.mod = None
+        if getattr(cfg, "use_modulation", False):
+            self.mod = nn.Sequential(nn.Linear(2, out_dim), nn.Tanh())
+
+    def forward(self, Hn, Mn, exc_emb, ch_emb):
+        x = torch.cat([Hn, Mn, exc_emb, ch_emb], dim=1)
+        out = self.mlp(x)
+        if self.mod is not None:
+            hm = torch.cat([Hn, Mn], dim=1)
+            out = out + self.cfg.mod_gamma * self.mod(hm)
+        out = out.view(-1, self.cfg.K_max, len(self.target_names))
+        values = {name: out[..., index] for index, name in enumerate(self.target_names)}
+        if self.target_names == ("sin_theta", "cos_theta"):
+            norm = torch.sqrt(
+                values["sin_theta"].pow(2) + values["cos_theta"].pow(2) + 1e-8
+            )
+            values["sin_theta"] = values["sin_theta"] / norm
+            values["cos_theta"] = values["cos_theta"] / norm
+        return values
+
+
+class TargetMFDNN(nn.Module):
+    """A standalone network that predicts one normalized FDR target component."""
+
+    outputs_normalized = True
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.target_names = tuple(str(name) for name in cfg.model_target_names)
+        self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
+        self.emb_ch = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
+        self.low = TargetHead(cfg)
+
+    def forward(self, Hn, Mn, exc_id, ch_id):
+        return self.low(Hn, Mn, self.emb_exc(exc_id), self.emb_ch(ch_id))
+
+
 def freeze_base_train_lora_only(model: nn.Module):
     for name, param in model.named_parameters():
         param.requires_grad_((".A." in name) or (".B." in name))

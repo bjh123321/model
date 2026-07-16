@@ -32,6 +32,7 @@ from surrogate_model.utils.model_artifacts import (
     validate_new_version_directory,
 )
 from surrogate_model.utils.excitation_channel_models import (
+    FDR_COMPONENT_TARGETS,
     channel_name,
     combination_dir,
     combinations_in_rows,
@@ -83,8 +84,11 @@ def _restore_parent_configuration(
     checkpoint_path = base_version_dir / f"{base_version_dir.name}.pth"
     if parent_inventory is not None and parent_inventory.get("models"):
         representative = parent_inventory["models"][0]
-        training_path = base_version_dir / representative["training_config"]
-        checkpoint_path = base_version_dir / representative["checkpoint"]
+        frequency = representative.get("components", {}).get("frequency")
+        if not frequency:
+            raise RuntimeError("Parent model inventory has no FDR frequency component")
+        training_path = base_version_dir / frequency["training_config"]
+        checkpoint_path = base_version_dir / frequency["checkpoint"]
     if training_path.is_file():
         parent_training = load_json(training_path)
         model = parent_training.get("model", {})
@@ -129,6 +133,30 @@ def _restore_parent_configuration(
         cfg = restore_model_config_from_checkpoint(checkpoint, use_lora=False)
     cfg.use_lora = False
     return cfg, None
+
+
+def _parent_component_train_losses(base_version_dir: Path, parent_entry: dict) -> dict[str, float]:
+    losses = {}
+    components = parent_entry.get("components", {})
+    for component in FDR_COMPONENT_TARGETS:
+        component_entry = components.get(component)
+        if not component_entry:
+            raise RuntimeError(f"Parent inventory is missing FDR component {component!r}")
+        training = load_json(base_version_dir / component_entry["training_config"])
+        value = training.get("selection", {}).get("final_train_loss")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"Parent FDR component {component!r} has no numeric selection.final_train_loss"
+            ) from None
+        if not math.isfinite(value) or value < 0:
+            raise RuntimeError(
+                f"Parent FDR component {component!r} final_train_loss must be finite and "
+                f"non-negative, got {value!r}"
+            )
+        losses[component] = value
+    return losses
 
 
 def _apply_cli_overrides(cfg: Config, args) -> None:
@@ -212,6 +240,10 @@ def main():
         base_version_dir, parent_inventory
     )
     _apply_cli_overrides(cfg, args)
+    if cfg.pole_target != "freq_damping" or cfg.residue_target != "polar":
+        raise ValueError(
+            "FDR split training requires pole_target='freq_damping' and residue_target='polar'"
+        )
 
     def resolve_user_path(raw: str) -> Path:
         candidate = Path(raw).expanduser()
@@ -321,10 +353,7 @@ def main():
     ]
     atomic_write_json(new_version_dir / "dataset_manifest.json", manifest)
 
-    target_names = (
-        (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
-        + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
-    )
+    target_names = [name for names in FDR_COMPONENT_TARGETS.values() for name in names]
     inherited_models = copy_parent_model_directories(
         base_version_dir, new_version_dir, parent_inventory
     )
@@ -371,31 +400,22 @@ def main():
                 combo_cfg.explicit_validation_group_keys = sorted(combo_validation_keys)
                 combo_cfg.require_validation = True
             else:
-                parent_final_train_loss = (
-                    None if parent_training is None
-                    else parent_training.get("selection", {}).get("final_train_loss")
-                )
-                try:
-                    parent_final_train_loss = float(parent_final_train_loss)
-                except (TypeError, ValueError):
+                if parent_entry is None:
                     raise RuntimeError(
-                        "No validation data remains and the parent channel model has no numeric "
-                        "selection.final_train_loss for early stopping"
-                    ) from None
-                if not math.isfinite(parent_final_train_loss) or parent_final_train_loss < 0:
-                    raise RuntimeError(
-                        "Parent channel selection.final_train_loss must be finite and non-negative, "
-                        f"got {parent_final_train_loss!r}"
+                        "No validation data remains and no parent FDR model is available for early stopping"
                     )
+                parent_loss_targets = _parent_component_train_losses(
+                    base_version_dir, parent_entry
+                )
                 combo_cfg.checkpoint_selection = "training"
                 combo_cfg.explicit_train_group_keys = sorted(available_keys)
                 combo_cfg.explicit_validation_group_keys = []
                 combo_cfg.require_validation = False
-                combo_cfg.parent_train_loss_target = parent_final_train_loss
+                combo_cfg.parent_train_loss_targets = parent_loss_targets
                 combo_cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
                 print(
-                    f"[CORRECTION] {label}: all rows train; train_loss target="
-                    f"{parent_final_train_loss:.9g}, then {combo_cfg.epochs_after_parent_loss} epochs.",
+                    f"[CORRECTION] {label}: all rows train; component train_loss targets="
+                    f"{parent_loss_targets}, then {combo_cfg.epochs_after_parent_loss} epochs.",
                     flush=True,
                 )
 
@@ -411,7 +431,7 @@ def main():
                 args=args,
                 dataset_metadata={
                     "manifest": manifest,
-                    "dataset_manifest_path": "../../dataset_manifest.json",
+                    "dataset_manifest_path": "../../../dataset_manifest.json",
                     "training_mode": "correction_full_retrain",
                     "model_filename": "model.pth",
                     "parent_model_version": base_model_version,

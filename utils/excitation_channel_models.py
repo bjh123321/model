@@ -8,9 +8,15 @@ from typing import Iterable, Mapping
 from surrogate_model.utils.model_artifacts import atomic_write_json, load_json
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MODEL_INVENTORY_NAME = "models_manifest.json"
 TRAINING_FAILURES_NAME = "training_failures.json"
+FDR_COMPONENT_TARGETS = {
+    "frequency": ("freq",),
+    "damping": ("damping",),
+    "residue_magnitude": ("magnitude",),
+    "residue_phase": ("sin_theta", "cos_theta"),
+}
 EXCITATION_NAMES = {
     0: "FXD_FDC",
     1: "FXD_DC",
@@ -66,17 +72,24 @@ def model_entry(
     source_model_version: str | None = None,
 ) -> dict:
     relative_dir = combination_relative_dir(excitation_id, channel_id)
+    components = {}
+    for component, target_names in FDR_COMPONENT_TARGETS.items():
+        component_dir = f"{relative_dir}/{component}"
+        components[component] = {
+            "target_names": list(target_names),
+            "checkpoint": f"{component_dir}/model.pth",
+            "normalizer_input": f"{component_dir}/Normalizer_Input.pth",
+            "normalizer_output": f"{component_dir}/Normalizer_Output.pth",
+            "training_config": f"{component_dir}/training_config.json",
+            "train_log": f"{component_dir}/train_log.csv",
+        }
     entry = {
         "excitation_id": int(excitation_id),
         "excitation_name": excitation_name(excitation_id),
         "channel_id": int(channel_id),
         "channel_name": channel_name(channel_id),
         "relative_dir": relative_dir,
-        "checkpoint": f"{relative_dir}/model.pth",
-        "normalizer_input": f"{relative_dir}/Normalizer_Input.pth",
-        "normalizer_output": f"{relative_dir}/Normalizer_Output.pth",
-        "training_config": f"{relative_dir}/training_config.json",
-        "train_log": f"{relative_dir}/train_log.csv",
+        "components": components,
         "row_count": int(row_count),
         "status": str(status),
     }
@@ -100,11 +113,12 @@ def write_model_inventory(
     failures = [dict(item) for item in failures]
     payload = {
         "schema_version": SCHEMA_VERSION,
-        "layout": "one_model_per_excitation_channel",
+        "layout": "four_models_per_excitation_channel",
         "model_version": str(model_version),
         "parent_model_version": parent_model_version,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_count": len(models),
+        "network_count": len(models) * len(FDR_COMPONENT_TARGETS),
         "failure_count": len(failures),
         "models": models,
     }
@@ -125,7 +139,7 @@ def load_model_inventory(version_dir: Path) -> dict:
             "Create a base model version with the excitation-channel training branch first."
         )
     payload = load_json(path)
-    if payload.get("layout") != "one_model_per_excitation_channel":
+    if payload.get("layout") != "four_models_per_excitation_channel":
         raise ValueError(f"Unsupported model inventory layout in {path}: {payload.get('layout')!r}")
     return payload
 

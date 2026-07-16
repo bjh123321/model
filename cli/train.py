@@ -26,6 +26,7 @@ from surrogate_model.utils.model_artifacts import (
     load_json,
 )
 from surrogate_model.utils.excitation_channel_models import (
+    FDR_COMPONENT_TARGETS,
     channel_name,
     combination_dir,
     combinations_in_rows,
@@ -127,37 +128,40 @@ def _send_finished_udp():
 
 
 def _resume_model_ready(output_dir: Path, excitation_id: int, channel_id: int) -> tuple[bool, str]:
-    required = (
-        "model.pth",
-        "Normalizer_Input.pth",
-        "Normalizer_Output.pth",
-        "training_config.json",
-        "train_log.csv",
-    )
-    missing = [name for name in required if not (output_dir / name).is_file()]
-    if missing:
-        return False, f"missing {', '.join(missing)}"
     try:
-        try:
-            checkpoint = torch.load(output_dir / "model.pth", map_location="cpu", weights_only=True)
-        except TypeError:
-            checkpoint = torch.load(output_dir / "model.pth", map_location="cpu")
-        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
-            return False, "checkpoint has no model_state_dict"
-        for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
-            if key in checkpoint and int(checkpoint[key]) != int(expected):
-                return False, f"checkpoint {key}={checkpoint[key]} does not match {expected}"
-        for filename in ("Normalizer_Input.pth", "Normalizer_Output.pth"):
-            normalizer = torch.load(output_dir / filename, map_location="cpu", weights_only=True)
-            if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
-                return False, f"invalid {filename}"
-        training_config = load_json(output_dir / "training_config.json")
-        if int(training_config.get("excitation_id", excitation_id)) != int(excitation_id):
-            return False, "training_config excitation_id mismatch"
-        if int(training_config.get("channel_id", channel_id)) != int(channel_id):
-            return False, "training_config channel_id mismatch"
-        if (output_dir / "train_log.csv").stat().st_size <= 0:
-            return False, "empty train_log.csv"
+        required = (
+            "model.pth", "Normalizer_Input.pth", "Normalizer_Output.pth",
+            "training_config.json", "train_log.csv",
+        )
+        for component, target_names in FDR_COMPONENT_TARGETS.items():
+            component_dir = output_dir / component
+            missing = [name for name in required if not (component_dir / name).is_file()]
+            if missing:
+                return False, f"{component}: missing {', '.join(missing)}"
+            try:
+                checkpoint = torch.load(component_dir / "model.pth", map_location="cpu", weights_only=True)
+            except TypeError:
+                checkpoint = torch.load(component_dir / "model.pth", map_location="cpu")
+            if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+                return False, f"{component}: checkpoint has no model_state_dict"
+            if checkpoint.get("model_type") != "TargetMFDNN":
+                return False, f"{component}: checkpoint is not TargetMFDNN"
+            if tuple(checkpoint.get("target_names", ())) != tuple(target_names):
+                return False, f"{component}: checkpoint target_names mismatch"
+            for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
+                if key in checkpoint and int(checkpoint[key]) != int(expected):
+                    return False, f"{component}: checkpoint {key}={checkpoint[key]} does not match {expected}"
+            for filename in ("Normalizer_Input.pth", "Normalizer_Output.pth"):
+                normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
+                if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
+                    return False, f"{component}: invalid {filename}"
+            training_config = load_json(component_dir / "training_config.json")
+            if int(training_config.get("excitation_id", excitation_id)) != int(excitation_id):
+                return False, f"{component}: training_config excitation_id mismatch"
+            if int(training_config.get("channel_id", channel_id)) != int(channel_id):
+                return False, f"{component}: training_config channel_id mismatch"
+            if (component_dir / "train_log.csv").stat().st_size <= 0:
+                return False, f"{component}: empty train_log.csv"
     except Exception as exc:
         return False, f"artifact validation failed: {type(exc).__name__}: {exc}"
     return True, "complete"
@@ -294,6 +298,10 @@ def main():
     cfg.K_max = 3
     cfg.embed_channel_num = real_stats["channel_num"]
     cfg.embed_excitation_num = real_stats["excitation_num"]
+    if cfg.pole_target != "freq_damping" or cfg.residue_target != "polar":
+        raise ValueError(
+            "FDR split training requires pole_target='freq_damping' and residue_target='polar'"
+        )
 
     model_root = Path(args.out_dir)
     preview_train, preview_val, split_strategy = split_single_fidelity_rows(real_parsed, cfg, 0, 0)
@@ -321,10 +329,7 @@ def main():
     if args.kfold > 1:
         raise ValueError("Per-excitation/channel training currently requires --kfold 0 or 1")
 
-    target_names = (
-        (["freq", "damping"] if cfg.pole_target == "freq_damping" else ["alpha", "omega"])
-        + (["rho", "sin_theta", "cos_theta"] if cfg.residue_target == "polar" else ["residue_re", "residue_im"])
-    )
+    target_names = [name for names in FDR_COMPONENT_TARGETS.values() for name in names]
     trained_models = []
     failures = []
     combinations = combinations_in_rows(real_parsed)
@@ -370,7 +375,7 @@ def main():
                 args=args,
                 dataset_metadata={
                     "manifest": manifest,
-                    "dataset_manifest_path": "../../dataset_manifest.json",
+                    "dataset_manifest_path": "../../../dataset_manifest.json",
                     "training_mode": "base_full_training",
                     "model_filename": "model.pth",
                     "excitation_id": excitation_id,

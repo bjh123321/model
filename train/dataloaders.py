@@ -29,7 +29,12 @@ def _target_modes(cfg: Config) -> tuple[str, str]:
 
 def _output_normalizer(parsed: List[ParsedRow], cfg: Config):
     pole_target, residue_target = _target_modes(cfg)
-    return compute_output_normalizer_masked(parsed, pole_target=pole_target, residue_target=residue_target)
+    return compute_output_normalizer_masked(
+        parsed,
+        pole_target=pole_target,
+        residue_target=residue_target,
+        target_names=getattr(cfg, "model_target_names", None),
+    )
 
 
 _DAMPING_LIMIT_BY_EXCITATION = {

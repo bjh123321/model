@@ -85,6 +85,9 @@ def row_target_values(p: ParsedRow, pole_target: str | None = None, residue_targ
         out["damping"] = np.asarray(p.damping, dtype=np.float32)
     if residue == RESIDUE_POLAR:
         out["rho"] = np.asarray(p.rho, dtype=np.float32)
+        out["magnitude"] = np.exp(
+            np.clip(np.asarray(p.rho, dtype=np.float64), -80.0, 80.0)
+        ).astype(np.float32)
         out["sin_theta"] = np.asarray(p.sin_theta, dtype=np.float32)
         out["cos_theta"] = np.asarray(p.cos_theta, dtype=np.float32)
     else:
@@ -176,10 +179,23 @@ def compute_output_normalizer_masked(
     parsed: List[ParsedRow],
     residue_target: str = RESIDUE_POLAR,
     pole_target: str = POLE_ALPHA_OMEGA,
+    target_names: list[str] | tuple[str, ...] | None = None,
 ) -> Normalizer:
     pole_target = canonical_pole_target(pole_target)
     residue_target = canonical_residue_target(residue_target)
-    names = target_names_for(pole_target, residue_target)
+    default_names = target_names_for(pole_target, residue_target)
+    available_names = list(default_names)
+    if residue_target == RESIDUE_POLAR:
+        available_names.append("magnitude")
+    names = default_names if target_names is None else [str(name) for name in target_names]
+    if not names:
+        raise ValueError("target_names must not be empty")
+    unsupported = [name for name in names if name not in available_names]
+    if unsupported:
+        raise ValueError(
+            f"Targets {unsupported} are unavailable for pole_target={pole_target!r}, "
+            f"residue_target={residue_target!r}; available={available_names}"
+        )
     values = []
     for p in parsed:
         mask = np.asarray(p.mask, dtype=bool)

@@ -8,7 +8,7 @@ from typing import Mapping
 import torch
 
 from surrogate_model.config import Config
-from surrogate_model.models.blocks import MFDNN
+from surrogate_model.models.blocks import MFDNN, TargetMFDNN
 
 
 STRUCTURE_FIELDS = (
@@ -16,6 +16,7 @@ STRUCTURE_FIELDS = (
     "embed_channel_dim", "low_hidden", "dropout_prob", "use_lora", "lora_rank",
     "lora_alpha", "lora_dropout", "lora_target_hidden_indices", "use_modulation",
     "mod_gamma", "pole_target", "residue_target",
+    "model_type", "model_target_names", "target_component",
 )
 
 
@@ -158,10 +159,21 @@ def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool 
     return cfg
 
 
-def build_model_from_checkpoint(checkpoint: Mapping, *, device=None, checkpoint_path: str | Path = "<memory>") -> MFDNN:
+def build_model_from_checkpoint(checkpoint: Mapping, *, device=None, checkpoint_path: str | Path = "<memory>") -> MFDNN | TargetMFDNN:
     state = checkpoint_state_dict(checkpoint)
     cfg = restore_model_config_from_checkpoint(checkpoint)
-    model = MFDNN(cfg)
+    model_type = str(checkpoint.get("model_type", getattr(cfg, "model_type", "MFDNN")))
+    if model_type == "TargetMFDNN":
+        target_names = checkpoint.get("target_names", getattr(cfg, "model_target_names", None))
+        if not target_names:
+            raise RuntimeError(f"TargetMFDNN checkpoint {checkpoint_path} has no target_names metadata")
+        cfg.model_target_names = [str(name) for name in target_names]
+        cfg.target_component = str(checkpoint.get("target_component", getattr(cfg, "target_component", "")))
+        model = TargetMFDNN(cfg)
+    elif model_type in {"MFDNN", "MFDNN_fixed_single_fidelity"}:
+        model = MFDNN(cfg)
+    else:
+        raise RuntimeError(f"Unsupported model_type={model_type!r} in checkpoint {checkpoint_path}")
     if device is not None:
         model = model.to(device)
     try:

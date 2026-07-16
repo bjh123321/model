@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from surrogate_model.config import Config
 from surrogate_model.data.io import OMEGA_N
-from surrogate_model.models.blocks import MFDNN, count_parameter_groups
+from surrogate_model.models.blocks import MFDNN, TargetMFDNN, count_parameter_groups
 from surrogate_model.train.dataloaders import build_single_fidelity_dataloaders
 from surrogate_model.utils.dist_utils import is_main_process
 
@@ -90,15 +90,20 @@ def _model_output_as_targets(pred, target_names):
     return {name: converted[name] for name in target_names}
 
 
-def _representation_loss(pred, tgt, mask, mean, std, target_names):
-    width = min(mask.size(1), pred["alpha"].size(1), min(tgt[name].size(1) for name in target_names))
-    w = mask[:, :width].to(dtype=pred["alpha"].dtype)
+def _representation_loss(
+    pred, tgt, mask, mean, std, target_names, *, outputs_normalized: bool = False
+):
+    reference = pred[target_names[0]] if outputs_normalized else pred["alpha"]
+    width = min(mask.size(1), reference.size(1), min(tgt[name].size(1) for name in target_names))
+    w = mask[:, :width].to(dtype=reference.dtype)
     den = w.sum().clamp_min(1.0)
-    pred_raw = _model_output_as_targets(pred, target_names)
-    total = pred["alpha"].new_tensor(0.0)
+    pred_raw = pred if outputs_normalized else _model_output_as_targets(pred, target_names)
+    total = reference.new_tensor(0.0)
     parts = {}
     for i, name in enumerate(target_names):
-        pred_cmp = (pred_raw[name][:, :width] - mean[i]) / std[i].clamp_min(1e-8)
+        pred_cmp = pred_raw[name][:, :width]
+        if not outputs_normalized:
+            pred_cmp = (pred_cmp - mean[i]) / std[i].clamp_min(1e-8)
         val = (w * (pred_cmp - tgt[name][:, :width]).pow(2)).sum() / den
         parts[name] = val
         total = total + val
@@ -137,7 +142,10 @@ def _select_pred(pred: dict, keep: torch.Tensor):
     return {k: v[keep] for k, v in pred.items()}
 
 
-def _accumulate_scope_losses(accum, pred, e, mask, y, mean, std, target_names, base_loss=None, base_parts=None):
+def _accumulate_scope_losses(
+    accum, pred, e, mask, y, mean, std, target_names,
+    base_loss=None, base_parts=None, *, outputs_normalized: bool = False,
+):
     pred_detached = {k: v.detach() for k, v in pred.items()}
     for scope, excitation_ids in EXCITATION_LOSS_SCOPES:
         keep = _scope_keep(e, excitation_ids)
@@ -148,7 +156,10 @@ def _accumulate_scope_losses(accum, pred, e, mask, y, mean, std, target_names, b
             parts = {k: v.detach() for k, v in base_parts.items()}
         else:
             y_sel = {k: v[keep] for k, v in y.items()}
-            loss, parts = _representation_loss(_select_pred(pred_detached, keep), y_sel, mask[keep], mean, std, target_names)
+            loss, parts = _representation_loss(
+                _select_pred(pred_detached, keep), y_sel, mask[keep], mean, std,
+                target_names, outputs_normalized=outputs_normalized,
+            )
         bs = int(keep.sum().item())
         accum[scope]["sum"] += float(loss.item()) * bs
         accum[scope]["count"] += bs
@@ -205,7 +216,10 @@ def _eval_model(model, dl, device, mean, std, target_names, eval_excitation_ids=
             if filtered is None:
                 continue
             H, M, e, c, mask, y = filtered
-            loss, parts = _representation_loss(model(H, M, e, c), y, mask, mean, std, target_names)
+            loss, parts = _representation_loss(
+                model(H, M, e, c), y, mask, mean, std, target_names,
+                outputs_normalized=bool(getattr(model, "outputs_normalized", False)),
+            )
             bs = H.size(0)
             total_sum += float(loss.item()) * bs
             count += bs
@@ -225,8 +239,15 @@ def _eval_model_scopes(model, dl, device, mean, std, target_names):
         for batch in dl:
             H, M, e, c, mask, y = _to_device(batch, device)
             pred = model(H, M, e, c)
-            loss, parts = _representation_loss(pred, y, mask, mean, std, target_names)
-            _accumulate_scope_losses(accum, pred, e, mask, y, mean, std, target_names, loss, parts)
+            outputs_normalized = bool(getattr(model, "outputs_normalized", False))
+            loss, parts = _representation_loss(
+                pred, y, mask, mean, std, target_names,
+                outputs_normalized=outputs_normalized,
+            )
+            _accumulate_scope_losses(
+                accum, pred, e, mask, y, mean, std, target_names, loss, parts,
+                outputs_normalized=outputs_normalized,
+            )
     return _finalize_scope_accum(_allreduce_scope_accum(accum, device), target_names)
 
 
@@ -243,7 +264,7 @@ def _write_train_log(path: Path, rows, target_names):
             writer.writerow({k: row.get(k, "") for k in fields})
 
 
-def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_norm, epoch: int, metric: float):
+def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, epoch: int, metric: float):
     model_save_path = Path(getattr(args, "model_save_path", "") or (out_dir / f"{out_dir.name}.pth"))
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
     normalizer_dir = Path(getattr(args, "normalizer_dir", "") or out_dir)
@@ -257,6 +278,8 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core: MFDNN, in_norm, out_
         "checkpoint_selection": str(getattr(model_core.cfg, "checkpoint_selection", "validation")),
         "best_metric_name": str(getattr(model_core.cfg, "_best_metric_name", "loss_val_group_FXD")),
         "model_state_dict": model_core.state_dict(),
+        "model_type": type(model_core).__name__,
+        "target_component": str(getattr(model_core.cfg, "target_component", "")),
         "pole_target": getattr(out_norm, "pole_target", "alpha_omega"),
         "residue_target": getattr(out_norm, "residue_target", "polar"),
         "target_names": out_norm.target_names(),
@@ -321,7 +344,10 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     cfg.embed_channel_num = max(int(getattr(cfg, "embed_channel_num", 0)), max(int(p.ch_id) for p in real_parsed) + 1)
 
     target_names = out_norm.target_names()
-    model_core = MFDNN(cfg).to(device)
+    if getattr(cfg, "model_target_names", None):
+        model_core = TargetMFDNN(cfg).to(device)
+    else:
+        model_core = MFDNN(cfg).to(device)
     for parameter in model_core.parameters():
         parameter.requires_grad_(True)
     model = model_core
@@ -388,8 +414,15 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
             H, M, e, c, mask, y = _to_device(batch, device)
             opt.zero_grad(set_to_none=True)
             pred = model(H, M, e, c)
-            loss, parts = _representation_loss(pred, y, mask, mean, std, target_names)
-            _accumulate_scope_losses(train_scope_accum, pred, e, mask, y, mean, std, target_names, loss, parts)
+            outputs_normalized = bool(getattr(model_core, "outputs_normalized", False))
+            loss, parts = _representation_loss(
+                pred, y, mask, mean, std, target_names,
+                outputs_normalized=outputs_normalized,
+            )
+            _accumulate_scope_losses(
+                train_scope_accum, pred, e, mask, y, mean, std, target_names,
+                loss, parts, outputs_normalized=outputs_normalized,
+            )
             loss.backward()
             if not debug_mode:
                 torch.nn.utils.clip_grad_norm_(model_core.parameters(), max_norm=5.0)

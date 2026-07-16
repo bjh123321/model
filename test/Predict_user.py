@@ -18,7 +18,11 @@ from surrogate_model.data.xlsx_utils import load_signal_type_rows
 from surrogate_model.test.residue_pred import build_BA_from_residues
 # from Error import calc_relative_error
 from surrogate_model.test.pp_utils import build_exc_seg_list, calc_pp_for_freq
-from surrogate_model.utils.excitation_channel_models import inventory_index, load_model_inventory
+from surrogate_model.utils.excitation_channel_models import (
+    FDR_COMPONENT_TARGETS,
+    inventory_index,
+    load_model_inventory,
+)
 
 
 def get_exe_dir():
@@ -517,24 +521,46 @@ class ExcitationChannelModelRegistry:
                 )
                 self._missing_warned.add(key)
             return None
-        checkpoint_path = self.version_dir / entry["checkpoint"]
-        input_normalizer_path = self.version_dir / entry["normalizer_input"]
-        try:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        selected_model = build_model_from_checkpoint(
-            checkpoint, device=self.device, checkpoint_path=checkpoint_path
-        )
-        input_normalizer = Normalizer.load(input_normalizer_path)
-        if len(input_normalizer.mean) != 2 or len(input_normalizer.std) != 2:
-            raise RuntimeError(
-                f"{input_normalizer_path} must describe [H, M], got "
-                f"mean={input_normalizer.mean}, std={input_normalizer.std}"
+        component_entries = entry.get("components", {})
+        bundle = {}
+        for component, expected_targets in FDR_COMPONENT_TARGETS.items():
+            component_entry = component_entries.get(component)
+            if not component_entry:
+                raise RuntimeError(
+                    f"Inventory entry excitation_id={key[0]} channel_id={key[1]} "
+                    f"is missing FDR component {component!r}"
+                )
+            if tuple(component_entry.get("target_names", ())) != tuple(expected_targets):
+                raise RuntimeError(
+                    f"Inventory FDR component {component!r} target mismatch: "
+                    f"expected={list(expected_targets)}, got={component_entry.get('target_names')}"
+                )
+            checkpoint_path = self.version_dir / component_entry["checkpoint"]
+            input_normalizer_path = self.version_dir / component_entry["normalizer_input"]
+            output_normalizer_path = self.version_dir / component_entry["normalizer_output"]
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            selected_model = build_model_from_checkpoint(
+                checkpoint, device=self.device, checkpoint_path=checkpoint_path
             )
-        self._cache[key] = (selected_model, input_normalizer)
+            input_normalizer = Normalizer.load(input_normalizer_path)
+            output_normalizer = Normalizer.load(output_normalizer_path)
+            if len(input_normalizer.mean) != 2 or len(input_normalizer.std) != 2:
+                raise RuntimeError(
+                    f"{input_normalizer_path} must describe [H, M], got "
+                    f"mean={input_normalizer.mean}, std={input_normalizer.std}"
+                )
+            if tuple(output_normalizer.target_names()) != tuple(expected_targets):
+                raise RuntimeError(
+                    f"{output_normalizer_path} target mismatch: expected={list(expected_targets)}, "
+                    f"got={output_normalizer.target_names()}"
+                )
+            bundle[component] = (selected_model, input_normalizer, output_normalizer)
+        self._cache[key] = bundle
         print(
-            f"[MODEL] loaded excitation_id={key[0]} channel_id={key[1]}: {checkpoint_path}",
+            f"[MODEL] loaded four FDR models for excitation_id={key[0]} channel_id={key[1]}",
             flush=True,
         )
         return self._cache[key]
@@ -542,7 +568,92 @@ class ExcitationChannelModelRegistry:
     @property
     def kmax(self) -> int:
         bundle = self.get(*min(self.entries))
-        return int(bundle[0].cfg.K_max)
+        return int(bundle["frequency"][0].cfg.K_max)
+
+
+@torch.no_grad()
+def _run_infer_fdr_bundle_batched(
+    bundle,
+    device: torch.device,
+    H_all: np.ndarray,
+    M_all: np.ndarray,
+    exc_all: np.ndarray,
+    ch_all: np.ndarray,
+    batch_size: int = 20000,
+    mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+):
+    component_outputs = {}
+    expected_kmax = None
+    count = len(H_all)
+    for component, target_names in FDR_COMPONENT_TARGETS.items():
+        model, input_normalizer, output_normalizer = bundle[component]
+        kmax = int(model.cfg.K_max)
+        if expected_kmax is None:
+            expected_kmax = kmax
+        elif kmax != expected_kmax:
+            raise RuntimeError(
+                f"FDR component K_max mismatch: expected={expected_kmax}, "
+                f"{component}={kmax}"
+            )
+        accum = {name: [] for name in target_names}
+        for start in range(0, count, batch_size):
+            end = min(count, start + batch_size)
+            hm = torch.tensor(
+                np.stack([H_all[start:end], M_all[start:end]], axis=1),
+                dtype=torch.float32,
+            )
+            hm_norm = input_normalizer.transform(hm).to(device)
+            predicted = model(
+                hm_norm[:, :1],
+                hm_norm[:, 1:],
+                torch.tensor(exc_all[start:end], dtype=torch.long, device=device),
+                torch.tensor(ch_all[start:end], dtype=torch.long, device=device),
+            )
+            for target_index, name in enumerate(target_names):
+                normalized = predicted[name].detach().cpu().numpy().astype(np.float64)
+                raw = (
+                    normalized * float(output_normalizer.std[target_index])
+                    + float(output_normalizer.mean[target_index])
+                )
+                accum[name].append(raw)
+        for name in target_names:
+            component_outputs[name] = np.concatenate(accum[name], axis=0)
+
+    freq = np.nan_to_num(component_outputs["freq"], nan=0.0, posinf=0.0, neginf=0.0)
+    damping = np.nan_to_num(component_outputs["damping"], nan=0.0, posinf=0.0, neginf=0.0)
+    rho = np.nan_to_num(component_outputs["magnitude"], nan=0.0, posinf=0.0, neginf=0.0)
+    sin_t = np.nan_to_num(component_outputs["sin_theta"], nan=0.0, posinf=0.0, neginf=0.0)
+    cos_t = np.nan_to_num(component_outputs["cos_theta"], nan=1.0, posinf=1.0, neginf=1.0)
+    phase_norm = np.sqrt(sin_t * sin_t + cos_t * cos_t + 1e-12)
+    sin_t = sin_t / phase_norm
+    cos_t = cos_t / phase_norm
+
+    omega = 2.0 * np.pi * freq
+    alpha = -damping * omega / np.sqrt(np.maximum(1.0 - damping * damping, 1e-12))
+    valid_mask = (
+        np.isfinite(alpha) & np.isfinite(omega) & np.isfinite(rho)
+        & np.isfinite(sin_t) & np.isfinite(cos_t)
+        & (alpha < 0.0) & (omega > 0.0) & (freq > 0.0)
+        & (damping > 0.0) & (damping < 0.5) & (rho > 1e-12)
+    )
+    if mode_freq_ranges is not None:
+        for row_index, channel_id in enumerate(np.asarray(ch_all, dtype=np.int64)):
+            ch_name = channels[int(channel_id)] if 0 <= int(channel_id) < len(channels) else f"C{int(channel_id):02d}"
+            ranges = mode_freq_ranges.get(ch_name, [None] * int(expected_kmax))
+            for slot in range(int(expected_kmax)):
+                rg = ranges[slot] if slot < len(ranges) else None
+                valid_mask[row_index, slot] = bool(
+                    rg is not None and valid_mask[row_index, slot]
+                    and float(rg[0]) <= float(freq[row_index, slot]) <= float(rg[1])
+                )
+    return {
+        "alpha": alpha,
+        "omega": omega,
+        "rho": rho,
+        "sin_theta": sin_t,
+        "cos_theta": cos_t,
+        "valid_mask": valid_mask.astype(np.float32),
+    }
 
 
 @torch.no_grad()
@@ -590,18 +701,14 @@ def run_infer_batched(
         bundle = registry.get(excitation_id, channel_id)
         if bundle is None:
             continue
-        selected_model, selected_normalizer = bundle
-        output = _run_infer_single_model_batched(
-            selected_model,
-            selected_normalizer,
-            omegaN,
+        output = _run_infer_fdr_bundle_batched(
+            bundle,
             device,
             np.asarray(H_all)[selected],
             np.asarray(M_all)[selected],
             exc_values[selected],
             channel_values[selected],
             batch_size=batch_size,
-            predict_output=predict_output,
             mode_freq_ranges=mode_freq_ranges,
         )
         for name in combined:

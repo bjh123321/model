@@ -11,12 +11,15 @@ import torch.distributed as dist
 
 from surrogate_model.train.loops import train_one_fold
 from surrogate_model.utils.dist_utils import is_main_process
+from surrogate_model.utils.excitation_channel_models import FDR_COMPONENT_TARGETS
 from surrogate_model.utils.model_artifacts import atomic_write_json, load_json, read_code_metadata, sha256_file
 
 
 def _model_config(cfg) -> dict:
     return {
-        "model_type": "MFDNN_fixed_single_fidelity",
+        "model_type": "TargetMFDNN",
+        "target_component": str(getattr(cfg, "target_component", "")),
+        "model_target_names": list(getattr(cfg, "model_target_names", [])),
         "K_max": int(cfg.K_max),
         "low_hidden": list(cfg.low_hidden),
         "dropout_prob": float(cfg.dropout_prob),
@@ -90,6 +93,8 @@ def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) 
         "parent_model_version": dataset_metadata.get("parent_model_version"),
         "parent_checkpoint_used_for_weights": False,
         "use_lora": False,
+        "model_type": "TargetMFDNN",
+        "target_component": str(dataset_metadata.get("target_component", "")),
         "dataset_manifest": str(dataset_metadata.get("dataset_manifest_path", "dataset_manifest.json")),
         "dataset_fingerprint": manifest["dataset_fingerprint"],
         "parent_dataset_fingerprint": dataset_metadata.get("parent_dataset_fingerprint"),
@@ -171,47 +176,80 @@ def run_full_training(
     args,
     dataset_metadata: Mapping,
 ):
-    """Shared fixed-SF training path for base models and correction full retraining."""
+    """Train the four independent FDR component networks for one excitation/channel."""
     version_dir = Path(version_dir)
     version_dir.mkdir(parents=True, exist_ok=True)
-    cfg.use_lora = False
-    seed = int(getattr(cfg, "val_seed", 42))
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    parent_targets = dict(getattr(cfg, "parent_train_loss_targets", {}) or {})
+    results = {}
+    for component_index, (component, target_names) in enumerate(FDR_COMPONENT_TARGETS.items()):
+        component_cfg = copy.deepcopy(cfg)
+        component_cfg.use_lora = False
+        component_cfg.model_type = "TargetMFDNN"
+        component_cfg.target_component = component
+        component_cfg.model_target_names = list(target_names)
+        if parent_targets:
+            if component not in parent_targets:
+                raise RuntimeError(f"Missing parent train-loss target for FDR component {component!r}")
+            component_cfg.parent_train_loss_target = float(parent_targets[component])
+        elif hasattr(component_cfg, "parent_train_loss_target"):
+            delattr(component_cfg, "parent_train_loss_target")
 
-    run_args = copy.copy(args)
-    run_args.out_dir = str(version_dir)
-    run_args.normalizer_dir = str(version_dir)
-    run_args.model_save_path = str(version_dir / str(dataset_metadata.get("model_filename", f"{model_version}.pth")))
-    run_args.train_log_path = str(version_dir / "train_log.csv")
-    run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
-    run_args.fold_index = 0
-    run_args.num_folds = 1
+        seed = int(getattr(component_cfg, "val_seed", 42)) + component_index
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
-    run_args.checkpoint_metadata = build_checkpoint_metadata(
-        model_version=model_version, dataset_metadata=dataset_metadata
-    )
-    best, train_hist, val_hist = train_one_fold(0, cfg, parsed_rows, run_args)
-
-    training_config_path = version_dir / "training_config.json"
-    if is_main_process():
-        training_config = write_training_config(
-            cfg=cfg,
-            args=args,
-            model_version=model_version,
-            version_dir=version_dir,
-            dataset_metadata=dataset_metadata,
+        component_dir = version_dir / component
+        component_dir.mkdir(parents=True, exist_ok=True)
+        component_metadata = dict(dataset_metadata)
+        component_metadata.update(
+            {
+                "model_filename": "model.pth",
+                "target_component": component,
+                "target_names": list(target_names),
+            }
         )
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-    if not is_main_process():
-        training_config = load_json(training_config_path)
-    return {
-        "best_metric": best,
-        "train_history": train_hist,
-        "validation_history": val_hist,
-        "training_config": training_config,
-    }
+
+        run_args = copy.copy(args)
+        run_args.out_dir = str(component_dir)
+        run_args.normalizer_dir = str(component_dir)
+        run_args.model_save_path = str(component_dir / "model.pth")
+        run_args.train_log_path = str(component_dir / "train_log.csv")
+        run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
+        run_args.fold_index = 0
+        run_args.num_folds = 1
+        run_args.checkpoint_metadata = build_checkpoint_metadata(
+            model_version=model_version, dataset_metadata=component_metadata
+        )
+        if is_main_process():
+            print(
+                f"========== FDR component {component_index + 1}/{len(FDR_COMPONENT_TARGETS)}: "
+                f"{component}, targets={list(target_names)} ==========",
+                flush=True,
+            )
+        best, train_hist, val_hist = train_one_fold(
+            0, component_cfg, parsed_rows, run_args
+        )
+
+        training_config_path = component_dir / "training_config.json"
+        if is_main_process():
+            training_config = write_training_config(
+                cfg=component_cfg,
+                args=args,
+                model_version=model_version,
+                version_dir=component_dir,
+                dataset_metadata=component_metadata,
+            )
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        if not is_main_process():
+            training_config = load_json(training_config_path)
+        results[component] = {
+            "best_metric": best,
+            "train_history": train_hist,
+            "validation_history": val_hist,
+            "training_config": training_config,
+        }
+    return {"components": results}
