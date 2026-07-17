@@ -386,14 +386,6 @@ def split_single_fidelity_rows(
 
 def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow], cfg: Config,
                       kfold: int, fold_idx: int, device: torch.device, out_dir: Path):
-    in_norm_sim = compute_input_normalizer_sim(sim_parsed)
-    if is_main_process():
-        in_norm_sim.save(out_dir / "Normalizer_Input_Sim.pth")
-
-    out_norm_sim = _output_normalizer(sim_parsed, cfg)
-    if is_main_process():
-        out_norm_sim.save(out_dir / "Normalizer_Output_Sim.pth")
-
     use_val_split = bool(getattr(cfg, "use_val_split", False))
     val_ratio = float(getattr(cfg, "val_ratio", 0.2))
     seed = int(getattr(cfg, "val_seed", 42))
@@ -417,44 +409,43 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         sim_train = sim_parsed
         sim_val = []
 
-    if use_val_split:
-        if use_height_mach_kfold:
-            real_train, real_val, real_info = _split_by_height_mach_groups(real_parsed, cfg, kfold, fold_idx, "real")
-            if is_main_process():
-                print(f"[VAL] real height_mach_kfold: val_groups={len(real_info)}, train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
-        elif use_height_max_mach_val:
-            real_train, real_val, split_info = _split_real_by_height_max_mach(real_parsed, cfg)
-            if is_main_process():
-                detail = ", ".join(f"H={h:g}, maxM={m:g}, val_rows={n}" for h, m, n in split_info)
-                print(f"[VAL] real split by height max Mach: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
-        elif use_height_mach_points_val:
-            real_train, real_val, split_info = _split_real_by_height_mach_points(real_parsed, cfg)
-            if is_main_process():
-                detail = ", ".join(f"H={h:g}, M={m:g}, val_rows={n}" for h, m, n in split_info)
-                print(f"[VAL] real split by specified height-Mach points: {detail}; train_rows={len(real_train)}, val_rows={len(real_val)}", flush=True)
-        elif kfold > 1 and len(real_parsed) > 1:
-            kf = KFold(n_splits=kfold, shuffle=True, random_state=seed)
-            indices = list(range(len(real_parsed)))
-            train_idx, val_idx = list(kf.split(indices))[fold_idx]
-            real_train = [real_parsed[i] for i in train_idx]
-            real_val = [real_parsed[i] for i in val_idx]
-        elif (0.0 < val_ratio < 1.0) and (len(real_parsed) > 1):
-            rng = np.random.default_rng(seed + 1000)
-            idx = np.arange(len(real_parsed))
-            rng.shuffle(idx)
-            n_val = max(1, int(round(len(real_parsed) * val_ratio)))
-            real_train = [real_parsed[i] for i in idx[n_val:]]
-            real_val = [real_parsed[i] for i in idx[:n_val]]
-        else:
-            real_train = real_parsed
-            real_val = []
-    else:
-        real_train = real_parsed
-        real_val = []
+    real_train, real_val, real_split_strategy = split_single_fidelity_rows(
+        real_parsed, cfg, kfold, fold_idx
+    )
+    cfg._last_split_metadata = {
+        "split_strategy": real_split_strategy,
+        "train_group_keys": sorted({group_key_from_parsed(row) for row in real_train}),
+        "validation_group_keys": sorted({group_key_from_parsed(row) for row in real_val}),
+    }
+    if is_main_process():
+        print(
+            f"[VAL] real strategy={real_split_strategy} "
+            f"train_rows={len(real_train)} val_rows={len(real_val)}",
+            flush=True,
+        )
 
+    sim_train, dropped_sim_train = _filter_damping_slots(sim_train, "sim_train")
+    sim_val, dropped_sim_val = _filter_damping_slots(sim_val, "sim_validation")
     real_train, dropped_train = _filter_damping_slots(real_train, "train")
     real_val, dropped_val = _filter_damping_slots(real_val, "validation")
-    _write_damping_filter_log(out_dir, dropped_train + dropped_val)
+    _write_damping_filter_log(
+        out_dir,
+        dropped_sim_train + dropped_sim_val + dropped_train + dropped_val,
+    )
+
+    if not sim_train:
+        raise RuntimeError("No valid simulation training rows remain after filtering")
+    if not real_train:
+        raise RuntimeError("No valid real training rows remain after filtering")
+
+    # Both fidelities use the simulation input coordinates.  Output statistics
+    # remain separate because simulation and real targets can have different
+    # offsets and scales.
+    in_norm_sim = compute_input_normalizer_sim(sim_train)
+    out_norm_sim = _output_normalizer(sim_train, cfg)
+    if is_main_process():
+        in_norm_sim.save(out_dir / "Normalizer_Input_Sim.pth")
+        out_norm_sim.save(out_dir / "Normalizer_Output_Sim.pth")
 
     out_norm_real = _output_normalizer(real_train, cfg)
     _attach_and_write_slot_support(out_norm_real, real_train, real_val, cfg, out_dir)
@@ -481,6 +472,41 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     val_dl = DataLoader(real_va, batch_size=cfg.batch_real, shuffle=False, sampler=val_sampler, **kwargs)
 
     return sim_dl, real_dl, sim_val_dl, val_dl, len(sim_ds), len(real_tr), out_norm_sim, out_norm_real, in_norm_sim
+
+
+def build_low_fidelity_dataloader(
+    sim_parsed: List[ParsedRow], cfg: Config, out_dir: Path
+):
+    """Build a simulation-only component loader when no valid real rows exist."""
+    sim_train, dropped = _filter_damping_slots(sim_parsed, "sim_train")
+    _write_damping_filter_log(out_dir, dropped)
+    if not sim_train:
+        raise RuntimeError("Low-fidelity training requires valid simulation rows")
+    in_norm_sim = compute_input_normalizer_sim(sim_train)
+    out_norm_sim = _output_normalizer(sim_train, cfg)
+    _attach_and_write_slot_support(out_norm_sim, sim_train, [], cfg, out_dir)
+    if is_main_process():
+        in_norm_sim.save(out_dir / "Normalizer_Input_Sim.pth")
+        out_norm_sim.save(out_dir / "Normalizer_Output_Sim.pth")
+    dataset = ModalDataset(sim_train, cfg.K_max, in_norm_sim, out_norm_sim)
+    sampler = (
+        DistributedSampler(dataset, shuffle=True, drop_last=True)
+        if _ddp_ready()
+        else None
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(getattr(cfg, "batch_sim", cfg.batch_real)),
+        shuffle=(sampler is None),
+        sampler=sampler,
+        **_loader_kwargs(cfg),
+    )
+    cfg._last_split_metadata = {
+        "split_strategy": "sim_all_rows_training",
+        "train_group_keys": sorted({group_key_from_parsed(row) for row in sim_train}),
+        "validation_group_keys": [],
+    }
+    return loader, len(dataset), out_norm_sim, in_norm_sim
 
 
 def build_single_fidelity_dataloaders(

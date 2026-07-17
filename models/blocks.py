@@ -239,6 +239,99 @@ class TargetMFDNN(nn.Module):
         return self.low(Hn, Mn, self.emb_exc(exc_id), self.emb_ch(ch_id))
 
 
+class TargetLinearHighFidelityHead(nn.Module):
+    """Per-slot affine map from simulation-normalized to real-normalized targets."""
+
+    def __init__(self, target_count: int):
+        super().__init__()
+        self.affine = nn.Linear(int(target_count), int(target_count))
+        with torch.no_grad():
+            self.affine.weight.copy_(torch.eye(int(target_count)))
+            self.affine.bias.zero_()
+
+    def forward(self, low_values: torch.Tensor) -> torch.Tensor:
+        return self.affine(low_values)
+
+
+class TargetAdaptationHead(nn.Module):
+    """Nonlinear real-data correction conditioned on H/M and the low prediction."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.target_count = len(tuple(cfg.model_target_names))
+        in_dim = (
+            2
+            + cfg.embed_excitation_dim
+            + cfg.embed_channel_dim
+            + self.target_count
+        )
+        self.mlp = MLP(
+            [in_dim]
+            + list(getattr(cfg, "adapt_hidden", [32, 32]))
+            + [cfg.K_max * self.target_count],
+            dropout=cfg.dropout_prob,
+        )
+
+    def forward(self, Hn, Mn, exc_emb, ch_emb, low_values):
+        low_pool = low_values.mean(dim=1)
+        x = torch.cat([Hn, Mn, exc_emb, ch_emb, low_pool], dim=1)
+        return self.mlp(x).view(-1, self.cfg.K_max, self.target_count)
+
+
+class TargetMultifidelityMFDNN(nn.Module):
+    """Independent FDR component with a sim low head and real correction head."""
+
+    outputs_normalized = True
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.target_names = tuple(str(name) for name in cfg.model_target_names)
+        if not self.target_names:
+            raise ValueError("model_target_names must not be empty")
+        self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
+        self.emb_ch = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
+        self.low = TargetHead(cfg)
+        self.lin = TargetLinearHighFidelityHead(len(self.target_names))
+        self.adaptation = TargetAdaptationHead(cfg)
+
+    def _as_tensor(self, values: dict[str, torch.Tensor]) -> torch.Tensor:
+        return torch.stack([values[name] for name in self.target_names], dim=-1)
+
+    def _as_dict(self, values: torch.Tensor) -> dict[str, torch.Tensor]:
+        result = {
+            name: values[..., index]
+            for index, name in enumerate(self.target_names)
+        }
+        if self.target_names == ("sin_theta", "cos_theta"):
+            norm = torch.sqrt(
+                result["sin_theta"].pow(2)
+                + result["cos_theta"].pow(2)
+                + 1e-8
+            )
+            result["sin_theta"] = result["sin_theta"] / norm
+            result["cos_theta"] = result["cos_theta"] / norm
+        return result
+
+    def forward_low(self, Hn, Mn, exc_id, ch_id):
+        return self.low(Hn, Mn, self.emb_exc(exc_id), self.emb_ch(ch_id))
+
+    def forward_high(self, Hn, Mn, exc_id, ch_id, out_low):
+        exc_emb = self.emb_exc(exc_id)
+        ch_emb = self.emb_ch(ch_id)
+        low_values = self._as_tensor(out_low)
+        high_values = self.lin(low_values) + self.adaptation(
+            Hn, Mn, exc_emb, ch_emb, low_values
+        )
+        return self._as_dict(high_values)
+
+    def forward(self, Hn, Mn, exc_id, ch_id):
+        out_low = self.forward_low(Hn, Mn, exc_id, ch_id)
+        out_high = self.forward_high(Hn, Mn, exc_id, ch_id, out_low)
+        return out_low, out_high
+
+
 def freeze_base_train_lora_only(model: nn.Module):
     for name, param in model.named_parameters():
         param.requires_grad_((".A." in name) or (".B." in name))
@@ -258,14 +351,21 @@ def count_parameters(model: nn.Module) -> tuple[int, int]:
     return trainable, total
 
 
-def count_parameter_groups(model: MFDNN) -> dict[str, int]:
+def count_parameter_groups(model: nn.Module) -> dict[str, int]:
     low = model.low
-    return {
+    groups = {
         "main_mlp_parameters": sum(p.numel() for p in low.mlp.parameters()),
         "mod_parameters": sum(p.numel() for p in low.mod.parameters()) if low.mod is not None else 0,
         "embedding_parameters": sum(p.numel() for p in model.emb_exc.parameters()) + sum(p.numel() for p in model.emb_ch.parameters()),
         "total_parameters": sum(p.numel() for p in model.parameters()),
     }
+    if hasattr(model, "lin"):
+        groups["linear_high_parameters"] = sum(p.numel() for p in model.lin.parameters())
+    if hasattr(model, "adaptation"):
+        groups["adaptation_parameters"] = sum(
+            p.numel() for p in model.adaptation.parameters()
+        )
+    return groups
 
 
 def _copy_tensor(dst: torch.Tensor, src: torch.Tensor, key: str):

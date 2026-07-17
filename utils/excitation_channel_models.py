@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 from surrogate_model.utils.model_artifacts import atomic_write_json, load_json
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MODEL_INVENTORY_NAME = "models_manifest.json"
 TRAINING_FAILURES_NAME = "training_failures.json"
 FDR_COMPONENT_TARGETS = {
@@ -70,7 +70,15 @@ def model_entry(
     row_count: int,
     status: str,
     source_model_version: str | None = None,
+    fidelity_mode: str = "multifidelity",
+    prediction_output: str | None = None,
+    sim_row_count: int | None = None,
+    real_row_count: int | None = None,
 ) -> dict:
+    fidelity_mode = str(fidelity_mode)
+    prediction_output = str(
+        prediction_output or ("low" if fidelity_mode == "sim_only" else "high")
+    )
     relative_dir = combination_relative_dir(excitation_id, channel_id)
     components = {}
     for component, target_names in FDR_COMPONENT_TARGETS.items():
@@ -80,6 +88,14 @@ def model_entry(
             "checkpoint": f"{component_dir}/model.pth",
             "normalizer_input": f"{component_dir}/Normalizer_Input.pth",
             "normalizer_output": f"{component_dir}/Normalizer_Output.pth",
+            "normalizer_output_sim": f"{component_dir}/Normalizer_Output_Sim.pth",
+            "normalizer_output_real": (
+                None
+                if fidelity_mode == "sim_only"
+                else f"{component_dir}/Normalizer_Output_Real_Fold0.pth"
+            ),
+            "fidelity_mode": fidelity_mode,
+            "prediction_output": prediction_output,
             "training_config": f"{component_dir}/training_config.json",
             "train_log": f"{component_dir}/train_log.csv",
             "slot_support": f"{component_dir}/slot_support.json",
@@ -93,7 +109,13 @@ def model_entry(
         "components": components,
         "row_count": int(row_count),
         "status": str(status),
+        "fidelity_mode": fidelity_mode,
+        "prediction_output": prediction_output,
     }
+    if sim_row_count is not None:
+        entry["sim_row_count"] = int(sim_row_count)
+    if real_row_count is not None:
+        entry["real_row_count"] = int(real_row_count)
     if source_model_version:
         entry["source_model_version"] = str(source_model_version)
     return entry

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import os
 from copy import deepcopy
+from itertools import cycle
 from pathlib import Path
 
 import torch
@@ -10,8 +11,17 @@ import torch.distributed as dist
 
 from surrogate_model.config import Config
 from surrogate_model.data.io import OMEGA_N
-from surrogate_model.models.blocks import MFDNN, TargetMFDNN, count_parameter_groups
-from surrogate_model.train.dataloaders import build_single_fidelity_dataloaders
+from surrogate_model.models.blocks import (
+    MFDNN,
+    TargetMFDNN,
+    TargetMultifidelityMFDNN,
+    count_parameter_groups,
+)
+from surrogate_model.train.dataloaders import (
+    build_dataloaders,
+    build_low_fidelity_dataloader,
+    build_single_fidelity_dataloaders,
+)
 from surrogate_model.utils.dist_utils import is_main_process
 
 
@@ -401,6 +411,7 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
         "slot_support": dict(out_norm.support or {}),
         "K_max": int(model_core.cfg.K_max),
         "low_hidden": list(getattr(model_core.cfg, "low_hidden", [])),
+        "adapt_hidden": list(getattr(model_core.cfg, "adapt_hidden", [])),
         "dropout_prob": float(getattr(model_core.cfg, "dropout_prob", 0.0)),
         "use_lora": bool(getattr(model_core.cfg, "use_lora", False)),
         "use_modulation": bool(getattr(model_core.cfg, "use_modulation", False)),
@@ -437,6 +448,399 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
             in_norm.save(deploy_normalizer_dir / "Normalizer_Input.pth")
             out_norm.save(deploy_normalizer_dir / "Normalizer_Output.pth")
     return model_save_path, normalizer_dir
+
+
+class _TargetOutputView(torch.nn.Module):
+    outputs_normalized = True
+
+    def __init__(self, model: TargetMultifidelityMFDNN, output: str):
+        super().__init__()
+        self.model = model
+        self.output = str(output)
+
+    def forward(self, H, M, e, c):
+        if self.output == "low":
+            return self.model.forward_low(H, M, e, c)
+        _low, high = self.model(H, M, e, c)
+        return high
+
+
+def _write_multifidelity_log(path: Path, rows: list[dict]):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    preferred = [
+        "stage", "epoch", "loss_sim", "loss_real", "loss_total",
+        "loss_val_sim", "loss_val_real", "lr",
+    ]
+    extra = sorted({key for row in rows for key in row} - set(preferred))
+    fields = preferred + extra
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fields})
+
+
+def train_multifidelity_component(
+    fold: int,
+    cfg: Config,
+    sim_parsed,
+    real_parsed,
+    args,
+):
+    """Train one FDR component: simulation low head then real correction head."""
+    sim_parsed = list(sim_parsed or [])
+    real_parsed = list(real_parsed or [])
+    if not sim_parsed:
+        raise RuntimeError("Multifidelity component training requires simulation rows")
+    if int(cfg.epochs_stage1) <= 0:
+        raise ValueError("epochs_stage1 must be positive")
+    if real_parsed and int(cfg.epochs_stage2) <= 0:
+        raise ValueError("epochs_stage2 must be positive for multifidelity training")
+
+    device = _select_device(args)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fidelity_mode = "multifidelity" if real_parsed else "sim_only"
+    prediction_output = "high" if real_parsed else "low"
+
+    if real_parsed:
+        (
+            sim_dl,
+            real_dl,
+            sim_val_dl,
+            real_val_dl,
+            n_sim,
+            n_real,
+            out_norm_sim,
+            out_norm_real,
+            in_norm,
+        ) = build_dataloaders(
+            sim_parsed, real_parsed, cfg, args.kfold, fold, device, out_dir
+        )
+        deploy_norm = out_norm_real
+    else:
+        sim_dl, n_sim, out_norm_sim, in_norm = build_low_fidelity_dataloader(
+            sim_parsed, cfg, out_dir
+        )
+        sim_val_dl = None
+        real_dl = real_val_dl = None
+        n_real = 0
+        out_norm_real = None
+        deploy_norm = out_norm_sim
+
+    cfg._target_transforms = dict(deploy_norm.target_transforms or {})
+    cfg.embed_excitation_num = max(
+        int(getattr(cfg, "embed_excitation_num", 0)),
+        max(int(row.exc_id) for row in sim_parsed + real_parsed) + 1,
+    )
+    cfg.embed_channel_num = max(
+        int(getattr(cfg, "embed_channel_num", 0)),
+        max(int(row.ch_id) for row in sim_parsed + real_parsed) + 1,
+    )
+    target_names = out_norm_sim.target_names()
+    if real_parsed and tuple(out_norm_real.target_names()) != tuple(target_names):
+        raise RuntimeError(
+            "Simulation/real target mismatch: "
+            f"sim={target_names}, real={out_norm_real.target_names()}"
+        )
+
+    model = TargetMultifidelityMFDNN(cfg).to(device)
+    low_view = _TargetOutputView(model, "low")
+    high_view = _TargetOutputView(model, "high")
+    mean_sim = torch.as_tensor(out_norm_sim.mean, dtype=torch.float32, device=device)
+    std_sim = torch.as_tensor(out_norm_sim.std, dtype=torch.float32, device=device).clamp_min(1e-8)
+    mean_real = (
+        None
+        if out_norm_real is None
+        else torch.as_tensor(out_norm_real.mean, dtype=torch.float32, device=device)
+    )
+    std_real = (
+        None
+        if out_norm_real is None
+        else torch.as_tensor(out_norm_real.std, dtype=torch.float32, device=device).clamp_min(1e-8)
+    )
+    print(
+        f"[MULTIFIDELITY-FDR] device={device} mode={fidelity_mode} "
+        f"sim_rows={n_sim} real_rows={n_real} targets={target_names} "
+        f"parameters={count_parameter_groups(model)}",
+        flush=True,
+    )
+
+    logs: list[dict] = []
+    train_hist: list[float] = []
+    val_hist: list[float] = []
+    min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
+
+    # Stage 1: train only the simulation low head.  Embeddings remain fixed,
+    # matching user_for_win7_fixed_exc_channel's per-combination behavior.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in model.low.parameters():
+        parameter.requires_grad_(True)
+    optimizer1 = torch.optim.AdamW(
+        model.low.parameters(), lr=cfg.lr_low_adam, weight_decay=cfg.weight_decay
+    )
+    scheduler1 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer1, mode="min", factor=0.5, patience=20, min_lr=1e-6
+    )
+    best_stage1 = float("inf")
+    best_stage1_epoch = 0
+    best_low_state = None
+    bad = 0
+    for epoch in range(int(cfg.epochs_stage1)):
+        model.train()
+        total, count = 0.0, 0
+        for batch in sim_dl:
+            H, M, e, c, mask, target = _to_device(batch, device)
+            optimizer1.zero_grad(set_to_none=True)
+            prediction = model.forward_low(H, M, e, c)
+            loss, _parts = _representation_loss(
+                prediction,
+                target,
+                mask,
+                mean_sim,
+                std_sim,
+                target_names,
+                outputs_normalized=True,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.low.parameters(), 5.0)
+            optimizer1.step()
+            total += float(loss.detach().item()) * H.size(0)
+            count += H.size(0)
+        train_loss = total / max(count, 1)
+        val_loss, _ = _eval_model(
+            low_view, sim_val_dl, device, mean_sim, std_sim, target_names
+        )
+        metric = train_loss if val_loss is None else val_loss
+        scheduler1.step(train_loss)
+        logs.append(
+            {
+                "stage": 1,
+                "epoch": epoch + 1,
+                "loss_sim": train_loss,
+                "loss_val_sim": "" if val_loss is None else val_loss,
+                "lr": optimizer1.param_groups[0]["lr"],
+            }
+        )
+        if metric < best_stage1 - min_delta:
+            best_stage1 = float(metric)
+            best_stage1_epoch = epoch + 1
+            best_low_state = deepcopy(model.low.state_dict())
+            bad = 0
+        else:
+            bad += 1
+        if (epoch + 1) == 1 or (epoch + 1) % 10 == 0:
+            val_text = "nan" if val_loss is None else f"{val_loss:.6f}"
+            print(
+                f"[S1] epoch={epoch + 1}/{cfg.epochs_stage1} "
+                f"sim={train_loss:.6f} val={val_text}",
+                flush=True,
+            )
+        if cfg.early_stop_patience_s1 > 0 and bad >= cfg.early_stop_patience_s1:
+            break
+    if best_low_state is not None:
+        model.low.load_state_dict(best_low_state)
+
+    if not real_parsed:
+        cfg._best_metric_name = "loss_sim"
+        cfg._last_training_result = {
+            "best_epoch": int(best_stage1_epoch),
+            "best_metric": float(best_stage1),
+            "best_metric_name": "loss_sim",
+            "final_train_loss": float(logs[-1]["loss_sim"]),
+            "final_validation_loss": None,
+            "fidelity_mode": fidelity_mode,
+            "prediction_output": prediction_output,
+        }
+        if is_main_process():
+            _save_deploy_artifacts(
+                args,
+                out_dir,
+                model,
+                in_norm,
+                deploy_norm,
+                best_stage1_epoch,
+                best_stage1,
+            )
+            _write_multifidelity_log(Path(args.train_log_path), logs)
+        return best_stage1, [float(row["loss_sim"]) for row in logs], []
+
+    # Stage 2: learn the real correction while retaining a soft sim constraint.
+    freeze_low = bool(getattr(cfg, "freeze_low_stage2", False))
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    for parameter in model.lin.parameters():
+        parameter.requires_grad_(True)
+    for parameter in model.adaptation.parameters():
+        parameter.requires_grad_(True)
+    if not freeze_low:
+        for parameter in model.low.parameters():
+            parameter.requires_grad_(True)
+    stage2_parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer2 = torch.optim.AdamW(
+        stage2_parameters, lr=cfg.lr_high_adam, weight_decay=cfg.weight_decay
+    )
+    scheduler2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer2, mode="min", factor=0.5, patience=20, min_lr=1e-6
+    )
+    sim_weight = float(getattr(cfg, "multifidelity_sim_loss_weight", 0.2))
+    checkpoint_selection = str(getattr(cfg, "checkpoint_selection", "validation")).lower()
+    ceiling = getattr(cfg, "checkpoint_train_loss_ceiling", None)
+    ceiling = None if ceiling is None else float(ceiling)
+    cfg._best_metric_name = (
+        "loss_val_real" if checkpoint_selection == "validation" else "loss_real"
+    )
+    parent_loss_target = getattr(cfg, "parent_train_loss_target", None)
+    parent_loss_target = (
+        None if parent_loss_target is None else float(parent_loss_target)
+    )
+    epochs_after_parent_loss = int(getattr(cfg, "epochs_after_parent_loss", 0))
+    parent_loss_reached_epoch = None
+    best = float("inf")
+    best_epoch = 0
+    best_state = None
+    fallback_best = float("inf")
+    fallback_state = None
+    fallback_epoch = 0
+    bad = 0
+    sim_iterator = cycle(sim_dl)
+    for epoch in range(int(cfg.epochs_stage2)):
+        model.train()
+        if freeze_low:
+            model.low.eval()
+        total_real = total_sim = total_combined = 0.0
+        count = 0
+        for real_batch in real_dl:
+            H_r, M_r, e_r, c_r, mask_r, target_r = _to_device(real_batch, device)
+            optimizer2.zero_grad(set_to_none=True)
+            _out_low_r, out_high_r = model(H_r, M_r, e_r, c_r)
+            loss_real, _ = _representation_loss(
+                out_high_r,
+                target_r,
+                mask_r,
+                mean_real,
+                std_real,
+                target_names,
+                outputs_normalized=True,
+            )
+            if freeze_low or sim_weight <= 0.0:
+                loss_sim = loss_real.new_tensor(0.0)
+            else:
+                H_s, M_s, e_s, c_s, mask_s, target_s = _to_device(
+                    next(sim_iterator), device
+                )
+                out_low_s = model.forward_low(H_s, M_s, e_s, c_s)
+                loss_sim, _ = _representation_loss(
+                    out_low_s,
+                    target_s,
+                    mask_s,
+                    mean_sim,
+                    std_sim,
+                    target_names,
+                    outputs_normalized=True,
+                )
+            loss_total = loss_real + sim_weight * loss_sim
+            loss_total.backward()
+            torch.nn.utils.clip_grad_norm_(stage2_parameters, 5.0)
+            optimizer2.step()
+            batch_size = H_r.size(0)
+            total_real += float(loss_real.detach().item()) * batch_size
+            total_sim += float(loss_sim.detach().item()) * batch_size
+            total_combined += float(loss_total.detach().item()) * batch_size
+            count += batch_size
+        real_loss = total_real / max(count, 1)
+        sim_loss = total_sim / max(count, 1)
+        combined_loss = total_combined / max(count, 1)
+        val_loss, _ = _eval_model(
+            high_view, real_val_dl, device, mean_real, std_real, target_names
+        )
+        raw_metric = (
+            real_loss
+            if checkpoint_selection == "training" or val_loss is None
+            else val_loss
+        )
+        eligible = val_loss is None or ceiling is None or real_loss <= ceiling
+        if raw_metric < fallback_best - min_delta:
+            fallback_best = float(raw_metric)
+            fallback_epoch = epoch + 1
+            fallback_state = deepcopy(model.state_dict())
+        metric = raw_metric if eligible else None
+        scheduler2.step(real_loss)
+        train_hist.append(real_loss)
+        val_hist.append(float("nan") if val_loss is None else val_loss)
+        logs.append(
+            {
+                "stage": 2,
+                "epoch": epoch + 1,
+                "loss_sim": sim_loss,
+                "loss_real": real_loss,
+                "loss_total": combined_loss,
+                "loss_val_real": "" if val_loss is None else val_loss,
+                "lr": optimizer2.param_groups[0]["lr"],
+            }
+        )
+        if (
+            parent_loss_target is not None
+            and parent_loss_reached_epoch is None
+            and real_loss <= parent_loss_target
+        ):
+            parent_loss_reached_epoch = epoch + 1
+        if metric is not None and metric < best - min_delta:
+            best = float(metric)
+            best_epoch = epoch + 1
+            best_state = deepcopy(model.state_dict())
+            bad = 0
+            if is_main_process():
+                _save_deploy_artifacts(
+                    args, out_dir, model, in_norm, deploy_norm, best_epoch, best
+                )
+        elif eligible:
+            bad += 1
+        if (epoch + 1) == 1 or (epoch + 1) % 10 == 0:
+            val_text = "nan" if val_loss is None else f"{val_loss:.6f}"
+            print(
+                f"[S2] epoch={epoch + 1}/{cfg.epochs_stage2} "
+                f"sim={sim_loss:.6f} real={real_loss:.6f} val={val_text}",
+                flush=True,
+            )
+        if cfg.early_stop_patience_s2 > 0 and bad >= cfg.early_stop_patience_s2:
+            break
+        if (
+            parent_loss_reached_epoch is not None
+            and (epoch + 1) - parent_loss_reached_epoch >= epochs_after_parent_loss
+        ):
+            break
+
+    if best_state is None:
+        best, best_epoch, best_state = fallback_best, fallback_epoch, fallback_state
+    if best_state is None:
+        raise RuntimeError("Multifidelity training did not produce a finite checkpoint")
+    model.load_state_dict(best_state)
+    cfg._last_training_result = {
+        "best_epoch": int(best_epoch),
+        "best_metric": float(best),
+        "best_metric_name": str(cfg._best_metric_name),
+        "final_train_loss": None if not train_hist else float(train_hist[-1]),
+        "final_validation_loss": (
+            None
+            if not val_hist or val_hist[-1] != val_hist[-1]
+            else float(val_hist[-1])
+        ),
+        "fidelity_mode": fidelity_mode,
+        "prediction_output": prediction_output,
+        "parent_train_loss_target": parent_loss_target,
+        "parent_loss_reached_epoch": parent_loss_reached_epoch,
+        "epochs_after_parent_loss": (
+            epochs_after_parent_loss if parent_loss_target is not None else None
+        ),
+    }
+    if is_main_process():
+        _save_deploy_artifacts(
+            args, out_dir, model, in_norm, deploy_norm, best_epoch, best
+        )
+        _write_multifidelity_log(Path(args.train_log_path), logs)
+    return best, train_hist, val_hist
 
 
 def train_one_fold(fold: int, cfg: Config, real_parsed, args):

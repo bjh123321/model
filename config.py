@@ -14,6 +14,7 @@ class Config:
     embed_channel_dim: int = 12
 
     low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
+    adapt_hidden: List[int] = field(default_factory=lambda: [32, 32])
     dropout_prob: float = 0
     use_lora: bool = False
     lora_rank: int = 4
@@ -27,6 +28,7 @@ class Config:
 
     # Fixed-SF training
     batch_real: int = 64
+    batch_sim: int = 256
     num_workers: int = 8
     prefetch: int = 4
 
@@ -55,24 +57,29 @@ class Config:
     residue_target: str = "polar"
 
     epochs_stage1: int = 5000
+    epochs_stage2: int = 5000
     early_stop_patience_s1: int = 500
+    early_stop_patience_s2: int = 500
     early_stop_min_delta: float = 1e-6
     checkpoint_selection: str = "validation"
 
     # Optim
     lr_low_adam: float = 1e-3
+    lr_high_adam: float = 1e-3
     weight_decay: float = 5e-5
+    multifidelity_sim_loss_weight: float = 0.2
+    freeze_low_stage2: bool = False
 
     # Independent FDR-component defaults.  Keep the split models large enough to
     # interpolate the sparse H/M samples; damping smoothness is handled by a
     # separate soft penalty below instead of shrinking every component network.
     fdr_physical_parameterization: bool = True
-    fdr_training_profile_version: int = 4
+    fdr_training_profile_version: int = 5
     fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
-        "frequency": 3,
-        "damping": 4,
-        "residue_magnitude": 3,
-        "residue_phase": 3,
+        "frequency": 5,
+        "damping": 5,
+        "residue_magnitude": 5,
+        "residue_phase": 5,
     })
     fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     fdr_dropout_prob: float = 0.0

@@ -29,7 +29,9 @@ def group_key_from_parsed(row) -> tuple[int, int, int]:
     return int(round(float(row.H) * 100)), int(round(float(row.M) * 100)), int(row.exc_id)
 
 
-def group_rows(rows: Iterable[Sequence[float]], *, source: str) -> dict[tuple[int, int, int], list[list[float]]]:
+def group_rows(
+    rows: Iterable[Sequence[float]], *, source: str, allow_duplicate_keys: bool = False
+) -> dict[tuple[int, int, int], list[list[float]]]:
     grouped: dict[tuple[int, int, int], list[list[float]]] = {}
     seen: set[tuple[int, int, int, int]] = set()
     for row in rows:
@@ -38,7 +40,7 @@ def group_rows(rows: Iterable[Sequence[float]], *, source: str) -> dict[tuple[in
         key = group_key_from_row(row)
         channel = int(round(float(row[3])))
         sample_key = (*key, channel)
-        if sample_key in seen:
+        if sample_key in seen and not allow_duplicate_keys:
             raise ValueError(f"{source}: duplicate group/channel row {sample_key}")
         seen.add(sample_key)
         grouped.setdefault(key, []).append([float(value) for value in row])
@@ -189,7 +191,7 @@ def build_dataset_snapshot(rows: Iterable[Sequence[float]], snapshot_dir: Path) 
 
 
 def build_input_dataset_snapshot(
-    input_path: Path, snapshot_dir: Path
+    input_path: Path, snapshot_dir: Path, *, allow_duplicate_keys: bool = False
 ) -> dict[tuple[int, int, int], list[str]]:
     """Copy the exact files used by base training and index groups to relative snapshot files."""
     input_path = Path(input_path)
@@ -210,9 +212,15 @@ def build_input_dataset_snapshot(
             raise FileNotFoundError(f"No fixed-SF dataset files found in: {input_path}")
         for source, destination_name in sources:
             shutil.copy2(source, temp_dir / destination_name)
-            file_groups = group_rows(read_real_dataset(source), source=str(source))
+            file_groups = group_rows(
+                read_real_dataset(source, allow_duplicate_keys=allow_duplicate_keys),
+                source=str(source),
+                allow_duplicate_keys=allow_duplicate_keys,
+            )
             for key in file_groups:
-                relative_files.setdefault(key, []).append(f"dataset_snapshot/{destination_name}")
+                relative_files.setdefault(key, []).append(
+                    f"{snapshot_dir.name}/{destination_name}"
+                )
         if snapshot_dir.exists():
             shutil.rmtree(snapshot_dir)
         os.replace(temp_dir, snapshot_dir)
@@ -253,8 +261,13 @@ def build_dataset_manifest(
     changes: Mapping | None = None,
     split_strategy: str = "",
     relative_files_by_group: Mapping[tuple[int, int, int], Sequence[str]] | None = None,
+    allow_duplicate_keys: bool = False,
 ) -> dict:
-    grouped = group_rows(rows, source="manifest dataset")
+    grouped = group_rows(
+        rows,
+        source="manifest dataset",
+        allow_duplicate_keys=allow_duplicate_keys,
+    )
     source_types = source_types or {}
     groups = []
     for key, values in sorted(grouped.items()):

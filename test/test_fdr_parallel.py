@@ -48,6 +48,7 @@ def _rows():
 def _config():
     cfg = Config()
     cfg.epochs_stage1 = 1
+    cfg.epochs_stage2 = 1
     cfg.early_stop_patience_s1 = 0
     cfg.checkpoint_selection = "training"
     cfg.use_val_split = False
@@ -78,7 +79,10 @@ def main():
         )
         metadata = {
             "manifest": {"dataset_fingerprint": "parallel-smoke"},
-            "training_mode": "base_full_training",
+            "training_mode": "base_multifidelity_training",
+            "sim_dataset_fingerprint": "parallel-smoke-sim",
+            "fidelity_mode": "multifidelity",
+            "prediction_output": "high",
             "excitation_id": 1,
             "excitation_name": "FXD_DC",
             "channel_id": 8,
@@ -88,7 +92,8 @@ def main():
             tasks.append(
                 {
                     "cfg": _config(),
-                    "parsed_rows": _rows(),
+                    "sim_parsed": _rows(),
+                    "real_parsed": _rows(),
                     "model_version": "parallel-smoke",
                     "version_dir": str(version_dir),
                     "args": args,
@@ -107,7 +112,8 @@ def main():
                 1,
                 8,
                 component,
-                required_profile_version=4,
+                required_profile_version=5,
+                expected_fidelity_mode="multifidelity",
             )
             assert ready, reason
         ready, _reason = _resume_component_ready(version_dir, 1, 8, "residue_phase")

@@ -5,7 +5,7 @@ import torch
 
 from surrogate_model.config import Config
 from surrogate_model.data.normalizer import Normalizer
-from surrogate_model.models.blocks import TargetMFDNN
+from surrogate_model.models.blocks import TargetMFDNN, TargetMultifidelityMFDNN
 from surrogate_model.models.checkpoint_utils import build_model_from_checkpoint
 from surrogate_model.test.Predict_user import _run_infer_fdr_bundle_batched
 from surrogate_model.test.Predict_user import _build_yhat_and_slot_strings
@@ -69,6 +69,43 @@ def test_target_model_checkpoint_roundtrip():
     torch.testing.assert_close(norm, torch.ones_like(norm), atol=1e-5, rtol=1e-5)
 
 
+def test_multifidelity_target_checkpoint_roundtrip_returns_low_and_high():
+    torch.manual_seed(0)
+    cfg = _target_config(("freq",))
+    cfg.model_type = "TargetMultifidelityMFDNN"
+    model = TargetMultifidelityMFDNN(cfg)
+    checkpoint = {
+        "model_type": "TargetMultifidelityMFDNN",
+        "target_component": "frequency",
+        "target_names": ["freq"],
+        "model_target_names": ["freq"],
+        "model_state_dict": model.state_dict(),
+        "K_max": cfg.K_max,
+        "low_hidden": list(cfg.low_hidden),
+        "adapt_hidden": list(cfg.adapt_hidden),
+        "dropout_prob": cfg.dropout_prob,
+        "use_lora": False,
+        "use_modulation": cfg.use_modulation,
+        "modulation_mode": "legacy",
+        "mod_gamma": cfg.mod_gamma,
+        "embed_excitation_num": cfg.embed_excitation_num,
+        "embed_excitation_dim": cfg.embed_excitation_dim,
+        "embed_channel_num": cfg.embed_channel_num,
+        "embed_channel_dim": cfg.embed_channel_dim,
+        "pole_target": "freq_damping",
+        "residue_target": "polar",
+    }
+    restored = build_model_from_checkpoint(checkpoint)
+    low, high = restored(
+        torch.zeros(2, 1),
+        torch.zeros(2, 1),
+        torch.tensor([0, 1]),
+        torch.tensor([8, 9]),
+    )
+    assert low["freq"].shape == (2, 3)
+    assert high["freq"].shape == (2, 3)
+
+
 def test_fdr_defaults_restore_capacity_without_dropout():
     cfg = Config()
     assert cfg.fdr_component_low_hidden["frequency"] == [64, 128, 64]
@@ -79,9 +116,9 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_early_stop_patience["damping"] == 500
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["frequency"] == 0.05
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["damping"] is None
-    assert cfg.fdr_training_profile_version == 4
-    assert cfg.fdr_component_training_profile_version["frequency"] == 3
-    assert cfg.fdr_component_training_profile_version["damping"] == 4
+    assert cfg.fdr_training_profile_version == 5
+    assert set(cfg.fdr_component_training_profile_version.values()) == {5}
+    assert cfg.multifidelity_sim_loss_weight == 0.2
     assert cfg.damping_slope_weight == 0.0
     assert cfg.damping_curvature_weight == 0.0
 
@@ -114,25 +151,36 @@ def _normalizer(names, mean, std):
     )
 
 
+def _component_bundle(model, input_norm, output_norm, *, fidelity_mode="multifidelity"):
+    return {
+        "model": model,
+        "input_normalizer": input_norm,
+        "output_normalizer_sim": output_norm,
+        "output_normalizer_real": output_norm if fidelity_mode == "multifidelity" else None,
+        "fidelity_mode": fidelity_mode,
+        "prediction_output": "high" if fidelity_mode == "multifidelity" else "low",
+    }
+
+
 def test_fdr_inference_merges_components_and_reconstructs_physical_values():
     input_norm = _normalizer(("H", "M"), (0.0, 0.0), (1.0, 1.0))
     bundle = {
-        "frequency": (
+        "frequency": _component_bundle(
             _ConstantTargetModel({"freq": [10.0, 20.0, 30.0]}),
             input_norm,
             _normalizer(("freq",), (0.0,), (1.0,)),
         ),
-        "damping": (
+        "damping": _component_bundle(
             _ConstantTargetModel({"damping": [0.1, 0.2, 0.3]}),
             input_norm,
             _normalizer(("damping",), (0.0,), (1.0,)),
         ),
-        "residue_magnitude": (
+        "residue_magnitude": _component_bundle(
             _ConstantTargetModel({"magnitude": [1.0, 2.0, 3.0]}),
             input_norm,
             _normalizer(("magnitude",), (0.0,), (1.0,)),
         ),
-        "residue_phase": (
+        "residue_phase": _component_bundle(
             _ConstantTargetModel(
                 {"sin_theta": [0.0, 0.6, 1.0], "cos_theta": [1.0, 0.8, 0.0]}
             ),
@@ -226,16 +274,16 @@ def test_new_normalizer_metadata_decodes_fdr_outputs_to_physical_domain():
     damping = encode_numpy(np.asarray([0.01, 0.05, 0.149]), specs["damping"])
     magnitude = np.log(np.asarray([1e-3, 2.0, 5.0]))
     bundle = {
-        "frequency": (
+        "frequency": _component_bundle(
             _ConstantTargetModel({"freq": frequency}), input_norm, transformed_normalizer("freq")
         ),
-        "damping": (
+        "damping": _component_bundle(
             _ConstantTargetModel({"damping": damping}), input_norm, transformed_normalizer("damping")
         ),
-        "residue_magnitude": (
+        "residue_magnitude": _component_bundle(
             _ConstantTargetModel({"magnitude": magnitude}), input_norm, transformed_normalizer("magnitude")
         ),
-        "residue_phase": (
+        "residue_phase": _component_bundle(
             _ConstantTargetModel({"sin_theta": [0.0, 0.6, 1.0], "cos_theta": [1.0, 0.8, 0.0]}),
             input_norm,
             _normalizer(("sin_theta", "cos_theta"), (0.0, 0.0), (1.0, 1.0)),

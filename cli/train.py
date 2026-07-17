@@ -176,12 +176,16 @@ def _resume_component_ready(
     channel_id: int,
     component: str,
     required_profile_version: int | None = None,
+    expected_fidelity_mode: str | None = None,
 ) -> tuple[bool, str]:
     try:
-        required = (
+        required = [
             "model.pth", "Normalizer_Input.pth", "Normalizer_Output.pth",
+            "Normalizer_Input_Sim.pth", "Normalizer_Output_Sim.pth",
             "training_config.json", "train_log.csv", "slot_support.json",
-        )
+        ]
+        if expected_fidelity_mode == "multifidelity":
+            required.append("Normalizer_Output_Real_Fold0.pth")
         target_names = FDR_COMPONENT_TARGETS[component]
         component_dir = output_dir / component
         missing = [name for name in required if not (component_dir / name).is_file()]
@@ -193,14 +197,23 @@ def _resume_component_ready(
             checkpoint = torch.load(component_dir / "model.pth", map_location="cpu")
         if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
             return False, "checkpoint has no model_state_dict"
-        if checkpoint.get("model_type") != "TargetMFDNN":
-            return False, "checkpoint is not TargetMFDNN"
+        if checkpoint.get("model_type") != "TargetMultifidelityMFDNN":
+            return False, "checkpoint is not TargetMultifidelityMFDNN"
+        checkpoint_fidelity_mode = str(checkpoint.get("fidelity_mode", ""))
+        if (
+            (expected_fidelity_mode == "multifidelity" or checkpoint_fidelity_mode == "multifidelity")
+            and not (component_dir / "Normalizer_Output_Real_Fold0.pth").is_file()
+        ):
+            return False, "missing Normalizer_Output_Real_Fold0.pth"
         if tuple(checkpoint.get("target_names", ())) != tuple(target_names):
             return False, "checkpoint target_names mismatch"
         for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
             if key in checkpoint and int(checkpoint[key]) != int(expected):
                 return False, f"checkpoint {key}={checkpoint[key]} does not match {expected}"
-        for filename in ("Normalizer_Input.pth", "Normalizer_Output.pth"):
+        for filename in (
+            "Normalizer_Input.pth", "Normalizer_Output.pth",
+            "Normalizer_Input_Sim.pth", "Normalizer_Output_Sim.pth",
+        ):
             normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
             if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
                 return False, f"invalid {filename}"
@@ -215,6 +228,19 @@ def _resume_component_ready(
             return False, "training_config excitation_id mismatch"
         if int(training_config.get("channel_id", channel_id)) != int(channel_id):
             return False, "training_config channel_id mismatch"
+        actual_fidelity_mode = str(
+            training_config.get(
+                "fidelity_mode", checkpoint.get("fidelity_mode", "")
+            )
+        )
+        if (
+            expected_fidelity_mode is not None
+            and actual_fidelity_mode != str(expected_fidelity_mode)
+        ):
+            return False, (
+                f"fidelity mode {actual_fidelity_mode!r} does not match "
+                f"{expected_fidelity_mode!r}"
+            )
         if required_profile_version is not None:
             actual_profile_version = int(
                 dict(training_config.get("training", {}) or {}).get(
@@ -258,7 +284,8 @@ def _train_component_worker(task: dict) -> dict:
     try:
         run_component_training(
             cfg=task["cfg"],
-            parsed_rows=task["parsed_rows"],
+            sim_parsed=task.get("sim_parsed", task.get("parsed_rows")),
+            real_parsed=task.get("real_parsed", task.get("parsed_rows", [])),
             model_version=task["model_version"],
             version_dir=Path(task["version_dir"]),
             args=task["args"],
@@ -299,11 +326,12 @@ def main():
 
     paths_ini_path = Path(lines[0].strip()).expanduser()
     model_version = lines[1].strip()
+    sim_dataset_path = base_dir / "sim_dataset"
     real_dataset_path = base_dir / "real_dataset"
-    if not real_dataset_path.is_dir():
+    if not sim_dataset_path.is_dir() or not real_dataset_path.is_dir():
         raise FileNotFoundError(
-            f"Base training requires a real_dataset directory next to the CLI entry: "
-            f"{real_dataset_path}"
+            "Multifidelity training requires both dataset directories next to the CLI entry: "
+            f"sim={sim_dataset_path}, real={real_dataset_path}"
         )
     model_dir = _default_model_dir(base_dir, paths_ini_path)
 
@@ -332,6 +360,16 @@ def main():
         help="Select the best checkpoint by validation group_FXD loss (default) or total training loss.",
     )
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--epochs_s1", type=int, default=None)
+    parser.add_argument("--epochs_s2", type=int, default=None)
+    parser.add_argument("--lr_high", type=float, default=None)
+    parser.add_argument("--batch_sim", type=int, default=None)
+    parser.add_argument(
+        "--freeze_low_stage2",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Freeze the simulation low head during real-data correction.",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -409,7 +447,9 @@ def main():
         )
     _enable_fast_cuda(args)
 
+    sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
     real_rows = read_real_dataset(real_dataset_path)
+    sim_parsed, sim_stats = parse_rows_to_struct(sim_rows)
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
     cfg = Config()
@@ -449,6 +489,17 @@ def main():
         cfg.checkpoint_selection = str(args.checkpoint_selection)
     if args.epochs is not None:
         cfg.epochs_stage1 = int(args.epochs)
+        cfg.epochs_stage2 = int(args.epochs)
+    if args.epochs_s1 is not None:
+        cfg.epochs_stage1 = int(args.epochs_s1)
+    if args.epochs_s2 is not None:
+        cfg.epochs_stage2 = int(args.epochs_s2)
+    if args.lr_high is not None:
+        cfg.lr_high_adam = float(args.lr_high)
+    if args.batch_sim is not None:
+        cfg.batch_sim = int(args.batch_sim)
+    if args.freeze_low_stage2 is not None:
+        cfg.freeze_low_stage2 = bool(args.freeze_low_stage2)
     if args.batch_real is not None:
         cfg.batch_real = int(args.batch_real)
     if args.num_workers is not None:
@@ -483,8 +534,8 @@ def main():
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
     cfg.K_max = 3
-    cfg.embed_channel_num = real_stats["channel_num"]
-    cfg.embed_excitation_num = real_stats["excitation_num"]
+    cfg.embed_channel_num = max(sim_stats["channel_num"], real_stats["channel_num"])
+    cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
     if cfg.pole_target != "freq_damping" or cfg.residue_target != "polar":
         raise ValueError(
             "FDR split training requires pole_target='freq_damping' and residue_target='polar'"
@@ -508,10 +559,28 @@ def main():
             relative_files_by_group=relative_files_by_group,
         )
         atomic_write_json(model_root / "dataset_manifest.json", manifest)
+        sim_relative_files = build_input_dataset_snapshot(
+            sim_dataset_path,
+            model_root / "sim_dataset_snapshot",
+            allow_duplicate_keys=True,
+        )
+        sim_keys = sorted({group_key_from_parsed(row) for row in sim_parsed})
+        sim_manifest = build_dataset_manifest(
+            rows=sim_rows,
+            model_version=f"{model_version}_sim",
+            snapshot_dir=model_root / "sim_dataset_snapshot",
+            train_group_keys=sim_keys,
+            validation_group_keys=[],
+            split_strategy="sim_all_rows",
+            relative_files_by_group=sim_relative_files,
+            allow_duplicate_keys=True,
+        )
+        atomic_write_json(model_root / "sim_dataset_manifest.json", sim_manifest)
     if ddp_enabled:
         dist.barrier()
     if ddp_enabled and rank != 0:
         manifest = load_json(model_root / "dataset_manifest.json")
+        sim_manifest = load_json(model_root / "sim_dataset_manifest.json")
 
     if args.kfold > 1:
         raise ValueError("Per-excitation/channel training currently requires --kfold 0 or 1")
@@ -522,7 +591,9 @@ def main():
     tasks = []
     component_states = {}
     combination_info = {}
-    all_combinations = combinations_in_rows(real_parsed)
+    all_combinations = sorted(
+        set(combinations_in_rows(sim_parsed)) | set(combinations_in_rows(real_parsed))
+    )
     selected_excitations = _resolve_id_selection(
         args.excitation, EXCITATION_NAMES, "excitation"
     )
@@ -547,10 +618,16 @@ def main():
             flush=True,
         )
         rows_by_combination = {
-            key: [
-                row for row in real_parsed
-                if (int(row.exc_id), int(row.ch_id)) == key
-            ]
+            key: (
+                [
+                    row for row in real_parsed
+                    if (int(row.exc_id), int(row.ch_id)) == key
+                ]
+                or [
+                    row for row in sim_parsed
+                    if (int(row.exc_id), int(row.ch_id)) == key
+                ]
+            )
             for key in all_combinations
         }
         for excitation_id, channel_id in all_combinations:
@@ -562,11 +639,21 @@ def main():
                 output_dir, excitation_id, channel_id
             )
             if ready:
+                sim_count = sum(
+                    (int(row.exc_id), int(row.ch_id)) == key for row in sim_parsed
+                )
+                real_count = sum(
+                    (int(row.exc_id), int(row.ch_id)) == key for row in real_parsed
+                )
+                fidelity_mode = "multifidelity" if real_count else "sim_only"
                 trained_models[key] = model_entry(
                     excitation_id=excitation_id,
                     channel_id=channel_id,
                     row_count=len(rows_by_combination[key]),
                     status="retained",
+                    fidelity_mode=fidelity_mode,
+                    sim_row_count=sim_count,
+                    real_row_count=real_count,
                 )
         print(
             f"[SELECTION] retained_unselected_complete_models={len(trained_models)}",
@@ -574,27 +661,50 @@ def main():
         )
     for index, (excitation_id, channel_id) in enumerate(combinations, 1):
         key = (excitation_id, channel_id)
+        combo_sim_rows = [
+            row for row in sim_parsed
+            if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
+        ]
         combo_rows = [
             row for row in real_parsed
             if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
         ]
+        fidelity_mode = "multifidelity" if combo_rows else "sim_only"
         combo_cfg = copy.deepcopy(cfg)
         available_keys = {group_key_from_parsed(row) for row in combo_rows}
         combo_cfg.explicit_train_group_keys = sorted(set(train_group_keys) & available_keys)
         combo_cfg.explicit_validation_group_keys = sorted(set(validation_group_keys) & available_keys)
-        combo_cfg.require_validation = combo_cfg.checkpoint_selection == "validation"
+        combo_cfg.require_validation = bool(
+            combo_rows
+            and combo_cfg.checkpoint_selection == "validation"
+            and combo_cfg.explicit_validation_group_keys
+        )
+        if not combo_rows or (
+            combo_cfg.checkpoint_selection == "validation"
+            and not combo_cfg.explicit_validation_group_keys
+        ):
+            combo_cfg.checkpoint_selection = "training"
         combo_cfg.validation_metric_scope = "all"
         output_dir = combination_dir(model_root, excitation_id, channel_id)
         label = f"{excitation_name(excitation_id)}/{channel_name(channel_id)}"
         print(
             f"========== Queue model {index}/{len(combinations)}: "
-            f"{label}, rows={len(combo_rows)} ==========",
+            f"{label}, sim_rows={len(combo_sim_rows)}, real_rows={len(combo_rows)}, "
+            f"mode={fidelity_mode} ==========",
             flush=True,
         )
-        combination_info[key] = {"row_count": len(combo_rows), "label": label}
+        combination_info[key] = {
+            "row_count": len(combo_rows) or len(combo_sim_rows),
+            "sim_row_count": len(combo_sim_rows),
+            "real_row_count": len(combo_rows),
+            "fidelity_mode": fidelity_mode,
+            "label": label,
+        }
         component_states[key] = {}
         try:
-            if not combo_cfg.explicit_train_group_keys:
+            if not combo_sim_rows:
+                raise RuntimeError("No simulation data is available for this combination")
+            if combo_rows and not combo_cfg.explicit_train_group_keys:
                 raise RuntimeError("No training operating points are available for this combination")
             if combo_cfg.require_validation and not combo_cfg.explicit_validation_group_keys:
                 raise RuntimeError("No validation operating points are available for this combination")
@@ -616,9 +726,23 @@ def main():
             continue
 
         dataset_metadata = {
-            "manifest": manifest,
-            "dataset_manifest_path": "../../../dataset_manifest.json",
-            "training_mode": "base_full_training",
+            "manifest": manifest if combo_rows else sim_manifest,
+            "dataset_manifest_path": (
+                "../../../dataset_manifest.json"
+                if combo_rows
+                else "../../../sim_dataset_manifest.json"
+            ),
+            "training_mode": (
+                "base_multifidelity_training"
+                if combo_rows
+                else "base_sim_only_training"
+            ),
+            "sim_dataset_fingerprint": sim_manifest["dataset_fingerprint"],
+            "dataset_snapshot_root": (
+                "dataset_snapshot" if combo_rows else "sim_dataset_snapshot"
+            ),
+            "fidelity_mode": fidelity_mode,
+            "prediction_output": "high" if combo_rows else "low",
             "model_filename": "model.pth",
             "excitation_id": excitation_id,
             "excitation_name": excitation_name(excitation_id),
@@ -635,6 +759,7 @@ def main():
                     required_profile_version=_required_component_profile_version(
                         combo_cfg, component
                     ),
+                    expected_fidelity_mode=fidelity_mode,
                 )
                 if ready:
                     component_states[key][component] = "resumed"
@@ -646,7 +771,8 @@ def main():
             tasks.append(
                 {
                     "cfg": combo_cfg,
-                    "parsed_rows": combo_rows,
+                    "sim_parsed": combo_sim_rows,
+                    "real_parsed": combo_rows,
                     "model_version": model_version,
                     "version_dir": str(output_dir),
                     "args": args,
@@ -661,8 +787,11 @@ def main():
             trained_models[key] = model_entry(
                 excitation_id=excitation_id,
                 channel_id=channel_id,
-                row_count=len(combo_rows),
+                row_count=len(combo_rows) or len(combo_sim_rows),
                 status="resumed",
+                fidelity_mode=fidelity_mode,
+                sim_row_count=len(combo_sim_rows),
+                real_row_count=len(combo_rows),
             )
 
     def write_progress_inventory():
@@ -685,6 +814,7 @@ def main():
                 required_profile_version=_required_component_profile_version(
                     cfg, component
                 ),
+                expected_fidelity_mode=info["fidelity_mode"],
             )
             if ready:
                 component_states[key][component] = "trained"
@@ -730,6 +860,9 @@ def main():
                 channel_id=key[1],
                 row_count=info["row_count"],
                 status=status,
+                fidelity_mode=info["fidelity_mode"],
+                sim_row_count=info["sim_row_count"],
+                real_row_count=info["real_row_count"],
             )
             print(f"[MODEL-COMPLETE] {info['label']} status={status}", flush=True)
         write_progress_inventory()

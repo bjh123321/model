@@ -8,14 +8,18 @@ from typing import Mapping
 import torch
 
 from surrogate_model.config import Config
-from surrogate_model.models.blocks import MFDNN, TargetMFDNN
+from surrogate_model.models.blocks import (
+    MFDNN,
+    TargetMFDNN,
+    TargetMultifidelityMFDNN,
+)
 
 
 STRUCTURE_FIELDS = (
     "K_max", "embed_excitation_num", "embed_excitation_dim", "embed_channel_num",
     "embed_channel_dim", "low_hidden", "dropout_prob", "use_lora", "lora_rank",
     "lora_alpha", "lora_dropout", "lora_target_hidden_indices", "use_modulation",
-    "mod_gamma", "pole_target", "residue_target",
+    "mod_gamma", "pole_target", "residue_target", "adapt_hidden",
     "model_type", "model_target_names", "target_component",
 )
 
@@ -159,17 +163,21 @@ def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool 
     return cfg
 
 
-def build_model_from_checkpoint(checkpoint: Mapping, *, device=None, checkpoint_path: str | Path = "<memory>") -> MFDNN | TargetMFDNN:
+def build_model_from_checkpoint(checkpoint: Mapping, *, device=None, checkpoint_path: str | Path = "<memory>") -> MFDNN | TargetMFDNN | TargetMultifidelityMFDNN:
     state = checkpoint_state_dict(checkpoint)
     cfg = restore_model_config_from_checkpoint(checkpoint)
     model_type = str(checkpoint.get("model_type", getattr(cfg, "model_type", "MFDNN")))
-    if model_type == "TargetMFDNN":
+    if model_type in {"TargetMFDNN", "TargetMultifidelityMFDNN"}:
         target_names = checkpoint.get("target_names", getattr(cfg, "model_target_names", None))
         if not target_names:
-            raise RuntimeError(f"TargetMFDNN checkpoint {checkpoint_path} has no target_names metadata")
+            raise RuntimeError(f"Target checkpoint {checkpoint_path} has no target_names metadata")
         cfg.model_target_names = [str(name) for name in target_names]
         cfg.target_component = str(checkpoint.get("target_component", getattr(cfg, "target_component", "")))
-        model = TargetMFDNN(cfg)
+        model = (
+            TargetMultifidelityMFDNN(cfg)
+            if model_type == "TargetMultifidelityMFDNN"
+            else TargetMFDNN(cfg)
+        )
     elif model_type in {"MFDNN", "MFDNN_fixed_single_fidelity"}:
         model = MFDNN(cfg)
     else:

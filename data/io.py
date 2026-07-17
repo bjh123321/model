@@ -22,7 +22,7 @@ def _parse_float_cell(cell: str) -> float:
 
 
 SPLIT_DATASET_NAME_RE = re.compile(
-    r"^SF_XGD_(FXD|PW|JFY)_(FDC|DC)_H(\d+)_M(\d+)(?:_(\d+))?\.txt$",
+    r"^(?:SF|FZ)_XGD_(FXD|PW|JFY)_(FDC|DC)_H(\d+)_M(\d+)(?:_(\d+))?\.txt$",
     re.IGNORECASE,
 )
 SPLIT_EXCITATION_IDS = {
@@ -89,8 +89,8 @@ def _validate_split_dataset_file(path: Path, rows: List[List[float]]) -> None:
             )
 
 
-def read_real_dataset(path: Path) -> List[List[float]]:
-    """Read either one legacy txt file or a directory of SF_XGD split txt files."""
+def read_real_dataset(path: Path, *, allow_duplicate_keys: bool = False) -> List[List[float]]:
+    """Read one dataset file or a directory of SF/FZ split files."""
     path = Path(path)
     if path.is_file():
         rows = read_variable_txt(path, strict=True)
@@ -118,20 +118,21 @@ def read_real_dataset(path: Path) -> List[List[float]]:
                 flush=True,
             )
             return rows
-        raise FileNotFoundError(f"No SF_XGD_*.txt split-dataset files found in: {path}")
+        raise FileNotFoundError(f"No SF_XGD_*.txt or FZ_XGD_*.txt split-dataset files found in: {path}")
 
     rows: List[List[float]] = []
     for txt_path in files:
         file_rows = read_variable_txt(txt_path, strict=True)
         _validate_split_dataset_file(txt_path, file_rows)
-        file_seen_keys = set()
-        for line_no, row in enumerate(file_rows, start=1):
-            key = (float(row[0]), float(row[1]), int(round(float(row[2]))), int(round(float(row[3]))))
-            if key in file_seen_keys:
-                raise ValueError(
-                    f"Duplicate (H, M, excitation, channel) sample {key} within {txt_path}:{line_no}"
-                )
-            file_seen_keys.add(key)
+        if not allow_duplicate_keys:
+            file_seen_keys = set()
+            for line_no, row in enumerate(file_rows, start=1):
+                key = (float(row[0]), float(row[1]), int(round(float(row[2]))), int(round(float(row[3]))))
+                if key in file_seen_keys:
+                    raise ValueError(
+                        f"Duplicate (H, M, excitation, channel) sample {key} within {txt_path}:{line_no}"
+                    )
+                file_seen_keys.add(key)
         rows.extend(file_rows)
 
     print(f"[DATA] loaded split real dataset: files={len(files)}, rows={len(rows)}, path={path}", flush=True)

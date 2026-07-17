@@ -24,6 +24,7 @@ from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
     build_dataset_snapshot,
+    build_input_dataset_snapshot,
     group_key_from_parsed,
     group_rows,
     load_json,
@@ -95,7 +96,7 @@ def _restore_parent_configuration(
         training = parent_training.get("training", {})
         targets = parent_training.get("targets", {})
         for name in (
-            "K_max", "low_hidden", "dropout_prob", "embed_excitation_num",
+            "K_max", "low_hidden", "adapt_hidden", "dropout_prob", "embed_excitation_num",
             "embed_excitation_dim", "embed_channel_num", "embed_channel_dim",
             "use_modulation", "mod_gamma",
         ):
@@ -105,13 +106,17 @@ def _restore_parent_configuration(
         cfg.residue_target = canonical_residue_target(targets.get("residue_target", cfg.residue_target))
         mapping = {
             "learning_rate": "lr_low_adam",
+            "learning_rate_high": "lr_high_adam",
             "weight_decay": "weight_decay",
             "batch_size": "batch_real",
+            "batch_sim": "batch_sim",
             "epochs": "epochs_stage1",
+            "epochs_stage2": "epochs_stage2",
             "num_workers": "num_workers",
             "prefetch": "prefetch",
             "checkpoint_selection": "checkpoint_selection",
             "early_stop_patience": "early_stop_patience_s1",
+            "early_stop_patience_stage2": "early_stop_patience_s2",
             "early_stop_min_delta": "early_stop_min_delta",
         }
         for source, destination in mapping.items():
@@ -179,6 +184,14 @@ def _apply_cli_overrides(cfg: Config, args) -> None:
         value = getattr(args, source, None)
         if value is not None:
             setattr(cfg, destination, value)
+    if args.epochs is not None:
+        cfg.epochs_stage2 = int(args.epochs)
+    if getattr(args, "epochs_s2", None) is not None:
+        cfg.epochs_stage2 = int(args.epochs_s2)
+    if getattr(args, "lr_high", None) is not None:
+        cfg.lr_high_adam = float(args.lr_high)
+    if getattr(args, "batch_sim", None) is not None:
+        cfg.batch_sim = int(args.batch_sim)
     if args.pole_target is not None:
         cfg.pole_target = canonical_pole_target(args.pole_target)
     if args.residue_target is not None:
@@ -189,6 +202,9 @@ def _apply_cli_overrides(cfg: Config, args) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--epochs_s2", type=int, default=None)
+    parser.add_argument("--lr_high", type=float, default=None)
+    parser.add_argument("--batch_sim", type=int, default=None)
     parser.add_argument("--batch_real", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--weight_decay", type=float, default=None)
@@ -210,6 +226,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main():
+    args = _parser().parse_args()
     base_dir = get_exe_dir()
     with (base_dir / "user_input.dat").open("r", encoding="utf-8") as handle:
         lines = [line.strip() for line in handle]
@@ -229,12 +246,19 @@ def main():
     validate_new_version_directory(base_version_dir, new_version_dir)
     parent_inventory = load_model_inventory(base_version_dir)
     parent_models = inventory_index(parent_inventory)
-    args = _parser().parse_args()
     if args.device is None:
         args.device = "auto"
     args.kfold = 0
     args.debug_overfit_n = 0
     args.debug_overfit_offset = 0
+
+    sim_dataset_path = base_dir / "sim_dataset"
+    if not sim_dataset_path.is_dir():
+        raise FileNotFoundError(
+            f"Multifidelity correction requires sim dataset: {sim_dataset_path}"
+        )
+    sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
+    sim_parsed, sim_stats = parse_rows_to_struct(sim_rows)
 
     cfg, _representative_parent_training = _restore_parent_configuration(
         base_version_dir, parent_inventory
@@ -292,8 +316,12 @@ def main():
     group_rows(correction_rows, source="selected correction files")
     merged_rows, merge_info = merge_dataset_rows(parent_rows, correction_rows)
     parsed_rows, stats = parse_rows_to_struct(merged_rows)
-    cfg.embed_channel_num = max(int(cfg.embed_channel_num), int(stats["channel_num"]))
-    cfg.embed_excitation_num = max(int(cfg.embed_excitation_num), int(stats["excitation_num"]))
+    cfg.embed_channel_num = max(
+        int(cfg.embed_channel_num), int(stats["channel_num"]), int(sim_stats["channel_num"])
+    )
+    cfg.embed_excitation_num = max(
+        int(cfg.embed_excitation_num), int(stats["excitation_num"]), int(sim_stats["excitation_num"])
+    )
 
     correction_keys = set(merge_info["correction_group_keys"])
     if parent_manifest is not None:
@@ -352,6 +380,23 @@ def main():
         list(key) for key in sorted(removed_from_validation)
     ]
     atomic_write_json(new_version_dir / "dataset_manifest.json", manifest)
+    sim_relative_files = build_input_dataset_snapshot(
+        sim_dataset_path,
+        new_version_dir / "sim_dataset_snapshot",
+        allow_duplicate_keys=True,
+    )
+    sim_keys = sorted({group_key_from_parsed(row) for row in sim_parsed})
+    sim_manifest = build_dataset_manifest(
+        rows=sim_rows,
+        model_version=f"{new_model_version}_sim",
+        snapshot_dir=new_version_dir / "sim_dataset_snapshot",
+        train_group_keys=sim_keys,
+        validation_group_keys=[],
+        split_strategy="sim_all_rows",
+        relative_files_by_group=sim_relative_files,
+        allow_duplicate_keys=True,
+    )
+    atomic_write_json(new_version_dir / "sim_dataset_manifest.json", sim_manifest)
 
     target_names = [name for names in FDR_COMPONENT_TARGETS.values() for name in names]
     inherited_models = copy_parent_model_directories(
@@ -365,6 +410,10 @@ def main():
     correction_parsed, _ = parse_rows_to_struct(correction_rows)
     affected_combinations = combinations_in_rows(correction_parsed)
     for index, (excitation_id, channel_id) in enumerate(affected_combinations, 1):
+        combo_sim_rows = [
+            row for row in sim_parsed
+            if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
+        ]
         combo_rows = [
             row for row in parsed_rows
             if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
@@ -392,6 +441,8 @@ def main():
             available_keys = {group_key_from_parsed(row) for row in combo_rows}
             combo_train_keys = set(train_keys) & available_keys
             combo_validation_keys = set(validation_keys) & available_keys
+            if not combo_sim_rows:
+                raise RuntimeError("No simulation data is available for this combination")
             if not combo_rows or not combo_train_keys:
                 raise RuntimeError("No merged training data is available for this combination")
 
@@ -400,24 +451,39 @@ def main():
                 combo_cfg.explicit_validation_group_keys = sorted(combo_validation_keys)
                 combo_cfg.require_validation = True
             else:
-                if parent_entry is None:
-                    raise RuntimeError(
-                        "No validation data remains and no parent FDR model is available for early stopping"
-                    )
-                parent_loss_targets = _parent_component_train_losses(
-                    base_version_dir, parent_entry
-                )
                 combo_cfg.checkpoint_selection = "training"
                 combo_cfg.explicit_train_group_keys = sorted(available_keys)
                 combo_cfg.explicit_validation_group_keys = []
                 combo_cfg.require_validation = False
-                combo_cfg.parent_train_loss_targets = parent_loss_targets
-                combo_cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
-                print(
-                    f"[CORRECTION] {label}: all rows train; component train_loss targets="
-                    f"{parent_loss_targets}, then {combo_cfg.epochs_after_parent_loss} epochs.",
-                    flush=True,
+                parent_fidelity = (
+                    None
+                    if parent_entry is None
+                    else str(parent_entry.get("fidelity_mode", "multifidelity"))
                 )
+                if parent_entry is not None and parent_fidelity == "multifidelity":
+                    parent_loss_targets = _parent_component_train_losses(
+                        base_version_dir, parent_entry
+                    )
+                    combo_cfg.parent_train_loss_targets = parent_loss_targets
+                    combo_cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
+                    print(
+                        f"[CORRECTION] {label}: all rows train; component train_loss targets="
+                        f"{parent_loss_targets}, then {combo_cfg.epochs_after_parent_loss} epochs.",
+                        flush=True,
+                    )
+                else:
+                    # A simulation-only parent has no comparable real-data loss.
+                    # When real samples first arrive, train the new correction head
+                    # for the configured stage-2 epochs and select by real train loss.
+                    if hasattr(combo_cfg, "parent_train_loss_targets"):
+                        delattr(combo_cfg, "parent_train_loss_targets")
+                    print(
+                        f"[CORRECTION] {label}: upgrading "
+                        f"{parent_fidelity or 'new'} model to multifidelity; "
+                        "no real validation or comparable parent real-loss target, "
+                        "so stage 2 selects by real training loss.",
+                        flush=True,
+                    )
 
             combo_correction_keys = {
                 group_key_from_parsed(row) for row in correction_parsed
@@ -425,7 +491,8 @@ def main():
             }
             run_full_training(
                 cfg=combo_cfg,
-                parsed_rows=combo_rows,
+                sim_parsed=combo_sim_rows,
+                real_parsed=combo_rows,
                 model_version=new_model_version,
                 version_dir=training_dir,
                 args=args,
@@ -433,6 +500,9 @@ def main():
                     "manifest": manifest,
                     "dataset_manifest_path": "../../../dataset_manifest.json",
                     "training_mode": "correction_full_retrain",
+                    "sim_dataset_fingerprint": sim_manifest["dataset_fingerprint"],
+                    "fidelity_mode": "multifidelity",
+                    "prediction_output": "high",
                     "model_filename": "model.pth",
                     "parent_model_version": base_model_version,
                     "parent_dataset_fingerprint": None if parent_manifest is None else parent_manifest.get("dataset_fingerprint"),
@@ -454,6 +524,9 @@ def main():
                 row_count=len(combo_rows),
                 status="corrected",
                 source_model_version=base_model_version,
+                fidelity_mode="multifidelity",
+                sim_row_count=len(combo_sim_rows),
+                real_row_count=len(combo_rows),
             )
         except Exception as exc:
             if training_dir.exists():

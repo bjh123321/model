@@ -537,7 +537,13 @@ class ExcitationChannelModelRegistry:
                 )
             checkpoint_path = self.version_dir / component_entry["checkpoint"]
             input_normalizer_path = self.version_dir / component_entry["normalizer_input"]
-            output_normalizer_path = self.version_dir / component_entry["normalizer_output"]
+            sim_output_path = self.version_dir / component_entry.get(
+                "normalizer_output_sim", component_entry["normalizer_output"]
+            )
+            real_output_value = component_entry.get("normalizer_output_real")
+            real_output_path = (
+                None if not real_output_value else self.version_dir / real_output_value
+            )
             try:
                 checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
             except TypeError:
@@ -546,18 +552,49 @@ class ExcitationChannelModelRegistry:
                 checkpoint, device=self.device, checkpoint_path=checkpoint_path
             )
             input_normalizer = Normalizer.load(input_normalizer_path)
-            output_normalizer = Normalizer.load(output_normalizer_path)
+            sim_output_normalizer = Normalizer.load(sim_output_path)
+            real_output_normalizer = (
+                None if real_output_path is None else Normalizer.load(real_output_path)
+            )
             if len(input_normalizer.mean) != 2 or len(input_normalizer.std) != 2:
                 raise RuntimeError(
                     f"{input_normalizer_path} must describe [H, M], got "
                     f"mean={input_normalizer.mean}, std={input_normalizer.std}"
                 )
-            if tuple(output_normalizer.target_names()) != tuple(expected_targets):
-                raise RuntimeError(
-                    f"{output_normalizer_path} target mismatch: expected={list(expected_targets)}, "
-                    f"got={output_normalizer.target_names()}"
+            for normalizer_path, output_normalizer in (
+                (sim_output_path, sim_output_normalizer),
+                (real_output_path, real_output_normalizer),
+            ):
+                if output_normalizer is None:
+                    continue
+                if tuple(output_normalizer.target_names()) != tuple(expected_targets):
+                    raise RuntimeError(
+                        f"{normalizer_path} target mismatch: expected={list(expected_targets)}, "
+                        f"got={output_normalizer.target_names()}"
+                    )
+            fidelity_mode = str(
+                component_entry.get(
+                    "fidelity_mode", checkpoint.get("fidelity_mode", "multifidelity")
                 )
-            bundle[component] = (selected_model, input_normalizer, output_normalizer)
+            )
+            prediction_output = str(
+                component_entry.get(
+                    "prediction_output", checkpoint.get("prediction_output", "high")
+                )
+            )
+            bundle[component] = {
+                "model": selected_model,
+                "input_normalizer": input_normalizer,
+                "output_normalizer_sim": sim_output_normalizer,
+                "output_normalizer_real": real_output_normalizer,
+                "fidelity_mode": fidelity_mode,
+                "prediction_output": prediction_output,
+            }
+            output_normalizer = (
+                real_output_normalizer
+                if prediction_output == "high" and real_output_normalizer is not None
+                else sim_output_normalizer
+            )
             low_confidence = [
                 int(item.get("slot_number", index + 1))
                 for index, item in enumerate(dict(output_normalizer.support or {}).get("slots", []))
@@ -580,7 +617,7 @@ class ExcitationChannelModelRegistry:
     @property
     def kmax(self) -> int:
         bundle = self.get(*min(self.entries))
-        return int(bundle["frequency"][0].cfg.K_max)
+        return int(bundle["frequency"]["model"].cfg.K_max)
 
 
 @torch.no_grad()
@@ -594,6 +631,7 @@ def _run_infer_fdr_bundle_batched(
     batch_size: int = 20000,
     mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
     extrapolation_policy: str = "clip",
+    predict_output: str = "high",
 ):
     extrapolation_policy = str(extrapolation_policy).lower()
     if extrapolation_policy not in {"clip", "mask", "allow"}:
@@ -603,7 +641,24 @@ def _run_infer_fdr_bundle_batched(
     expected_kmax = None
     count = len(H_all)
     for component, target_names in FDR_COMPONENT_TARGETS.items():
-        model, input_normalizer, output_normalizer = bundle[component]
+        component_bundle = bundle[component]
+        model = component_bundle["model"]
+        input_normalizer = component_bundle["input_normalizer"]
+        selected_output = (
+            "low"
+            if component_bundle["fidelity_mode"] == "sim_only"
+            or component_bundle["prediction_output"] == "low"
+            else str(predict_output)
+        )
+        output_normalizer = (
+            component_bundle["output_normalizer_real"]
+            if selected_output == "high"
+            else component_bundle["output_normalizer_sim"]
+        )
+        if output_normalizer is None:
+            raise RuntimeError(
+                f"FDR component {component!r} has no {selected_output} output normalizer"
+            )
         kmax = int(model.cfg.K_max)
         if expected_kmax is None:
             expected_kmax = kmax
@@ -632,9 +687,13 @@ def _run_infer_fdr_bundle_batched(
                     np.stack([h_input, m_input], axis=1), dtype=torch.float32
                 )
                 hm_norm = input_normalizer.transform(hm).to(device)
-                return model(
+                model_output = model(
                     hm_norm[:, :1], hm_norm[:, 1:], excitation_tensor, channel_tensor
                 )
+                if isinstance(model_output, tuple):
+                    out_low, out_high = model_output
+                    return out_low if selected_output == "low" else out_high
+                return model_output
 
             if extrapolation_policy == "clip" and support_slots:
                 normalized_by_name = {
@@ -807,6 +866,7 @@ def run_infer_batched(
             batch_size=batch_size,
             mode_freq_ranges=mode_freq_ranges,
             extrapolation_policy=extrapolation_policy,
+            predict_output=predict_output,
         )
         for name in combined:
             combined[name][selected] = output[name]
@@ -1270,9 +1330,9 @@ def main():
     )
     parser.add_argument(
         "--predict_output",
-        choices=["low"],
-        default="low",
-        help="Fixed-SF only has low-network output.",
+        choices=["high", "low"],
+        default="high",
+        help="Use real-corrected high output by default, or inspect the sim low output.",
     )
     parser.add_argument(
         "--use_freq_filter",
