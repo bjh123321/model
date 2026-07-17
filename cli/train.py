@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import copy
+import math
 import multiprocessing as mp
 import os
 import socket
@@ -102,6 +103,115 @@ def _filter_combinations(combinations, selected_excitations=None, selected_chann
     ]
 
 
+def _resolve_height_selection(raw_values) -> list[float] | None:
+    """Resolve repeatable comma/semicolon-separated finite height values."""
+    if not raw_values:
+        return None
+    selected = []
+    for raw in raw_values:
+        for token in str(raw).replace(";", ",").split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                value = float(token)
+            except ValueError as exc:
+                raise ValueError(f"Invalid height selector {token!r}; expected a number") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"Invalid height selector {token!r}; height must be finite")
+            selected.append(value)
+    if not selected:
+        raise ValueError("At least one height selector is required")
+    return sorted(set(selected))
+
+
+def _filter_rows_by_heights(rows, selected_heights, height_tolerance: float):
+    if selected_heights is None:
+        return list(rows)
+    tolerance = float(height_tolerance)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("Height-selection tolerance must be a finite non-negative value")
+    return [
+        row
+        for row in rows
+        if any(abs(float(row.H) - height) <= tolerance for height in selected_heights)
+    ]
+
+
+def _configure_validation_for_height_selection(cfg, selected_heights, real_parsed) -> None:
+    """Keep validation usable after restricting the dataset to selected heights."""
+    if selected_heights is None or not real_parsed or not bool(cfg.use_val_split):
+        return
+    tolerance = float(cfg.val_height_tol)
+    real_heights = [
+        height
+        for height in selected_heights
+        if any(abs(float(row.H) - height) <= tolerance for row in real_parsed)
+    ]
+    strategy = str(getattr(cfg, "val_split_strategy", "")).lower()
+    if strategy == "height_max_mach":
+        cfg.val_heights = real_heights
+        return
+    if strategy != "height_mach_points":
+        return
+
+    configured_points = [
+        (float(point[0]), float(point[1]))
+        for point in getattr(cfg, "val_height_mach_points", [])
+    ]
+    matching_points = [
+        point
+        for point in configured_points
+        if any(abs(point[0] - height) <= tolerance for height in real_heights)
+    ]
+    covered_heights = {
+        height
+        for height in real_heights
+        if any(abs(point[0] - height) <= tolerance for point in matching_points)
+    }
+    if len(covered_heights) == len(real_heights):
+        cfg.val_height_mach_points = matching_points
+        return
+
+    cfg.val_split_strategy = "height_max_mach"
+    cfg.val_heights = real_heights
+    missing = [height for height in real_heights if height not in covered_heights]
+    print(
+        "[SELECTION] No configured validation (H, M) point covers selected "
+        f"height(s) {missing}; using the maximum Mach number at each selected "
+        "height for validation.",
+        flush=True,
+    )
+
+
+def _height_selection_matches(
+    training_config: dict,
+    expected_heights: list[float] | None,
+    expected_tolerance: float,
+) -> tuple[bool, str]:
+    dataset_config = dict(training_config.get("dataset", {}) or {})
+    actual_selection = dict(dataset_config.get("data_selection", {}) or {})
+    actual_heights = actual_selection.get("heights")
+    if actual_heights is not None:
+        actual_heights = sorted(float(value) for value in actual_heights)
+    expected = None if expected_heights is None else sorted(float(value) for value in expected_heights)
+    if actual_heights is None or expected is None:
+        if actual_heights != expected:
+            return False, f"height selection {actual_heights!r} does not match {expected!r}"
+        return True, "complete"
+    if len(actual_heights) != len(expected):
+        return False, f"height selection {actual_heights!r} does not match {expected!r}"
+    tolerance = float(expected_tolerance)
+    if any(abs(actual - wanted) > tolerance for actual, wanted in zip(actual_heights, expected)):
+        return False, f"height selection {actual_heights!r} does not match {expected!r}"
+    actual_tolerance = float(actual_selection.get("height_tolerance", tolerance))
+    if not math.isclose(actual_tolerance, tolerance, rel_tol=0.0, abs_tol=1e-12):
+        return False, (
+            f"height-selection tolerance {actual_tolerance!r} does not match {tolerance!r}"
+        )
+    return True, "complete"
+
+
 def get_exe_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -189,6 +299,9 @@ def _resume_component_ready(
     component: str,
     required_profile_version: int | None = None,
     expected_fidelity_mode: str | None = None,
+    expected_heights: list[float] | None = None,
+    expected_height_tolerance: float = 1e-6,
+    check_height_selection: bool = False,
 ) -> tuple[bool, str]:
     try:
         required = [
@@ -242,6 +355,14 @@ def _resume_component_ready(
             return False, "training_config excitation_id mismatch"
         if int(training_config.get("channel_id", channel_id)) != int(channel_id):
             return False, "training_config channel_id mismatch"
+        if check_height_selection:
+            selection_matches, selection_reason = _height_selection_matches(
+                training_config,
+                expected_heights,
+                expected_height_tolerance,
+            )
+            if not selection_matches:
+                return False, selection_reason
         actual_fidelity_mode = str(
             training_config.get(
                 "fidelity_mode", checkpoint.get("fidelity_mode", "")
@@ -410,6 +531,16 @@ def main():
         default=None,
         help="Train only selected response-channel names or IDs; repeat or separate with commas.",
     )
+    parser.add_argument(
+        "--height",
+        "--heights",
+        action="append",
+        default=None,
+        help=(
+            "Train using only selected height values in both simulation and real data; "
+            "repeat or separate with commas."
+        ),
+    )
     parser.add_argument("--batch_real", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--prefetch", type=int, default=None)
@@ -548,6 +679,30 @@ def main():
         cfg.num_workers = 0
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
+    selected_heights = _resolve_height_selection(args.height)
+    height_tolerance = float(cfg.val_height_tol)
+    if selected_heights is not None:
+        original_sim_count = len(sim_parsed)
+        original_real_count = len(real_parsed)
+        available_sim_heights = sorted({float(row.H) for row in sim_parsed})
+        sim_parsed = _filter_rows_by_heights(
+            sim_parsed, selected_heights, height_tolerance
+        )
+        real_parsed = _filter_rows_by_heights(
+            real_parsed, selected_heights, height_tolerance
+        )
+        if not sim_parsed:
+            raise RuntimeError(
+                f"The height selector(s) {selected_heights} matched no simulation rows; "
+                f"available simulation heights: {available_sim_heights}"
+            )
+        _configure_validation_for_height_selection(cfg, selected_heights, real_parsed)
+        print(
+            f"[SELECTION] heights={selected_heights} tolerance={height_tolerance:g} "
+            f"sim_rows={len(sim_parsed)}/{original_sim_count} "
+            f"real_rows={len(real_parsed)}/{original_real_count}",
+            flush=True,
+        )
     cfg.K_max = 3
     cfg.embed_channel_num = max(sim_stats["channel_num"], real_stats["channel_num"])
     cfg.embed_excitation_num = max(sim_stats["excitation_num"], real_stats["excitation_num"])
@@ -557,7 +712,12 @@ def main():
         )
 
     model_root = Path(args.out_dir)
-    preview_train, preview_val, split_strategy = split_single_fidelity_rows(real_parsed, cfg, 0, 0)
+    if real_parsed:
+        preview_train, preview_val, split_strategy = split_single_fidelity_rows(
+            real_parsed, cfg, 0, 0
+        )
+    else:
+        preview_train, preview_val, split_strategy = [], [], "sim_only_no_real_rows"
     train_group_keys = sorted({group_key_from_parsed(row) for row in preview_train})
     validation_group_keys = sorted({group_key_from_parsed(row) for row in preview_val})
     if not ddp_enabled or rank == 0:
@@ -714,6 +874,8 @@ def main():
             "real_row_count": len(combo_rows),
             "fidelity_mode": fidelity_mode,
             "label": label,
+            "selected_heights": selected_heights,
+            "height_tolerance": height_tolerance,
         }
         component_states[key] = {}
         try:
@@ -763,6 +925,10 @@ def main():
             "excitation_name": excitation_name(excitation_id),
             "channel_id": channel_id,
             "target_names": target_names,
+            "data_selection": {
+                "heights": selected_heights,
+                "height_tolerance": height_tolerance,
+            },
         }
         for component in FDR_COMPONENT_TARGETS:
             if args.resume:
@@ -775,6 +941,9 @@ def main():
                         combo_cfg, component
                     ),
                     expected_fidelity_mode=fidelity_mode,
+                    expected_heights=selected_heights,
+                    expected_height_tolerance=height_tolerance,
+                    check_height_selection=True,
                 )
                 if ready:
                     component_states[key][component] = "resumed"
@@ -877,6 +1046,9 @@ def main():
                     cfg, component
                 ),
                 expected_fidelity_mode=info["fidelity_mode"],
+                expected_heights=info["selected_heights"],
+                expected_height_tolerance=info["height_tolerance"],
+                check_height_selection=True,
             )
             if ready:
                 component_states[key][component] = "trained"

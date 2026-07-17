@@ -174,6 +174,7 @@ def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) 
         "dataset_snapshot_root": str(
             dataset_metadata.get("dataset_snapshot_root", "dataset_snapshot")
         ),
+        "data_selection": dict(dataset_metadata.get("data_selection", {}) or {}),
         "training_config": "training_config.json",
         "normalizer_input": "Normalizer_Input.pth",
         "normalizer_output": "Normalizer_Output.pth",
@@ -234,6 +235,7 @@ def write_training_config(
             "snapshot_root": str(
                 dataset_metadata.get("dataset_snapshot_root", "dataset_snapshot")
             ),
+            "data_selection": dict(dataset_metadata.get("data_selection", {}) or {}),
         },
         "model": _model_config(cfg),
         "targets": {

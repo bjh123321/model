@@ -86,6 +86,7 @@ def main():
             "excitation_id": 1,
             "excitation_name": "FXD_DC",
             "channel_id": 8,
+            "data_selection": {"heights": [3.0], "height_tolerance": 1e-6},
         }
         tasks = []
         for component in ("frequency", "damping"):
@@ -114,8 +115,21 @@ def main():
                 component,
                 required_profile_version=8,
                 expected_fidelity_mode="multifidelity",
+                expected_heights=[3.0],
+                expected_height_tolerance=1e-6,
+                check_height_selection=True,
             )
             assert ready, reason
+            ready, _reason = _resume_component_ready(
+                version_dir,
+                1,
+                8,
+                component,
+                expected_heights=[5.5],
+                expected_height_tolerance=1e-6,
+                check_height_selection=True,
+            )
+            assert not ready
         ready, _reason = _resume_component_ready(version_dir, 1, 8, "residue_phase")
         assert not ready
     print("parallel component training and component-level resume: PASS")
