@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import time
 from copy import deepcopy
 from itertools import cycle
 from pathlib import Path
@@ -38,6 +39,25 @@ EXCITATION_LOSS_SCOPES = (
     ("group_PW", (2, 3)),
     ("group_JFY", (4, 5)),
 )
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _elapsed_and_eta(started_at: float, completed: int, total: int) -> tuple[str, str]:
+    elapsed = time.perf_counter() - started_at
+    eta = None
+    if completed > 0:
+        eta = elapsed / completed * max(total - completed, 0)
+    return _format_duration(elapsed), _format_duration(eta)
 
 
 def _select_device(args) -> torch.device:
@@ -587,6 +607,7 @@ def train_multifidelity_component(
     best_stage1_epoch = 0
     best_low_state = None
     bad = 0
+    stage1_started_at = time.perf_counter()
     for epoch in range(int(cfg.epochs_stage1)):
         model.train()
         total, count = 0.0, 0
@@ -632,13 +653,25 @@ def train_multifidelity_component(
             bad += 1
         if (epoch + 1) == 1 or (epoch + 1) % 10 == 0:
             val_text = "nan" if val_loss is None else f"{val_loss:.6f}"
+            elapsed_text, eta_text = _elapsed_and_eta(
+                stage1_started_at, epoch + 1, int(cfg.epochs_stage1)
+            )
             print(
-                f"[S1] epoch={epoch + 1}/{cfg.epochs_stage1} "
-                f"sim={train_loss:.6f} val={val_text}",
+                f"[S1][{cfg.target_component}] epoch={epoch + 1}/{cfg.epochs_stage1} "
+                f"sim={train_loss:.6f} val={val_text} "
+                f"elapsed={elapsed_text} eta_to_max={eta_text}",
                 flush=True,
             )
         if cfg.early_stop_patience_s1 > 0 and bad >= cfg.early_stop_patience_s1:
             break
+    stage1_epochs_run = sum(int(row.get("stage", 0)) == 1 for row in logs)
+    print(
+        f"[S1-DONE][{cfg.target_component}] epochs={stage1_epochs_run}/"
+        f"{cfg.epochs_stage1} elapsed="
+        f"{_format_duration(time.perf_counter() - stage1_started_at)} "
+        f"best={best_stage1:.6f}@{best_stage1_epoch}",
+        flush=True,
+    )
     if best_low_state is not None:
         model.low.load_state_dict(best_low_state)
 
@@ -705,6 +738,7 @@ def train_multifidelity_component(
     fallback_epoch = 0
     bad = 0
     sim_iterator = cycle(sim_dl)
+    stage2_started_at = time.perf_counter()
     for epoch in range(int(cfg.epochs_stage2)):
         model.train()
         if freeze_low:
@@ -799,9 +833,13 @@ def train_multifidelity_component(
             bad += 1
         if (epoch + 1) == 1 or (epoch + 1) % 10 == 0:
             val_text = "nan" if val_loss is None else f"{val_loss:.6f}"
+            elapsed_text, eta_text = _elapsed_and_eta(
+                stage2_started_at, epoch + 1, int(cfg.epochs_stage2)
+            )
             print(
-                f"[S2] epoch={epoch + 1}/{cfg.epochs_stage2} "
-                f"sim={sim_loss:.6f} real={real_loss:.6f} val={val_text}",
+                f"[S2][{cfg.target_component}] epoch={epoch + 1}/{cfg.epochs_stage2} "
+                f"sim={sim_loss:.6f} real={real_loss:.6f} val={val_text} "
+                f"elapsed={elapsed_text} eta_to_max={eta_text}",
                 flush=True,
             )
         if cfg.early_stop_patience_s2 > 0 and bad >= cfg.early_stop_patience_s2:
@@ -811,6 +849,14 @@ def train_multifidelity_component(
             and (epoch + 1) - parent_loss_reached_epoch >= epochs_after_parent_loss
         ):
             break
+
+    stage2_epochs_run = sum(int(row.get("stage", 0)) == 2 for row in logs)
+    print(
+        f"[S2-DONE][{cfg.target_component}] epochs={stage2_epochs_run}/"
+        f"{cfg.epochs_stage2} elapsed="
+        f"{_format_duration(time.perf_counter() - stage2_started_at)}",
+        flush=True,
+    )
 
     if best_state is None:
         best, best_epoch, best_state = fallback_best, fallback_epoch, fallback_state

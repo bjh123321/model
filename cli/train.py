@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 import socket
 import sys
+import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -37,6 +38,17 @@ from surrogate_model.utils.excitation_channel_models import (
     model_entry,
     write_model_inventory,
 )
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "--:--"
+    total_seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _parse_int_list(raw: str) -> list[int]:
@@ -317,6 +329,7 @@ def _train_component_worker(task: dict) -> dict:
 
 
 def main():
+    run_started_at = time.perf_counter()
     base_dir = get_exe_dir()
     user_input_path = base_dir / "user_input.dat"
     with open(user_input_path, "r", encoding="utf-8") as f:
@@ -802,7 +815,54 @@ def main():
             failures=failures,
         )
 
+    scheduled_total = len(tasks)
+    scheduled_completed = 0
+    training_started_at = time.perf_counter()
+
+    def print_training_progress():
+        state_values = [
+            state
+            for states in component_states.values()
+            for state in states.values()
+        ]
+        total_components = len(state_values)
+        trained_components = sum(state == "trained" for state in state_values)
+        resumed_components = sum(state == "resumed" for state in state_values)
+        failed_components = sum(state == "failed" for state in state_values)
+        done_components = trained_components + resumed_components + failed_components
+        remaining_components = max(total_components - done_components, 0)
+        complete_models = sum(
+            bool(states)
+            and all(state in {"trained", "resumed"} for state in states.values())
+            for states in component_states.values()
+        )
+        failed_models = sum(
+            any(state == "failed" for state in states.values())
+            for states in component_states.values()
+        )
+        elapsed = time.perf_counter() - training_started_at
+        eta = None
+        if scheduled_total == 0 or scheduled_completed >= scheduled_total:
+            eta = 0.0
+        elif scheduled_completed > 0:
+            eta = (
+                elapsed
+                / scheduled_completed
+                * max(scheduled_total - scheduled_completed, 0)
+            )
+        percent = 100.0 if total_components == 0 else 100.0 * done_components / total_components
+        print(
+            f"[PROGRESS] components={done_components}/{total_components} "
+            f"({percent:.1f}%) remaining={remaining_components} "
+            f"trained={trained_components} resumed={resumed_components} "
+            f"failed={failed_components} models={complete_models}/{len(component_states)} "
+            f"model_failures={failed_models} elapsed={_format_duration(elapsed)} "
+            f"ETA={_format_duration(eta)}",
+            flush=True,
+        )
+
     def handle_task_result(result: dict):
+        nonlocal scheduled_completed
         key = (int(result["excitation_id"]), int(result["channel_id"]))
         component = str(result["component"])
         info = combination_info[key]
@@ -865,7 +925,9 @@ def main():
                 real_row_count=info["real_row_count"],
             )
             print(f"[MODEL-COMPLETE] {info['label']} status={status}", flush=True)
+        scheduled_completed += 1
         write_progress_inventory()
+        print_training_progress()
 
     write_progress_inventory()
     print(
@@ -873,6 +935,7 @@ def main():
         f"resumed_models={len(trained_models)}",
         flush=True,
     )
+    print_training_progress()
     if int(args.parallel_workers) == 1:
         for task in tasks:
             handle_task_result(_train_component_worker(task))
@@ -906,6 +969,14 @@ def main():
         print(
             f"[MODEL-INVENTORY] complete={len(trained_models)} failures={len(failures)} "
             f"path={model_root / 'models_manifest.json'}",
+            flush=True,
+        )
+        training_elapsed = time.perf_counter() - training_started_at
+        total_elapsed = time.perf_counter() - run_started_at
+        print(
+            f"[TIMING] preparation={_format_duration(total_elapsed - training_elapsed)} "
+            f"training={_format_duration(training_elapsed)} "
+            f"total={_format_duration(total_elapsed)}",
             flush=True,
         )
 
