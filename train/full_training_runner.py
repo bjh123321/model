@@ -83,6 +83,22 @@ def _training_values(cfg, args) -> dict:
             "slope_limit_multiplier": float(getattr(cfg, "damping_slope_limit_multiplier", 1.0)),
             "slope_limit_floor": float(getattr(cfg, "damping_slope_limit_floor", 0.0)),
         },
+        "sim_slot_outlier_filter": {
+            "enabled": bool(
+                getattr(cfg, "sim_slot_outlier_filter_enabled", True)
+            ),
+            "fit_scope": "simulation_training_split_per_excitation_channel_slot",
+            "min_samples": int(
+                getattr(cfg, "sim_slot_outlier_min_samples", 8)
+            ),
+            "mad_threshold": float(
+                getattr(cfg, "sim_slot_outlier_mad_threshold", 12.0)
+            ),
+            "scale_floor_ratio": float(
+                getattr(cfg, "sim_slot_outlier_scale_floor_ratio", 0.02)
+            ),
+            "report_file": "sim_slot_outlier_filter.json",
+        },
         "multifidelity": {
             "sim_loss_weight_stage2": float(
                 getattr(cfg, "multifidelity_sim_loss_weight", 0.2)

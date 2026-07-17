@@ -74,12 +74,12 @@ class Config:
     # interpolate the sparse H/M samples; damping smoothness is handled by a
     # separate soft penalty below instead of shrinking every component network.
     fdr_physical_parameterization: bool = True
-    fdr_training_profile_version: int = 5
+    fdr_training_profile_version: int = 6
     fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
-        "frequency": 5,
-        "damping": 5,
-        "residue_magnitude": 5,
-        "residue_phase": 5,
+        "frequency": 6,
+        "damping": 6,
+        "residue_magnitude": 6,
+        "residue_phase": 6,
     })
     fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     fdr_dropout_prob: float = 0.0
@@ -121,6 +121,12 @@ class Config:
     damping_curvature_weight: float = 0.0
     damping_slope_limit_multiplier: float = 1.5
     damping_slope_limit_floor: float = 0.03
+    # Robust sim-only pole-slot screening.  Frequency and damping are fitted
+    # jointly per excitation/channel/slot from the simulation training split.
+    sim_slot_outlier_filter_enabled: bool = True
+    sim_slot_outlier_min_samples: int = 8
+    sim_slot_outlier_mad_threshold: float = 12.0
+    sim_slot_outlier_scale_floor_ratio: float = 0.02
 
     # One-time migration source for parent versions created before dataset snapshots.
     incremental_history_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"

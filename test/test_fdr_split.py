@@ -9,7 +9,10 @@ from surrogate_model.models.blocks import TargetMFDNN, TargetMultifidelityMFDNN
 from surrogate_model.models.checkpoint_utils import build_model_from_checkpoint
 from surrogate_model.test.Predict_user import _run_infer_fdr_bundle_batched
 from surrogate_model.test.Predict_user import _build_yhat_and_slot_strings
-from surrogate_model.train.dataloaders import _filter_damping_slots
+from surrogate_model.train.dataloaders import (
+    _filter_damping_slots,
+    _filter_sim_outlier_slots,
+)
 from surrogate_model.utils.fdr_target_transforms import (
     build_target_transform_specs,
     decode_numpy,
@@ -116,11 +119,15 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_early_stop_patience["damping"] == 500
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["frequency"] == 0.05
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["damping"] is None
-    assert cfg.fdr_training_profile_version == 5
-    assert set(cfg.fdr_component_training_profile_version.values()) == {5}
+    assert cfg.fdr_training_profile_version == 6
+    assert set(cfg.fdr_component_training_profile_version.values()) == {6}
     assert cfg.multifidelity_sim_loss_weight == 0.2
     assert cfg.damping_slope_weight == 0.0
     assert cfg.damping_curvature_weight == 0.0
+    assert cfg.sim_slot_outlier_filter_enabled is True
+    assert cfg.sim_slot_outlier_min_samples == 8
+    assert cfg.sim_slot_outlier_mad_threshold == 12.0
+    assert cfg.sim_slot_outlier_scale_floor_ratio == 0.02
 
 
 class _ConstantTargetModel(torch.nn.Module):
@@ -252,6 +259,72 @@ def test_damping_filter_keeps_high_positive_values_and_drops_non_positive_values
     assert filtered[0].K_valid == 2
     assert len(dropped) == 1
     assert dropped[0]["reason"] == "non_positive"
+
+
+def test_sim_frequency_or_damping_outlier_masks_the_whole_slot():
+    cfg = Config()
+    rows = []
+    for index in range(12):
+        frequency = np.asarray(
+            [10.0 + 0.05 * ((index % 3) - 1), 20.0, 30.0],
+            dtype=np.float32,
+        )
+        damping = np.asarray([0.05, 0.08, 0.10], dtype=np.float32)
+        if index == 10:
+            frequency[0] = 100.0
+        if index == 11:
+            damping[1] = 0.80
+        rows.append(
+            SimpleNamespace(
+                H=3.0,
+                M=0.7 + 0.01 * index,
+                exc_id=1,
+                ch_id=12,
+                mask=np.ones(3, dtype=np.float32),
+                freq=frequency,
+                damping=damping,
+                K_valid=3,
+            )
+        )
+
+    filtered, validation, report = _filter_sim_outlier_slots(rows, [], cfg)
+
+    assert not validation
+    np.testing.assert_array_equal(filtered[10].mask, [0.0, 1.0, 1.0])
+    np.testing.assert_array_equal(filtered[11].mask, [1.0, 0.0, 1.0])
+    assert all(np.all(row.mask == 1.0) for row in rows)
+    assert report["masked_slot_count"] == 2
+    assert {tuple(item["reasons"]) for item in report["masked_slots"]} == {
+        ("frequency_outlier",),
+        ("damping_outlier",),
+    }
+
+
+def test_sim_outlier_filter_is_disabled_for_small_groups():
+    cfg = Config()
+    rows = []
+    for index in range(cfg.sim_slot_outlier_min_samples - 1):
+        frequency = np.asarray([10.0, 20.0, 30.0], dtype=np.float32)
+        if index == 0:
+            frequency[0] = 1000.0
+        rows.append(
+            SimpleNamespace(
+                H=3.0,
+                M=0.7 + 0.01 * index,
+                exc_id=1,
+                ch_id=12,
+                mask=np.ones(3, dtype=np.float32),
+                freq=frequency,
+                damping=np.asarray([0.05, 0.08, 0.10], dtype=np.float32),
+                K_valid=3,
+            )
+        )
+
+    filtered, _validation, report = _filter_sim_outlier_slots(rows, [], cfg)
+
+    assert all(np.all(row.mask == 1.0) for row in filtered)
+    assert report["masked_slot_count"] == 0
+    assert all(not group["filter_active"] for group in report["groups"])
 
 
 def test_new_normalizer_metadata_decodes_fdr_outputs_to_physical_domain():

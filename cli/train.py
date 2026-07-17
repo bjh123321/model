@@ -196,6 +196,8 @@ def _resume_component_ready(
             "Normalizer_Input_Sim.pth", "Normalizer_Output_Sim.pth",
             "training_config.json", "train_log.csv", "slot_support.json",
         ]
+        if required_profile_version is not None and int(required_profile_version) >= 6:
+            required.append("sim_slot_outlier_filter.json")
         if expected_fidelity_mode == "multifidelity":
             required.append("Normalizer_Output_Real_Fold0.pth")
         target_names = FDR_COMPONENT_TARGETS[component]

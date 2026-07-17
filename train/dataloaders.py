@@ -170,6 +170,212 @@ def _filter_damping_slots(parsed: List[ParsedRow], split_name: str):
     return filtered, dropped
 
 
+def _robust_metric_stats(values, threshold: float, scale_floor_ratio: float):
+    array = np.asarray(values, dtype=np.float64)
+    median = float(np.median(array))
+    mad = float(np.median(np.abs(array - median)))
+    robust_scale = 1.4826 * mad
+    scale_floor = max(abs(median) * scale_floor_ratio, 1e-12)
+    scale = max(robust_scale, scale_floor)
+    return {
+        "median": median,
+        "mad": mad,
+        "robust_scale": robust_scale,
+        "scale_used": scale,
+        "lower": median - threshold * scale,
+        "upper": median + threshold * scale,
+    }
+
+
+def _filter_sim_outlier_slots(
+    sim_train: List[ParsedRow], sim_val: List[ParsedRow], cfg: Config
+):
+    """Mask a whole sim slot when its frequency or damping is a robust outlier.
+
+    Robust ranges are fitted only on the simulation training split, separately
+    for every excitation/channel/slot.  The resulting ranges are then applied
+    to both sim train and sim validation rows, avoiding validation leakage.
+    """
+    enabled = bool(getattr(cfg, "sim_slot_outlier_filter_enabled", True))
+    min_samples = int(getattr(cfg, "sim_slot_outlier_min_samples", 8))
+    threshold = float(getattr(cfg, "sim_slot_outlier_mad_threshold", 12.0))
+    scale_floor_ratio = float(
+        getattr(cfg, "sim_slot_outlier_scale_floor_ratio", 0.02)
+    )
+    if min_samples <= 0:
+        raise ValueError("sim_slot_outlier_min_samples must be positive")
+    if threshold <= 0.0:
+        raise ValueError("sim_slot_outlier_mad_threshold must be positive")
+    if scale_floor_ratio <= 0.0:
+        raise ValueError("sim_slot_outlier_scale_floor_ratio must be positive")
+
+    grouped: dict[tuple[int, int, int], list[tuple[float, float]]] = {}
+    for row in sim_train:
+        mask = np.asarray(row.mask, dtype=np.float64)
+        frequency = np.asarray(row.freq, dtype=np.float64)
+        damping = np.asarray(row.damping, dtype=np.float64)
+        width = min(len(mask), len(frequency), len(damping))
+        for slot in range(width):
+            if mask[slot] <= 0.5:
+                continue
+            freq_value = float(frequency[slot])
+            damping_value = float(damping[slot])
+            if (
+                np.isfinite(freq_value)
+                and freq_value > 0.0
+                and np.isfinite(damping_value)
+                and damping_value > 0.0
+            ):
+                key = (int(row.exc_id), int(row.ch_id), slot)
+                grouped.setdefault(key, []).append((freq_value, damping_value))
+
+    fitted = {}
+    group_reports = []
+    for key, pairs in sorted(grouped.items()):
+        count = len(pairs)
+        group_enabled = enabled and count >= min_samples
+        report = {
+            "excitation_id": key[0],
+            "channel_id": key[1],
+            "slot_index": key[2],
+            "slot_number": key[2] + 1,
+            "fit_sample_count": count,
+            "filter_active": group_enabled,
+        }
+        if group_enabled:
+            frequencies = [pair[0] for pair in pairs]
+            damping_values = [pair[1] for pair in pairs]
+            report["frequency"] = _robust_metric_stats(
+                frequencies, threshold, scale_floor_ratio
+            )
+            report["damping"] = _robust_metric_stats(
+                damping_values, threshold, scale_floor_ratio
+            )
+            fitted[key] = report
+        group_reports.append(report)
+
+    dropped = []
+    empty_rows_after_filter = []
+
+    def apply(rows, split_name: str):
+        filtered = []
+        for source in rows:
+            row = deepcopy(source)
+            mask = np.asarray(row.mask, dtype=np.float32).copy()
+            frequency = np.asarray(row.freq, dtype=np.float64)
+            damping = np.asarray(row.damping, dtype=np.float64)
+            width = min(len(mask), len(frequency), len(damping))
+            for slot in range(width):
+                if mask[slot] <= 0.5:
+                    continue
+                stats = fitted.get((int(row.exc_id), int(row.ch_id), slot))
+                if stats is None:
+                    continue
+                freq_value = float(frequency[slot])
+                damping_value = float(damping[slot])
+                freq_stats = stats["frequency"]
+                damping_stats = stats["damping"]
+                frequency_outlier = (
+                    not np.isfinite(freq_value)
+                    or freq_value <= 0.0
+                    or freq_value < freq_stats["lower"]
+                    or freq_value > freq_stats["upper"]
+                )
+                damping_outlier = (
+                    not np.isfinite(damping_value)
+                    or damping_value <= 0.0
+                    or damping_value < damping_stats["lower"]
+                    or damping_value > damping_stats["upper"]
+                )
+                if not frequency_outlier and not damping_outlier:
+                    continue
+                mask[slot] = 0.0
+                dropped.append(
+                    {
+                        "split": split_name,
+                        "H": float(row.H),
+                        "M": float(row.M),
+                        "excitation_id": int(row.exc_id),
+                        "channel_id": int(row.ch_id),
+                        "slot_index": slot,
+                        "slot_number": slot + 1,
+                        "frequency": freq_value,
+                        "damping": damping_value,
+                        "frequency_robust_score": (
+                            None
+                            if not np.isfinite(freq_value)
+                            else abs(freq_value - freq_stats["median"])
+                            / freq_stats["scale_used"]
+                        ),
+                        "damping_robust_score": (
+                            None
+                            if not np.isfinite(damping_value)
+                            else abs(damping_value - damping_stats["median"])
+                            / damping_stats["scale_used"]
+                        ),
+                        "reasons": [
+                            reason
+                            for reason, active in (
+                                ("frequency_outlier", frequency_outlier),
+                                ("damping_outlier", damping_outlier),
+                            )
+                            if active
+                        ],
+                    }
+                )
+            row.mask = mask
+            row.K_valid = int(np.count_nonzero(mask > 0.5))
+            filtered.append(row)
+            if row.K_valid == 0:
+                empty_rows_after_filter.append(
+                    {
+                        "split": split_name,
+                        "H": float(row.H),
+                        "M": float(row.M),
+                        "excitation_id": int(row.exc_id),
+                        "channel_id": int(row.ch_id),
+                    }
+                )
+        return filtered
+
+    filtered_train = apply(sim_train, "sim_train")
+    filtered_val = apply(sim_val, "sim_validation")
+    report = {
+        "schema_version": 1,
+        "filter": "joint_frequency_damping_robust_mad",
+        "enabled": enabled,
+        "fit_scope": "simulation_training_split_per_excitation_channel_slot",
+        "min_samples": min_samples,
+        "mad_threshold": threshold,
+        "scale_floor_ratio": scale_floor_ratio,
+        "input_train_rows": len(sim_train),
+        "output_train_rows": len(filtered_train),
+        "input_validation_rows": len(sim_val),
+        "output_validation_rows": len(filtered_val),
+        "masked_slot_count": len(dropped),
+        "empty_row_after_filter_count": len(empty_rows_after_filter),
+        "groups": group_reports,
+        "masked_slots": dropped,
+        "empty_rows_after_filter": empty_rows_after_filter,
+    }
+    return filtered_train, filtered_val, report
+
+
+def _write_sim_outlier_filter_report(out_dir: Path, report: dict):
+    if not is_main_process():
+        return
+    path = Path(out_dir) / "sim_slot_outlier_filter.json"
+    atomic_write_json(path, report)
+    print(
+        f"[SIM-OUTLIER-FILTER] masked_slots={report['masked_slot_count']} "
+        f"empty_rows_after_filter={report['empty_row_after_filter_count']} "
+        f"train_rows={report['output_train_rows']}/{report['input_train_rows']} "
+        f"validation_rows={report['output_validation_rows']}/"
+        f"{report['input_validation_rows']} report={path}",
+        flush=True,
+    )
+
+
 def _write_damping_filter_log(out_dir: Path, dropped: list[dict]):
     if not is_main_process():
         return
@@ -409,6 +615,11 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
         sim_train = sim_parsed
         sim_val = []
 
+    sim_train, sim_val, sim_outlier_report = _filter_sim_outlier_slots(
+        sim_train, sim_val, cfg
+    )
+    _write_sim_outlier_filter_report(out_dir, sim_outlier_report)
+
     real_train, real_val, real_split_strategy = split_single_fidelity_rows(
         real_parsed, cfg, kfold, fold_idx
     )
@@ -478,7 +689,11 @@ def build_low_fidelity_dataloader(
     sim_parsed: List[ParsedRow], cfg: Config, out_dir: Path
 ):
     """Build a simulation-only component loader when no valid real rows exist."""
-    sim_train, dropped = _filter_damping_slots(sim_parsed, "sim_train")
+    sim_train, _sim_val, sim_outlier_report = _filter_sim_outlier_slots(
+        sim_parsed, [], cfg
+    )
+    _write_sim_outlier_filter_report(out_dir, sim_outlier_report)
+    sim_train, dropped = _filter_damping_slots(sim_train, "sim_train")
     _write_damping_filter_log(out_dir, dropped)
     if not sim_train:
         raise RuntimeError("Low-fidelity training requires valid simulation rows")
