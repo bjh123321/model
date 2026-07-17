@@ -99,6 +99,24 @@ def _training_values(cfg, args) -> dict:
             ),
             "report_file": "sim_slot_outlier_filter.json",
         },
+        "real_damping_slot_filter": {
+            "enabled": bool(
+                getattr(cfg, "real_damping_upper_filter_enabled", True)
+            ),
+            "comparison": "damping > excitation_channel_threshold",
+            "thresholds_by_excitation": dict(
+                getattr(cfg, "real_damping_upper_thresholds", {}) or {}
+            ),
+            "channel_ids_by_excitation": {
+                int(excitation_id): list(channel_ids)
+                for excitation_id, channel_ids in dict(
+                    getattr(cfg, "real_damping_upper_channel_ids", {}) or {}
+                ).items()
+            },
+            "applies_to": ["real_training_split", "real_validation_split"],
+            "action": "mask_entire_slot_for_all_fdr_components",
+            "log_file": "damping_slot_filter.log",
+        },
         "multifidelity": {
             "sim_loss_weight_stage2": float(
                 getattr(cfg, "multifidelity_sim_loss_weight", 0.2)

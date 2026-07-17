@@ -119,8 +119,8 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_early_stop_patience["damping"] == 500
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["frequency"] == 0.05
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["damping"] is None
-    assert cfg.fdr_training_profile_version == 6
-    assert set(cfg.fdr_component_training_profile_version.values()) == {6}
+    assert cfg.fdr_training_profile_version == 7
+    assert set(cfg.fdr_component_training_profile_version.values()) == {7}
     assert cfg.multifidelity_sim_loss_weight == 0.2
     assert cfg.damping_slope_weight == 0.0
     assert cfg.damping_curvature_weight == 0.0
@@ -128,6 +128,13 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.sim_slot_outlier_min_samples == 8
     assert cfg.sim_slot_outlier_mad_threshold == 12.0
     assert cfg.sim_slot_outlier_scale_floor_ratio == 0.02
+    assert cfg.real_damping_upper_filter_enabled is True
+    assert cfg.real_damping_upper_thresholds == {
+        0: 0.15, 1: 0.15, 2: 0.30, 3: 0.30, 4: 0.30, 5: 0.30,
+    }
+    assert cfg.real_damping_upper_channel_ids[0] == tuple(range(8, 20))
+    assert cfg.real_damping_upper_channel_ids[2] == tuple(range(20, 28))
+    assert cfg.real_damping_upper_channel_ids[4] == tuple(range(0, 8))
 
 
 class _ConstantTargetModel(torch.nn.Module):
@@ -244,7 +251,7 @@ def test_target_transforms_roundtrip_without_damping_upper_bound():
     assert np.all(decode_numpy(np.asarray([-1e6, 1e6]), specs["magnitude"]) > 0.0)
 
 
-def test_damping_filter_keeps_high_positive_values_and_drops_non_positive_values():
+def test_sim_damping_filter_keeps_high_positive_values_and_drops_non_positive_values():
     row = SimpleNamespace(
         H=3.0,
         M=0.9,
@@ -254,11 +261,56 @@ def test_damping_filter_keeps_high_positive_values_and_drops_non_positive_values
         damping=np.asarray([0.10, 0.40, -0.01], dtype=np.float32),
         K_valid=3,
     )
-    filtered, dropped = _filter_damping_slots([row], "train")
+    filtered, dropped = _filter_damping_slots([row], "sim_train")
     np.testing.assert_array_equal(filtered[0].mask, [1.0, 1.0, 0.0])
     assert filtered[0].K_valid == 2
     assert len(dropped) == 1
     assert dropped[0]["reason"] == "non_positive"
+
+
+def test_real_damping_filter_applies_excitation_channel_thresholds_to_whole_slots():
+    cfg = Config()
+    cases = (
+        (1, 8, 0.15, 0.151),
+        (2, 20, 0.30, 0.301),
+        (4, 0, 0.30, 0.301),
+    )
+    for excitation_id, channel_id, boundary, above in cases:
+        row = SimpleNamespace(
+            H=3.0,
+            M=0.9,
+            exc_id=excitation_id,
+            ch_id=channel_id,
+            mask=np.ones(3, dtype=np.float32),
+            damping=np.asarray([boundary, above, 0.10], dtype=np.float32),
+            K_valid=3,
+        )
+        filtered, dropped = _filter_damping_slots(
+            [row], "train", cfg, apply_real_upper_limits=True
+        )
+        np.testing.assert_array_equal(filtered[0].mask, [1.0, 0.0, 1.0])
+        assert filtered[0].K_valid == 2
+        assert len(dropped) == 1
+        assert dropped[0]["reason"] == "above_real_upper_limit"
+        assert dropped[0]["upper_threshold"] == boundary
+
+
+def test_real_damping_filter_does_not_apply_upper_limit_outside_mapped_channels():
+    cfg = Config()
+    row = SimpleNamespace(
+        H=3.0,
+        M=0.9,
+        exc_id=1,
+        ch_id=7,
+        mask=np.ones(1, dtype=np.float32),
+        damping=np.asarray([0.90], dtype=np.float32),
+        K_valid=1,
+    )
+    filtered, dropped = _filter_damping_slots(
+        [row], "train", cfg, apply_real_upper_limits=True
+    )
+    np.testing.assert_array_equal(filtered[0].mask, [1.0])
+    assert not dropped
 
 
 def test_sim_frequency_or_damping_outlier_masks_the_whole_slot():

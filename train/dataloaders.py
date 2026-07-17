@@ -134,8 +134,50 @@ def _attach_and_write_slot_support(
         print(f"[SLOT-SUPPORT] {summary}", flush=True)
 
 
-def _filter_damping_slots(parsed: List[ParsedRow], split_name: str):
-    """Mask only non-finite or non-positive damping slots."""
+def _real_damping_upper_rules(cfg: Config | None):
+    if cfg is None or not bool(
+        getattr(cfg, "real_damping_upper_filter_enabled", True)
+    ):
+        return {}
+    thresholds = {
+        int(excitation_id): float(threshold)
+        for excitation_id, threshold in dict(
+            getattr(cfg, "real_damping_upper_thresholds", {}) or {}
+        ).items()
+    }
+    channel_ids = {
+        int(excitation_id): {int(channel_id) for channel_id in channels}
+        for excitation_id, channels in dict(
+            getattr(cfg, "real_damping_upper_channel_ids", {}) or {}
+        ).items()
+    }
+    rules = {}
+    for excitation_id, threshold in thresholds.items():
+        if not np.isfinite(threshold) or threshold <= 0.0:
+            raise ValueError(
+                "real_damping_upper_thresholds values must be finite and positive"
+            )
+        channels = channel_ids.get(excitation_id)
+        if not channels:
+            raise ValueError(
+                "Missing real damping channel IDs for excitation_id="
+                f"{excitation_id}"
+            )
+        rules[excitation_id] = {
+            "threshold": threshold,
+            "channel_ids": channels,
+        }
+    return rules
+
+
+def _filter_damping_slots(
+    parsed: List[ParsedRow],
+    split_name: str,
+    cfg: Config | None = None,
+    apply_real_upper_limits: bool = False,
+):
+    """Mask invalid damping slots and optionally apply real-data upper limits."""
+    upper_rules = _real_damping_upper_rules(cfg) if apply_real_upper_limits else {}
     filtered = []
     dropped = []
     for source in parsed:
@@ -144,9 +186,27 @@ def _filter_damping_slots(parsed: List[ParsedRow], split_name: str):
         damping = np.asarray(row.damping, dtype=np.float64)
         width = min(len(mask), len(damping))
         for slot in range(width):
+            damping_value = float(damping[slot])
+            rule = upper_rules.get(int(row.exc_id))
+            upper_threshold = (
+                float(rule["threshold"])
+                if rule is not None and int(row.ch_id) in rule["channel_ids"]
+                else None
+            )
+            tolerance = (
+                max(1e-8, abs(upper_threshold) * 1e-6)
+                if upper_threshold is not None
+                else 0.0
+            )
+            above_upper_limit = (
+                upper_threshold is not None
+                and np.isfinite(damping_value)
+                and damping_value > upper_threshold + tolerance
+            )
             invalid = (
-                not np.isfinite(damping[slot])
-                or float(damping[slot]) <= 0.0
+                not np.isfinite(damping_value)
+                or damping_value <= 0.0
+                or above_upper_limit
             )
             if mask[slot] > 0.5 and invalid:
                 mask[slot] = 0.0
@@ -158,10 +218,12 @@ def _filter_damping_slots(parsed: List[ParsedRow], split_name: str):
                     "ch_id": int(row.ch_id),
                     "slot_number": slot + 1,
                     "slot_index": slot,
-                    "damping": float(damping[slot]),
+                    "damping": damping_value,
+                    "upper_threshold": upper_threshold,
                     "reason": (
-                        "non_finite" if not np.isfinite(damping[slot])
-                        else "non_positive"
+                        "non_finite" if not np.isfinite(damping_value)
+                        else "non_positive" if damping_value <= 0.0
+                        else "above_real_upper_limit"
                     ),
                 })
         row.mask = mask
@@ -376,17 +438,30 @@ def _write_sim_outlier_filter_report(out_dir: Path, report: dict):
     )
 
 
-def _write_damping_filter_log(out_dir: Path, dropped: list[dict]):
+def _write_damping_filter_log(out_dir: Path, dropped: list[dict], cfg: Config):
     if not is_main_process():
         return
     path = Path(out_dir) / "damping_slot_filter.log"
     train_count = sum(item["split"] == "train" for item in dropped)
     val_count = sum(item["split"] == "validation" for item in dropped)
+    upper_count = sum(
+        item["reason"] == "above_real_upper_limit" for item in dropped
+    )
+    rules = _real_damping_upper_rules(cfg)
+    rule_lines = [
+        f"  excitation_id={excitation_id} "
+        f"channel_ids={','.join(str(value) for value in sorted(rule['channel_ids']))} "
+        f"damping_upper_threshold={rule['threshold']:.9g}"
+        for excitation_id, rule in sorted(rules.items())
+    ]
     lines = [
         "DAMPING SLOT FILTER",
         "Stable-mode filter: discard non-finite or damping <= 0",
-        "No excitation-specific upper damping limit is applied.",
-        f"dropped_total={len(dropped)} dropped_train={train_count} dropped_validation={val_count}",
+        "Real-data upper filter: discard a whole slot when damping is greater than its excitation/channel threshold.",
+        f"real_upper_filter_enabled={bool(rules)}",
+        *rule_lines,
+        f"dropped_total={len(dropped)} dropped_train={train_count} "
+        f"dropped_validation={val_count} dropped_real_above_upper={upper_count}",
         "",
     ]
     for index, item in enumerate(dropped, 1):
@@ -394,7 +469,8 @@ def _write_damping_filter_log(out_dir: Path, dropped: list[dict]):
             f"[{index:05d}] split={item['split']} H={item['H']:.9g} M={item['M']:.9g} "
             f"exc_id={item['exc_id']} ch_id={item['ch_id']} "
             f"slot_number={item['slot_number']} slot_index={item['slot_index']} "
-            f"damping={item['damping']:.9g} reason={item['reason']}"
+            f"damping={item['damping']:.9g} "
+            f"upper_threshold={item.get('upper_threshold')} reason={item['reason']}"
         )
     path.write_text("\n".join(lines), encoding="utf-8")
     print(
@@ -637,11 +713,16 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
 
     sim_train, dropped_sim_train = _filter_damping_slots(sim_train, "sim_train")
     sim_val, dropped_sim_val = _filter_damping_slots(sim_val, "sim_validation")
-    real_train, dropped_train = _filter_damping_slots(real_train, "train")
-    real_val, dropped_val = _filter_damping_slots(real_val, "validation")
+    real_train, dropped_train = _filter_damping_slots(
+        real_train, "train", cfg, apply_real_upper_limits=True
+    )
+    real_val, dropped_val = _filter_damping_slots(
+        real_val, "validation", cfg, apply_real_upper_limits=True
+    )
     _write_damping_filter_log(
         out_dir,
         dropped_sim_train + dropped_sim_val + dropped_train + dropped_val,
+        cfg,
     )
 
     if not sim_train:
@@ -694,7 +775,7 @@ def build_low_fidelity_dataloader(
     )
     _write_sim_outlier_filter_report(out_dir, sim_outlier_report)
     sim_train, dropped = _filter_damping_slots(sim_train, "sim_train")
-    _write_damping_filter_log(out_dir, dropped)
+    _write_damping_filter_log(out_dir, dropped, cfg)
     if not sim_train:
         raise RuntimeError("Low-fidelity training requires valid simulation rows")
     in_norm_sim = compute_input_normalizer_sim(sim_train)
@@ -746,9 +827,13 @@ def build_single_fidelity_dataloaders(
             flush=True,
         )
 
-    real_train, dropped_train = _filter_damping_slots(real_train, "train")
-    real_val, dropped_val = _filter_damping_slots(real_val, "validation")
-    _write_damping_filter_log(out_dir, dropped_train + dropped_val)
+    real_train, dropped_train = _filter_damping_slots(
+        real_train, "train", cfg, apply_real_upper_limits=True
+    )
+    real_val, dropped_val = _filter_damping_slots(
+        real_val, "validation", cfg, apply_real_upper_limits=True
+    )
+    _write_damping_filter_log(out_dir, dropped_train + dropped_val, cfg)
 
     in_norm_real = compute_input_normalizer_sim(real_train)
     out_norm_real = _output_normalizer(real_train, cfg)

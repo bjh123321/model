@@ -74,12 +74,12 @@ class Config:
     # interpolate the sparse H/M samples; damping smoothness is handled by a
     # separate soft penalty below instead of shrinking every component network.
     fdr_physical_parameterization: bool = True
-    fdr_training_profile_version: int = 6
+    fdr_training_profile_version: int = 7
     fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
-        "frequency": 6,
-        "damping": 6,
-        "residue_magnitude": 6,
-        "residue_phase": 6,
+        "frequency": 7,
+        "damping": 7,
+        "residue_magnitude": 7,
+        "residue_phase": 7,
     })
     fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     fdr_dropout_prob: float = 0.0
@@ -127,6 +127,27 @@ class Config:
     sim_slot_outlier_min_samples: int = 8
     sim_slot_outlier_mad_threshold: float = 12.0
     sim_slot_outlier_scale_floor_ratio: float = 0.02
+
+    # Real-data damping screening.  A value above the configured limit masks
+    # the whole modal slot for every FDR component.  The channel lists encode
+    # the fixed excitation/channel inventory used by this branch.
+    real_damping_upper_filter_enabled: bool = True
+    real_damping_upper_thresholds: Dict[int, float] = field(default_factory=lambda: {
+        0: 0.15,
+        1: 0.15,
+        2: 0.30,
+        3: 0.30,
+        4: 0.30,
+        5: 0.30,
+    })
+    real_damping_upper_channel_ids: Dict[int, Tuple[int, ...]] = field(default_factory=lambda: {
+        0: tuple(range(8, 20)),
+        1: tuple(range(8, 20)),
+        2: tuple(range(20, 28)),
+        3: tuple(range(20, 28)),
+        4: tuple(range(0, 8)),
+        5: tuple(range(0, 8)),
+    })
 
     # One-time migration source for parent versions created before dataset snapshots.
     incremental_history_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"
