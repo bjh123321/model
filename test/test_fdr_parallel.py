@@ -112,7 +112,7 @@ def main():
                 1,
                 8,
                 component,
-                required_profile_version=7,
+                required_profile_version=8,
                 expected_fidelity_mode="multifidelity",
             )
             assert ready, reason

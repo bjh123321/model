@@ -74,12 +74,12 @@ class Config:
     # interpolate the sparse H/M samples; damping smoothness is handled by a
     # separate soft penalty below instead of shrinking every component network.
     fdr_physical_parameterization: bool = True
-    fdr_training_profile_version: int = 7
+    fdr_training_profile_version: int = 8
     fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
-        "frequency": 7,
-        "damping": 7,
-        "residue_magnitude": 7,
-        "residue_phase": 7,
+        "frequency": 8,
+        "damping": 8,
+        "residue_magnitude": 8,
+        "residue_phase": 8,
     })
     fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     fdr_dropout_prob: float = 0.0

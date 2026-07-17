@@ -1,3 +1,4 @@
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,9 +8,13 @@ from surrogate_model.config import Config
 from surrogate_model.data.normalizer import Normalizer
 from surrogate_model.models.blocks import TargetMFDNN, TargetMultifidelityMFDNN
 from surrogate_model.models.checkpoint_utils import build_model_from_checkpoint
-from surrogate_model.test.Predict_user import _run_infer_fdr_bundle_batched
+from surrogate_model.test.Predict_user import (
+    _bounded_damping_tanh_pull,
+    _run_infer_fdr_bundle_batched,
+)
 from surrogate_model.test.Predict_user import _build_yhat_and_slot_strings
 from surrogate_model.train.dataloaders import (
+    _build_slot_support,
     _filter_damping_slots,
     _filter_sim_outlier_slots,
 )
@@ -119,8 +124,8 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_early_stop_patience["damping"] == 500
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["frequency"] == 0.05
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["damping"] is None
-    assert cfg.fdr_training_profile_version == 7
-    assert set(cfg.fdr_component_training_profile_version.values()) == {7}
+    assert cfg.fdr_training_profile_version == 8
+    assert set(cfg.fdr_component_training_profile_version.values()) == {8}
     assert cfg.multifidelity_sim_loss_weight == 0.2
     assert cfg.damping_slope_weight == 0.0
     assert cfg.damping_curvature_weight == 0.0
@@ -155,6 +160,20 @@ class _ConstantTargetModel(torch.nn.Module):
         }
 
 
+class _MachDampingModel(torch.nn.Module):
+    outputs_normalized = True
+
+    def __init__(self, intercept=0.05, slope=0.10):
+        super().__init__()
+        self.intercept = float(intercept)
+        self.slope = float(slope)
+        self.cfg = SimpleNamespace(K_max=3)
+
+    def forward(self, H, M, excitation_id, channel_id):
+        value = self.intercept + self.slope * M[:, :1]
+        return {"damping": value.expand(-1, 3)}
+
+
 def _normalizer(names, mean, std):
     return Normalizer(
         mean=np.asarray(mean, dtype=np.float32),
@@ -163,6 +182,17 @@ def _normalizer(names, mean, std):
         residue_target="polar",
         names=list(names),
     )
+
+
+def _support_normalizer(names, mean, std, slots):
+    normalizer = _normalizer(names, mean, std)
+    normalizer.support = {
+        "schema_version": 2,
+        "coordinate_support_scope": "training_and_validation_rows",
+        "slope_fit_scope": "training_rows_only",
+        "slots": slots,
+    }
+    return normalizer
 
 
 def _component_bundle(model, input_norm, output_norm, *, fidelity_mode="multifidelity"):
@@ -216,6 +246,122 @@ def test_fdr_inference_merges_components_and_reconstructs_physical_values():
     np.testing.assert_allclose(output["cos_theta"][0], np.asarray([1.0, 0.8, 0.0]), atol=1e-6)
     assert np.all(output["alpha"] < 0.0)
     assert np.all(output["valid_mask"] == 1.0)
+
+
+def test_damping_tanh_pull_has_bounded_slope_and_positive_floor():
+    boundary = np.asarray([0.15, -0.01], dtype=np.float64)
+    center = np.asarray([0.09, 0.04], dtype=np.float64)
+    slope_limit = 0.03
+    epsilon = 1e-6
+    at_boundary = _bounded_damping_tanh_pull(
+        boundary, center, np.zeros(2), slope_limit
+    )
+    just_outside = _bounded_damping_tanh_pull(
+        boundary, center, np.full(2, epsilon), slope_limit
+    )
+    far_outside = _bounded_damping_tanh_pull(
+        boundary, center, np.full(2, 100.0), slope_limit
+    )
+
+    assert at_boundary[0] == boundary[0]
+    assert at_boundary[1] == 1e-6
+    assert np.all(np.abs((just_outside - at_boundary) / epsilon) <= slope_limit + 1e-6)
+    np.testing.assert_allclose(far_outside, center, atol=1e-8)
+    assert np.all(far_outside > 0.0)
+
+
+def test_fdr_inference_defaults_to_tanh_and_preserves_in_support_damping():
+    parameter = inspect.signature(_run_infer_fdr_bundle_batched).parameters[
+        "extrapolation_policy"
+    ]
+    assert parameter.default == "tanh"
+
+    slots = [
+        {
+            "slot_index": slot,
+            "slot_number": slot + 1,
+            "height_min": 3.0,
+            "height_max": 8.0,
+            "mach_min": 0.5,
+            "mach_max": 1.0,
+            "slope_limit": 0.02,
+            "train_count": 10,
+        }
+        for slot in range(3)
+    ]
+    input_norm = _normalizer(("H", "M"), (0.0, 0.0), (1.0, 1.0))
+    bundle = {
+        "frequency": _component_bundle(
+            _ConstantTargetModel({"freq": [10.0, 20.0, 30.0]}),
+            input_norm,
+            _support_normalizer(("freq",), (0.0,), (1.0,), slots),
+        ),
+        "damping": _component_bundle(
+            _MachDampingModel(),
+            input_norm,
+            _support_normalizer(("damping",), (0.0,), (1.0,), slots),
+        ),
+        "residue_magnitude": _component_bundle(
+            _ConstantTargetModel({"magnitude": [1.0, 2.0, 3.0]}),
+            input_norm,
+            _support_normalizer(("magnitude",), (0.0,), (1.0,), slots),
+        ),
+        "residue_phase": _component_bundle(
+            _ConstantTargetModel(
+                {"sin_theta": [0.0, 0.6, 1.0], "cos_theta": [1.0, 0.8, 0.0]}
+            ),
+            input_norm,
+            _support_normalizer(
+                ("sin_theta", "cos_theta"), (0.0, 0.0), (1.0, 1.0), slots
+            ),
+        ),
+    }
+    mach = np.asarray([-10.0, 0.5, 0.75, 1.0, 1.5, 10.0], dtype=np.float32)
+    output = _run_infer_fdr_bundle_batched(
+        bundle,
+        torch.device("cpu"),
+        np.full_like(mach, 3.0),
+        mach,
+        np.ones(len(mach), dtype=np.int64),
+        np.full(len(mach), 8, dtype=np.int64),
+    )
+    damping = -output["alpha"][:, 0] / np.hypot(
+        output["alpha"][:, 0], output["omega"][:, 0]
+    )
+
+    np.testing.assert_allclose(damping[1:4], [0.10, 0.125, 0.15], atol=1e-6)
+    assert 0.10 < damping[0] <= 0.125 + 1e-6
+    assert 0.125 - 1e-6 <= damping[-1] < 0.15
+    assert 0.125 < damping[4] < 0.15
+    assert np.all(output["damping_valid_mask"] == 1.0)
+
+
+def test_slot_support_uses_train_and_validation_coordinates_but_train_only_slopes():
+    cfg = Config()
+    cfg.K_max = 1
+
+    def row(height, mach, damping):
+        return SimpleNamespace(
+            H=height,
+            M=mach,
+            mask=np.ones(1, dtype=np.float32),
+            damping=np.asarray([damping], dtype=np.float32),
+        )
+
+    support = _build_slot_support(
+        [row(3.0, 0.7, 0.05), row(3.0, 0.8, 0.06)],
+        [row(8.0, 1.2, 0.40)],
+        cfg,
+    )
+    slot = support["slots"][0]
+    assert support["schema_version"] == 2
+    assert support["coordinate_support_scope"] == "training_and_validation_rows"
+    assert support["slope_fit_scope"] == "training_rows_only"
+    assert slot["height_max"] == 8.0
+    assert slot["mach_max"] == 1.2
+    assert slot["support_count"] == 3
+    assert slot["damping_max"] < 0.40
+    np.testing.assert_allclose(slot["slope_limit"], 0.15, rtol=1e-5)
 
 
 def test_inventory_entry_lists_all_four_component_artifacts():

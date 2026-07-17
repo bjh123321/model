@@ -83,6 +83,12 @@ def _training_values(cfg, args) -> dict:
             "slope_limit_multiplier": float(getattr(cfg, "damping_slope_limit_multiplier", 1.0)),
             "slope_limit_floor": float(getattr(cfg, "damping_slope_limit_floor", 0.0)),
         },
+        "prediction_support": {
+            "coordinate_scope": "real_training_and_validation_rows",
+            "slope_fit_scope": "real_training_rows_only",
+            "default_extrapolation_policy": "tanh",
+            "damping_tanh_asymptote": "network_prediction_at_support_mid_mach",
+        },
         "sim_slot_outlier_filter": {
             "enabled": bool(
                 getattr(cfg, "sim_slot_outlier_filter_enabled", True)

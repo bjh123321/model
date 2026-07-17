@@ -87,6 +87,8 @@ def _build_slot_support(real_train: List[ParsedRow], real_val: List[ParsedRow], 
     )
     slots = []
     for slot, values in enumerate(train_values):
+        validation_slot_values = validation_values[slot]
+        support_values = values + validation_slot_values
         slopes = _observed_mach_slopes(values)
         slope_limit = max(
             floor,
@@ -96,23 +98,29 @@ def _build_slot_support(real_train: List[ParsedRow], real_val: List[ParsedRow], 
             "slot_index": slot,
             "slot_number": slot + 1,
             "train_count": len(values),
-            "validation_count": len(validation_values[slot]),
+            "validation_count": len(validation_slot_values),
+            "support_count": len(support_values),
             "low_confidence": len(values) < minimum_count,
             "slope_limit": slope_limit,
         }
+        if support_values:
+            slot_data.update({
+                "height_min": min(item[0] for item in support_values),
+                "height_max": max(item[0] for item in support_values),
+                "mach_min": min(item[1] for item in support_values),
+                "mach_max": max(item[1] for item in support_values),
+            })
         if values:
             slot_data.update({
-                "height_min": min(item[0] for item in values),
-                "height_max": max(item[0] for item in values),
-                "mach_min": min(item[1] for item in values),
-                "mach_max": max(item[1] for item in values),
                 "damping_min": min(item[2] for item in values),
                 "damping_max": max(item[2] for item in values),
             })
         slots.append(slot_data)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "minimum_train_samples": minimum_count,
+        "coordinate_support_scope": "training_and_validation_rows",
+        "slope_fit_scope": "training_rows_only",
         "slots": slots,
     }
 
