@@ -31,6 +31,7 @@ def _model_config(cfg) -> dict:
         "modulation_type": "single_linear_hm",
         "mod_gamma": float(cfg.mod_gamma),
         "use_lora": False,
+        "physical_parameterization": bool(getattr(cfg, "fdr_physical_parameterization", False)),
     }
 
 
@@ -38,6 +39,9 @@ def _training_values(cfg, args) -> dict:
     requested_device = str(getattr(args, "device", "auto"))
     actual_device = "cuda" if requested_device != "cpu" and torch.cuda.is_available() else "cpu"
     values = {
+        "fdr_profile_version": int(
+            getattr(cfg, "fdr_training_profile_version", 1)
+        ),
         "optimizer": "AdamW",
         "learning_rate": float(cfg.lr_low_adam),
         "weight_decay": float(cfg.weight_decay),
@@ -59,10 +63,19 @@ def _training_values(cfg, args) -> dict:
         "checkpoint_selection": str(cfg.checkpoint_selection),
         "early_stop_patience": int(cfg.early_stop_patience_s1),
         "early_stop_min_delta": float(cfg.early_stop_min_delta),
+        "checkpoint_train_loss_ceiling": getattr(
+            cfg, "checkpoint_train_loss_ceiling", None
+        ),
         "validation_split": {
             "strategy": str(getattr(cfg, "val_split_strategy", "")),
             "ratio": float(getattr(cfg, "val_ratio", 0.0)),
             "seed": int(getattr(cfg, "val_seed", 42)),
+        },
+        "damping_smoothness": {
+            "slope_weight": float(getattr(cfg, "damping_slope_weight", 0.0)),
+            "curvature_weight": float(getattr(cfg, "damping_curvature_weight", 0.0)),
+            "slope_limit_multiplier": float(getattr(cfg, "damping_slope_limit_multiplier", 1.0)),
+            "slope_limit_floor": float(getattr(cfg, "damping_slope_limit_floor", 0.0)),
         },
     }
     parent_loss_target = getattr(cfg, "parent_train_loss_target", None)
@@ -151,7 +164,9 @@ def write_training_config(
             "pole_target": str(cfg.pole_target),
             "residue_target": str(cfg.residue_target),
             "target_names": list(dataset_metadata.get("target_names", [])),
+            "target_transforms": dict(getattr(cfg, "_target_transforms", {}) or {}),
         },
+        "slot_support": dict(getattr(cfg, "_slot_support_metadata", {}) or {}),
         "normalizers": {
             "input_file": "Normalizer_Input.pth",
             "output_file": "Normalizer_Output.pth",
@@ -219,6 +234,45 @@ def run_component_training(
     component_cfg.model_type = "TargetMFDNN"
     component_cfg.target_component = component
     component_cfg.model_target_names = list(target_names)
+    component_cfg.fdr_physical_parameterization = True
+    if getattr(args, "low_hidden", None) is None:
+        profiles = dict(getattr(component_cfg, "fdr_component_low_hidden", {}) or {})
+        component_cfg.low_hidden = list(
+            profiles.get(component, component_cfg.fdr_low_hidden)
+        )
+    if getattr(args, "dropout_prob", None) is None:
+        profiles = dict(getattr(component_cfg, "fdr_component_dropout_prob", {}) or {})
+        component_cfg.dropout_prob = float(
+            profiles.get(component, component_cfg.fdr_dropout_prob)
+        )
+    if getattr(args, "weight_decay", None) is None:
+        profiles = dict(getattr(component_cfg, "fdr_component_weight_decay", {}) or {})
+        component_cfg.weight_decay = float(
+            profiles.get(component, component_cfg.fdr_weight_decay)
+        )
+    if getattr(args, "early_stop_patience", None) is None:
+        profiles = dict(
+            getattr(component_cfg, "fdr_component_early_stop_patience", {}) or {}
+        )
+        component_cfg.early_stop_patience_s1 = int(
+            profiles.get(component, component_cfg.fdr_early_stop_patience)
+        )
+    if getattr(args, "checkpoint_train_loss_ceiling", None) is None:
+        profiles = dict(
+            getattr(
+                component_cfg,
+                "fdr_component_checkpoint_train_loss_ceiling",
+                {},
+            )
+            or {}
+        )
+        ceiling = profiles.get(
+            component,
+            component_cfg.fdr_checkpoint_train_loss_ceiling,
+        )
+        component_cfg.checkpoint_train_loss_ceiling = (
+            None if ceiling is None else float(ceiling)
+        )
     parent_targets = dict(getattr(component_cfg, "parent_train_loss_targets", {}) or {})
     if parent_targets:
         if component not in parent_targets:

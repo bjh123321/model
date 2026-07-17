@@ -558,6 +558,18 @@ class ExcitationChannelModelRegistry:
                     f"got={output_normalizer.target_names()}"
                 )
             bundle[component] = (selected_model, input_normalizer, output_normalizer)
+            low_confidence = [
+                int(item.get("slot_number", index + 1))
+                for index, item in enumerate(dict(output_normalizer.support or {}).get("slots", []))
+                if bool(item.get("low_confidence", False))
+            ]
+            if low_confidence and component == "damping":
+                print(
+                    f"[WARN] excitation_id={key[0]} channel_id={key[1]} damping slots "
+                    f"{low_confidence} have fewer than the configured minimum training samples; "
+                    "predictions are low-confidence.",
+                    flush=True,
+                )
         self._cache[key] = bundle
         print(
             f"[MODEL] loaded four FDR models for excitation_id={key[0]} channel_id={key[1]}",
@@ -581,8 +593,13 @@ def _run_infer_fdr_bundle_batched(
     ch_all: np.ndarray,
     batch_size: int = 20000,
     mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+    extrapolation_policy: str = "clip",
 ):
+    extrapolation_policy = str(extrapolation_policy).lower()
+    if extrapolation_policy not in {"clip", "mask", "allow"}:
+        raise ValueError(f"Unsupported extrapolation_policy={extrapolation_policy!r}")
     component_outputs = {}
+    component_support_masks = {}
     expected_kmax = None
     count = len(H_all)
     for component, target_names in FDR_COMPONENT_TARGETS.items():
@@ -596,31 +613,88 @@ def _run_infer_fdr_bundle_batched(
                 f"{component}={kmax}"
             )
         accum = {name: [] for name in target_names}
+        support_accum = []
         for start in range(0, count, batch_size):
             end = min(count, start + batch_size)
-            hm = torch.tensor(
-                np.stack([H_all[start:end], M_all[start:end]], axis=1),
-                dtype=torch.float32,
+            h_values = np.asarray(H_all[start:end], dtype=np.float64)
+            m_values = np.asarray(M_all[start:end], dtype=np.float64)
+            excitation_tensor = torch.tensor(
+                exc_all[start:end], dtype=torch.long, device=device
             )
-            hm_norm = input_normalizer.transform(hm).to(device)
-            predicted = model(
-                hm_norm[:, :1],
-                hm_norm[:, 1:],
-                torch.tensor(exc_all[start:end], dtype=torch.long, device=device),
-                torch.tensor(ch_all[start:end], dtype=torch.long, device=device),
+            channel_tensor = torch.tensor(
+                ch_all[start:end], dtype=torch.long, device=device
             )
+            support_slots = list(dict(output_normalizer.support or {}).get("slots", []))
+            support_mask = np.ones((end - start, kmax), dtype=bool)
+
+            def predict_at(h_input, m_input):
+                hm = torch.tensor(
+                    np.stack([h_input, m_input], axis=1), dtype=torch.float32
+                )
+                hm_norm = input_normalizer.transform(hm).to(device)
+                return model(
+                    hm_norm[:, :1], hm_norm[:, 1:], excitation_tensor, channel_tensor
+                )
+
+            if extrapolation_policy == "clip" and support_slots:
+                normalized_by_name = {
+                    name: np.zeros((end - start, kmax), dtype=np.float64)
+                    for name in target_names
+                }
+                for slot in range(kmax):
+                    slot_support = support_slots[slot] if slot < len(support_slots) else {}
+                    required = ("height_min", "height_max", "mach_min", "mach_max")
+                    if not all(key in slot_support for key in required):
+                        support_mask[:, slot] = False
+                        continue
+                    h_clipped = np.clip(
+                        h_values, float(slot_support["height_min"]), float(slot_support["height_max"])
+                    )
+                    m_clipped = np.clip(
+                        m_values, float(slot_support["mach_min"]), float(slot_support["mach_max"])
+                    )
+                    slot_predicted = predict_at(h_clipped, m_clipped)
+                    for name in target_names:
+                        normalized_by_name[name][:, slot] = (
+                            slot_predicted[name][:, slot].detach().cpu().numpy().astype(np.float64)
+                        )
+                predicted_numpy = normalized_by_name
+            else:
+                predicted = predict_at(h_values, m_values)
+                predicted_numpy = {
+                    name: predicted[name].detach().cpu().numpy().astype(np.float64)
+                    for name in target_names
+                }
+                if extrapolation_policy == "mask" and support_slots:
+                    for slot in range(kmax):
+                        slot_support = support_slots[slot] if slot < len(support_slots) else {}
+                        required = ("height_min", "height_max", "mach_min", "mach_max")
+                        if not all(key in slot_support for key in required):
+                            support_mask[:, slot] = False
+                            continue
+                        support_mask[:, slot] = (
+                            (h_values >= float(slot_support["height_min"]))
+                            & (h_values <= float(slot_support["height_max"]))
+                            & (m_values >= float(slot_support["mach_min"]))
+                            & (m_values <= float(slot_support["mach_max"]))
+                        )
+
             for target_index, name in enumerate(target_names):
-                normalized = predicted[name].detach().cpu().numpy().astype(np.float64)
-                raw = (
-                    normalized * float(output_normalizer.std[target_index])
+                latent = (
+                    predicted_numpy[name] * float(output_normalizer.std[target_index])
                     + float(output_normalizer.mean[target_index])
                 )
-                accum[name].append(raw)
+                accum[name].append(
+                    output_normalizer.decode_target_numpy(name, latent).astype(np.float64)
+                )
+            support_accum.append(support_mask)
         for name in target_names:
             component_outputs[name] = np.concatenate(accum[name], axis=0)
+        component_support_masks[component] = np.concatenate(support_accum, axis=0)
 
     freq = np.nan_to_num(component_outputs["freq"], nan=0.0, posinf=0.0, neginf=0.0)
     damping = np.nan_to_num(component_outputs["damping"], nan=0.0, posinf=0.0, neginf=0.0)
+    damping = np.maximum(damping, 0.0)
     rho = np.nan_to_num(component_outputs["magnitude"], nan=0.0, posinf=0.0, neginf=0.0)
     sin_t = np.nan_to_num(component_outputs["sin_theta"], nan=0.0, posinf=0.0, neginf=0.0)
     cos_t = np.nan_to_num(component_outputs["cos_theta"], nan=1.0, posinf=1.0, neginf=1.0)
@@ -630,12 +704,21 @@ def _run_infer_fdr_bundle_batched(
 
     omega = 2.0 * np.pi * freq
     alpha = -damping * omega / np.sqrt(np.maximum(1.0 - damping * damping, 1e-12))
-    valid_mask = (
-        np.isfinite(alpha) & np.isfinite(omega) & np.isfinite(rho)
-        & np.isfinite(sin_t) & np.isfinite(cos_t)
-        & (alpha < 0.0) & (omega > 0.0) & (freq > 0.0)
-        & (damping > 0.0) & (damping < 0.5) & (rho > 1e-12)
+    frequency_valid_mask = (
+        np.isfinite(freq) & (freq > 0.0) & component_support_masks["frequency"]
     )
+    damping_valid_mask = (
+        np.isfinite(damping) & (damping > 0.0) & (damping < 0.5)
+        & component_support_masks["damping"]
+    )
+    magnitude_valid_mask = (
+        np.isfinite(rho) & (rho > 1e-12) & component_support_masks["residue_magnitude"]
+    )
+    phase_valid_mask = (
+        np.isfinite(sin_t) & np.isfinite(cos_t)
+        & component_support_masks["residue_phase"]
+    )
+    valid_mask = frequency_valid_mask & damping_valid_mask & magnitude_valid_mask & phase_valid_mask
     if mode_freq_ranges is not None:
         for row_index, channel_id in enumerate(np.asarray(ch_all, dtype=np.int64)):
             ch_name = channels[int(channel_id)] if 0 <= int(channel_id) < len(channels) else f"C{int(channel_id):02d}"
@@ -646,6 +729,10 @@ def _run_infer_fdr_bundle_batched(
                     rg is not None and valid_mask[row_index, slot]
                     and float(rg[0]) <= float(freq[row_index, slot]) <= float(rg[1])
                 )
+                frequency_valid_mask[row_index, slot] = bool(
+                    rg is not None and frequency_valid_mask[row_index, slot]
+                    and float(rg[0]) <= float(freq[row_index, slot]) <= float(rg[1])
+                )
     return {
         "alpha": alpha,
         "omega": omega,
@@ -653,6 +740,10 @@ def _run_infer_fdr_bundle_batched(
         "sin_theta": sin_t,
         "cos_theta": cos_t,
         "valid_mask": valid_mask.astype(np.float32),
+        "frequency_valid_mask": frequency_valid_mask.astype(np.float32),
+        "damping_valid_mask": damping_valid_mask.astype(np.float32),
+        "magnitude_valid_mask": magnitude_valid_mask.astype(np.float32),
+        "phase_valid_mask": phase_valid_mask.astype(np.float32),
     }
 
 
@@ -669,6 +760,7 @@ def run_infer_batched(
     batch_size: int = 20000,
     predict_output: str = "low",
     mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+    extrapolation_policy: str = "clip",
 ):
     if not isinstance(model, ExcitationChannelModelRegistry):
         return _run_infer_single_model_batched(
@@ -688,6 +780,10 @@ def run_infer_batched(
         "sin_theta": np.zeros((count, kmax), dtype=np.float64),
         "cos_theta": np.ones((count, kmax), dtype=np.float64),
         "valid_mask": np.zeros((count, kmax), dtype=np.float32),
+        "frequency_valid_mask": np.zeros((count, kmax), dtype=np.float32),
+        "damping_valid_mask": np.zeros((count, kmax), dtype=np.float32),
+        "magnitude_valid_mask": np.zeros((count, kmax), dtype=np.float32),
+        "phase_valid_mask": np.zeros((count, kmax), dtype=np.float32),
     }
     exc_values = np.asarray(exc_all, dtype=np.int64)
     channel_values = np.asarray(ch_all, dtype=np.int64)
@@ -710,6 +806,7 @@ def run_infer_batched(
             channel_values[selected],
             batch_size=batch_size,
             mode_freq_ranges=mode_freq_ranges,
+            extrapolation_policy=extrapolation_policy,
         )
         for name in combined:
             combined[name][selected] = output[name]
@@ -849,6 +946,8 @@ def save_response_dat(
             outs_resp["sin_theta"][ch_idx], outs_resp["cos_theta"][ch_idx],
             outs_resp["valid_mask"][ch_idx], ch_name, csv_path, u, Ts,
             exist_thresh=exist_thresh, use_freq_filter=use_freq_filter,
+            frequency_valid_mask_row=outs_resp.get("frequency_valid_mask", outs_resp["valid_mask"])[ch_idx],
+            damping_valid_mask_row=outs_resp.get("damping_valid_mask", outs_resp["valid_mask"])[ch_idx],
         )
         if not any(freq_slots):
             fd_lines.append(f"{ch_name}," + ",".join([""] * 9) + "\n")
@@ -909,6 +1008,8 @@ def _build_yhat_and_slot_strings(
     Ts: float,
     exist_thresh: float = 0.5,
     use_freq_filter: bool = True,
+    frequency_valid_mask_row: np.ndarray | None = None,
+    damping_valid_mask_row: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """对单个扫描点/单个通道：
     1) 按存在性与频段范围筛选槽位；
@@ -920,21 +1021,28 @@ def _build_yhat_and_slot_strings(
     freq_slots = [""] * kmax
     damp_slots = [""] * kmax
     selected_alpha, selected_omega, selected_rho, selected_theta = [], [], [], []
+    if frequency_valid_mask_row is None:
+        frequency_valid_mask_row = valid_mask_row
+    if damping_valid_mask_row is None:
+        damping_valid_mask_row = valid_mask_row
 
     for slot in range(kmax):
-        if not bool(valid_mask_row[slot] > exist_thresh):
-            continue
         alpha = float(alpha_row[slot])
         omega = float(omega_row[slot])
         rho = float(rho_row[slot])
         theta = float(np.arctan2(sin_row[slot], cos_row[slot]))
-        if not np.all(np.isfinite([alpha, omega, rho, theta])):
-            continue
         denominator = float(np.hypot(alpha, omega))
-        if denominator <= 0.0:
+        if bool(frequency_valid_mask_row[slot] > exist_thresh) and np.isfinite(omega) and omega > 0.0:
+            freq_slots[slot] = f"{omega / (2.0 * np.pi):.2f}"
+        if (
+            bool(damping_valid_mask_row[slot] > exist_thresh)
+            and np.isfinite(alpha) and np.isfinite(omega) and denominator > 0.0
+        ):
+            damp_slots[slot] = f"{(-alpha / denominator) * 200.0:.6f}"
+        if not bool(valid_mask_row[slot] > exist_thresh):
             continue
-        freq_slots[slot] = f"{omega / (2.0 * np.pi):.2f}"
-        damp_slots[slot] = f"{(-alpha / denominator) * 200.0:.6f}"
+        if not np.all(np.isfinite([alpha, omega, rho, theta])) or denominator <= 0.0:
+            continue
         selected_alpha.append(alpha)
         selected_omega.append(omega)
         selected_rho.append(rho)
@@ -1017,6 +1125,8 @@ def save_HF_HG_for_entry(
                 Ts=Ts,
                 exist_thresh=exist_thresh,
                 use_freq_filter=use_freq_filter,
+                frequency_valid_mask_row=outs_hscan.get("frequency_valid_mask", valid_mask)[row],
+                damping_valid_mask_row=outs_hscan.get("damping_valid_mask", valid_mask)[row],
             )
 
             pp_slots = ["", "", ""]
@@ -1115,6 +1225,8 @@ def save_VF_VG_for_entry(
                 Ts=Ts,
                 exist_thresh=exist_thresh,
                 use_freq_filter=use_freq_filter,
+                frequency_valid_mask_row=outs_mscan.get("frequency_valid_mask", valid_mask)[row],
+                damping_valid_mask_row=outs_mscan.get("damping_valid_mask", valid_mask)[row],
             )
 
             pp_slots = ["", "", ""]
@@ -1167,6 +1279,12 @@ def main():
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Apply per-channel/per-slot frequency ranges when explicitly enabled; direct valid model outputs are the default.",
+    )
+    parser.add_argument(
+        "--extrapolation_policy",
+        choices=["clip", "mask", "allow"],
+        default="clip",
+        help="Handle points outside each modal slot's training support: clip (default), mask, or allow.",
     )
     args, _unknown = parser.parse_known_args()
 
@@ -1254,6 +1372,7 @@ def main():
     in_norm = None
     mode_freq_ranges = _load_channel_freq_ranges(csv_path) if args.use_freq_filter else None
     print(f"==> Frequency range filter enabled: {args.use_freq_filter}", flush=True)
+    print(f"==> Extrapolation policy: {args.extrapolation_policy}", flush=True)
 
     # ===== 读取 ini → entries =====
     sortie_num, entries = load_task_from_ini(task_ini_path, EXC_NAME_TO_ID)
@@ -1293,6 +1412,7 @@ def main():
             batch_size=4096,
             predict_output=args.predict_output,
             mode_freq_ranges=mode_freq_ranges,
+            extrapolation_policy=args.extrapolation_policy,
         )
 
         # 2) 生成激励 u(t)
@@ -1322,6 +1442,7 @@ def main():
                 batch_size=20000,
                 predict_output=args.predict_output,
                 mode_freq_ranges=mode_freq_ranges,
+                extrapolation_policy=args.extrapolation_policy,
             )
             save_HF_HG_for_entry(
                 entry, H_axis, outs_hscan, csv_path,
@@ -1347,6 +1468,7 @@ def main():
                 batch_size=20000,
                 predict_output=args.predict_output,
                 mode_freq_ranges=mode_freq_ranges,
+                extrapolation_policy=args.extrapolation_policy,
             )
             save_VF_VG_for_entry(
                 entry, M_axis, outs_mscan, csv_path,

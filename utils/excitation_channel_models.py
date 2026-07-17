@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 from surrogate_model.utils.model_artifacts import atomic_write_json, load_json
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MODEL_INVENTORY_NAME = "models_manifest.json"
 TRAINING_FAILURES_NAME = "training_failures.json"
 FDR_COMPONENT_TARGETS = {
@@ -82,6 +82,7 @@ def model_entry(
             "normalizer_output": f"{component_dir}/Normalizer_Output.pth",
             "training_config": f"{component_dir}/training_config.json",
             "train_log": f"{component_dir}/train_log.csv",
+            "slot_support": f"{component_dir}/slot_support.json",
         }
     entry = {
         "excitation_id": int(excitation_id),

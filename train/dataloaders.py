@@ -11,10 +11,12 @@ from torch.utils.data.distributed import DistributedSampler
 
 from surrogate_model.config import Config
 from surrogate_model.data.io import ParsedRow
-from surrogate_model.data.normalizer import compute_input_normalizer_sim, compute_output_normalizer_masked
+from surrogate_model.data.normalizer import Normalizer, compute_input_normalizer_sim, compute_output_normalizer_masked
 from surrogate_model.data.datasets import ModalDataset, collate_modal
 from surrogate_model.utils.dist_utils import is_main_process
 from surrogate_model.utils.model_artifacts import group_key_from_parsed
+from surrogate_model.utils.model_artifacts import atomic_write_json
+from surrogate_model.utils.fdr_target_transforms import build_target_transform_specs
 
 
 def _ddp_ready() -> bool:
@@ -29,49 +31,139 @@ def _target_modes(cfg: Config) -> tuple[str, str]:
 
 def _output_normalizer(parsed: List[ParsedRow], cfg: Config):
     pole_target, residue_target = _target_modes(cfg)
+    target_names = getattr(cfg, "model_target_names", None)
+    transforms = build_target_transform_specs(
+        target_names or [],
+        (row.exc_id for row in parsed),
+        enabled=bool(target_names) and bool(getattr(cfg, "fdr_physical_parameterization", False)),
+    )
     return compute_output_normalizer_masked(
         parsed,
         pole_target=pole_target,
         residue_target=residue_target,
-        target_names=getattr(cfg, "model_target_names", None),
+        target_names=target_names,
+        target_transforms=transforms,
     )
 
 
-_DAMPING_LIMIT_BY_EXCITATION = {
-    0: 0.15,  # FXD_FDC
-    1: 0.15,  # FXD_DC
-    2: 0.30,  # PW_FDC
-    3: 0.30,  # PW_DC
-    4: 0.30,  # JFY_FDC
-    5: 0.30,  # JFY_DC
-}
+def _slot_values(rows: List[ParsedRow], slot: int):
+    values = []
+    for row in rows:
+        mask = np.asarray(row.mask, dtype=np.float64)
+        damping = np.asarray(row.damping, dtype=np.float64)
+        if slot >= len(mask) or slot >= len(damping) or mask[slot] <= 0.5:
+            continue
+        value = float(damping[slot])
+        if np.isfinite(value):
+            values.append((float(row.H), float(row.M), value))
+    return values
+
+
+def _observed_mach_slopes(values):
+    groups: dict[float, list[tuple[float, float]]] = {}
+    for height, mach, damping in values:
+        groups.setdefault(round(float(height), 8), []).append((float(mach), float(damping)))
+    slopes = []
+    for points in groups.values():
+        points.sort()
+        for (m0, d0), (m1, d1) in zip(points, points[1:]):
+            delta = m1 - m0
+            if delta > 1e-8:
+                slopes.append(abs((d1 - d0) / delta))
+    return slopes
+
+
+def _build_slot_support(real_train: List[ParsedRow], real_val: List[ParsedRow], cfg: Config):
+    kmax = int(cfg.K_max)
+    minimum_count = int(getattr(cfg, "min_slot_train_samples", 8))
+    multiplier = float(getattr(cfg, "damping_slope_limit_multiplier", 1.5))
+    floor = float(getattr(cfg, "damping_slope_limit_floor", 0.03))
+    train_values = [_slot_values(real_train, slot) for slot in range(kmax)]
+    validation_values = [_slot_values(real_val, slot) for slot in range(kmax)]
+    pooled_slopes = [slope for values in train_values for slope in _observed_mach_slopes(values)]
+    pooled_limit = max(
+        floor,
+        (float(np.quantile(pooled_slopes, 0.90)) * multiplier) if pooled_slopes else floor,
+    )
+    slots = []
+    for slot, values in enumerate(train_values):
+        slopes = _observed_mach_slopes(values)
+        slope_limit = max(
+            floor,
+            (float(np.quantile(slopes, 0.90)) * multiplier) if slopes else pooled_limit,
+        )
+        slot_data = {
+            "slot_index": slot,
+            "slot_number": slot + 1,
+            "train_count": len(values),
+            "validation_count": len(validation_values[slot]),
+            "low_confidence": len(values) < minimum_count,
+            "slope_limit": slope_limit,
+        }
+        if values:
+            slot_data.update({
+                "height_min": min(item[0] for item in values),
+                "height_max": max(item[0] for item in values),
+                "mach_min": min(item[1] for item in values),
+                "mach_max": max(item[1] for item in values),
+                "damping_min": min(item[2] for item in values),
+                "damping_max": max(item[2] for item in values),
+            })
+        slots.append(slot_data)
+    return {
+        "schema_version": 1,
+        "minimum_train_samples": minimum_count,
+        "slots": slots,
+    }
+
+
+def _attach_and_write_slot_support(
+    out_norm: Normalizer, real_train: List[ParsedRow], real_val: List[ParsedRow], cfg: Config, out_dir: Path
+):
+    support = _build_slot_support(real_train, real_val, cfg)
+    out_norm.support = support
+    cfg._slot_support_metadata = support
+    cfg._damping_slope_limits = [float(item["slope_limit"]) for item in support["slots"]]
+    if is_main_process():
+        atomic_write_json(Path(out_dir) / "slot_support.json", support)
+        summary = ", ".join(
+            f"slot{item['slot_number']}={item['train_count']}"
+            + ("(low-confidence)" if item["low_confidence"] else "")
+            for item in support["slots"]
+        )
+        print(f"[SLOT-SUPPORT] {summary}", flush=True)
 
 
 def _filter_damping_slots(parsed: List[ParsedRow], split_name: str):
-    """Return copied rows with over-limit modal slots masked out."""
+    """Mask only non-finite or non-positive damping slots."""
     filtered = []
     dropped = []
     for source in parsed:
         row = deepcopy(source)
         mask = np.asarray(row.mask, dtype=np.float32).copy()
-        threshold = _DAMPING_LIMIT_BY_EXCITATION.get(int(row.exc_id))
-        if threshold is not None:
-            damping = np.asarray(row.damping, dtype=np.float64)
-            width = min(len(mask), len(damping))
-            for slot in range(width):
-                if mask[slot] > 0.5 and np.isfinite(damping[slot]) and float(damping[slot]) >= threshold:
-                    mask[slot] = 0.0
-                    dropped.append({
-                        "split": split_name,
-                        "H": float(row.H),
-                        "M": float(row.M),
-                        "exc_id": int(row.exc_id),
-                        "ch_id": int(row.ch_id),
-                        "slot_number": slot + 1,
-                        "slot_index": slot,
-                        "damping": float(damping[slot]),
-                        "threshold": float(threshold),
-                    })
+        damping = np.asarray(row.damping, dtype=np.float64)
+        width = min(len(mask), len(damping))
+        for slot in range(width):
+            invalid = (
+                not np.isfinite(damping[slot])
+                or float(damping[slot]) <= 0.0
+            )
+            if mask[slot] > 0.5 and invalid:
+                mask[slot] = 0.0
+                dropped.append({
+                    "split": split_name,
+                    "H": float(row.H),
+                    "M": float(row.M),
+                    "exc_id": int(row.exc_id),
+                    "ch_id": int(row.ch_id),
+                    "slot_number": slot + 1,
+                    "slot_index": slot,
+                    "damping": float(damping[slot]),
+                    "reason": (
+                        "non_finite" if not np.isfinite(damping[slot])
+                        else "non_positive"
+                    ),
+                })
         row.mask = mask
         row.K_valid = int(np.count_nonzero(mask > 0.5))
         filtered.append(row)
@@ -86,9 +178,8 @@ def _write_damping_filter_log(out_dir: Path, dropped: list[dict]):
     val_count = sum(item["split"] == "validation" for item in dropped)
     lines = [
         "DAMPING SLOT FILTER",
-        "FXD exc_id 0/1: discard damping >= 0.15",
-        "PW  exc_id 2/3: discard damping >= 0.30",
-        "JFY exc_id 4/5: discard damping >= 0.30",
+        "Stable-mode filter: discard non-finite or damping <= 0",
+        "No excitation-specific upper damping limit is applied.",
         f"dropped_total={len(dropped)} dropped_train={train_count} dropped_validation={val_count}",
         "",
     ]
@@ -97,7 +188,7 @@ def _write_damping_filter_log(out_dir: Path, dropped: list[dict]):
             f"[{index:05d}] split={item['split']} H={item['H']:.9g} M={item['M']:.9g} "
             f"exc_id={item['exc_id']} ch_id={item['ch_id']} "
             f"slot_number={item['slot_number']} slot_index={item['slot_index']} "
-            f"damping={item['damping']:.9g} threshold={item['threshold']:.9g}"
+            f"damping={item['damping']:.9g} reason={item['reason']}"
         )
     path.write_text("\n".join(lines), encoding="utf-8")
     print(
@@ -366,6 +457,7 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     _write_damping_filter_log(out_dir, dropped_train + dropped_val)
 
     out_norm_real = _output_normalizer(real_train, cfg)
+    _attach_and_write_slot_support(out_norm_real, real_train, real_val, cfg, out_dir)
     if is_main_process():
         out_norm_real.save(out_dir / f"Normalizer_Output_Real_Fold{fold_idx}.pth")
 
@@ -419,6 +511,7 @@ def build_single_fidelity_dataloaders(
 
     in_norm_real = compute_input_normalizer_sim(real_train)
     out_norm_real = _output_normalizer(real_train, cfg)
+    _attach_and_write_slot_support(out_norm_real, real_train, real_val, cfg, out_dir)
 
     real_tr = ModalDataset(real_train, cfg.K_max, in_norm_real, out_norm_real)
     real_va = ModalDataset(real_val, cfg.K_max, in_norm_real, out_norm_real)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -62,6 +62,58 @@ class Config:
     # Optim
     lr_low_adam: float = 1e-3
     weight_decay: float = 5e-5
+
+    # Independent FDR-component defaults.  Keep the split models large enough to
+    # interpolate the sparse H/M samples; damping smoothness is handled by a
+    # separate soft penalty below instead of shrinking every component network.
+    fdr_physical_parameterization: bool = True
+    fdr_training_profile_version: int = 4
+    fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
+        "frequency": 3,
+        "damping": 4,
+        "residue_magnitude": 3,
+        "residue_phase": 3,
+    })
+    fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
+    fdr_dropout_prob: float = 0.0
+    fdr_weight_decay: float = 5e-5
+    fdr_early_stop_patience: int = 500
+    fdr_component_low_hidden: Dict[str, List[int]] = field(default_factory=lambda: {
+        "frequency": [64, 128, 64],
+        "damping": [64, 128, 64],
+        "residue_magnitude": [64, 128, 64],
+        "residue_phase": [64, 128, 64],
+    })
+    fdr_component_dropout_prob: Dict[str, float] = field(default_factory=lambda: {
+        "frequency": 0.0,
+        "damping": 0.0,
+        "residue_magnitude": 0.0,
+        "residue_phase": 0.0,
+    })
+    fdr_component_weight_decay: Dict[str, float] = field(default_factory=lambda: {
+        "frequency": 5e-5,
+        "damping": 5e-5,
+        "residue_magnitude": 5e-5,
+        "residue_phase": 5e-5,
+    })
+    fdr_component_early_stop_patience: Dict[str, int] = field(default_factory=lambda: {
+        "frequency": 500,
+        "damping": 500,
+        "residue_magnitude": 500,
+        "residue_phase": 500,
+    })
+    fdr_checkpoint_train_loss_ceiling: float = 0.05
+    fdr_component_checkpoint_train_loss_ceiling: Dict[str, Optional[float]] = field(default_factory=lambda: {
+        "frequency": 0.05,
+        "damping": None,
+        "residue_magnitude": 0.02,
+        "residue_phase": 0.02,
+    })
+    min_slot_train_samples: int = 8
+    damping_slope_weight: float = 0.0
+    damping_curvature_weight: float = 0.0
+    damping_slope_limit_multiplier: float = 1.5
+    damping_slope_limit_floor: float = 0.03
 
     # One-time migration source for parent versions created before dataset snapshots.
     incremental_history_dataset_dir: str = r"C:\Users\leo\Desktop\split_real_dataset_opt"

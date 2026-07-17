@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from surrogate_model.data.io import ParsedRow
+from surrogate_model.utils.fdr_target_transforms import decode_numpy, decode_torch, encode_numpy
 
 
 POLE_ALPHA_OMEGA = "alpha_omega"
@@ -103,6 +104,8 @@ class Normalizer:
     residue_target: str = RESIDUE_POLAR
     pole_target: str = POLE_ALPHA_OMEGA
     names: list[str] | None = None
+    target_transforms: dict[str, dict] | None = None
+    support: dict | None = None
 
     def __post_init__(self):
         self.pole_target = canonical_pole_target(self.pole_target)
@@ -113,6 +116,11 @@ class Normalizer:
             self.names = target_names_for(self.pole_target, self.residue_target)
         else:
             self.names = [str(x) for x in self.names]
+        self.target_transforms = {
+            str(name): dict(spec)
+            for name, spec in dict(self.target_transforms or {}).items()
+        }
+        self.support = dict(self.support or {})
 
     def save(self, path):
         import torch as _torch
@@ -123,6 +131,8 @@ class Normalizer:
             "residue_target": self.residue_target,
             "pole_target": self.pole_target,
             "target_names": list(self.names or target_names_for(self.pole_target, self.residue_target)),
+            "target_transforms": self.target_transforms,
+            "support": self.support,
         }
         _torch.save(d, path)
 
@@ -136,6 +146,8 @@ class Normalizer:
         residue_target = d.get("residue_target", RESIDUE_POLAR)
         pole_target = d.get("pole_target", POLE_ALPHA_OMEGA)
         names = d.get("target_names", None)
+        target_transforms = d.get("target_transforms", None)
+        support = d.get("support", None)
         if isinstance(mean, _torch.Tensor):
             mean = mean.detach().cpu().numpy()
         elif not isinstance(mean, _np.ndarray):
@@ -144,7 +156,15 @@ class Normalizer:
             std = std.detach().cpu().numpy()
         elif not isinstance(std, _np.ndarray):
             std = _np.asarray(std, dtype=_np.float32)
-        return Normalizer(mean=mean, std=std, residue_target=str(residue_target), pole_target=str(pole_target), names=names)
+        return Normalizer(
+            mean=mean,
+            std=std,
+            residue_target=str(residue_target),
+            pole_target=str(pole_target),
+            names=names,
+            target_transforms=target_transforms,
+            support=support,
+        )
 
     def transform(self, x: torch.Tensor) -> torch.Tensor:
         m = torch.as_tensor(self.mean, dtype=x.dtype, device=x.device)
@@ -161,6 +181,20 @@ class Normalizer:
 
     def target_names(self) -> list[str]:
         return list(self.names or target_names_for(self.pole_target, self.residue_target))
+
+    def target_transform(self, name: str) -> dict:
+        return dict((self.target_transforms or {}).get(str(name), {"kind": "identity"}))
+
+    def encode_target_numpy(self, name: str, values):
+        return encode_numpy(values, self.target_transform(name))
+
+    def decode_target_numpy(self, name: str, values):
+        return decode_numpy(values, self.target_transform(name))
+
+    def decode_normalized_target_torch(self, name: str, values: torch.Tensor) -> torch.Tensor:
+        index = self.target_names().index(str(name))
+        latent = values * float(self.std[index]) + float(self.mean[index])
+        return decode_torch(latent, self.target_transform(name))
 
 
 # Backward-compatible name kept for older imports.
@@ -180,6 +214,7 @@ def compute_output_normalizer_masked(
     residue_target: str = RESIDUE_POLAR,
     pole_target: str = POLE_ALPHA_OMEGA,
     target_names: list[str] | tuple[str, ...] | None = None,
+    target_transforms: dict[str, dict] | None = None,
 ) -> Normalizer:
     pole_target = canonical_pole_target(pole_target)
     residue_target = canonical_residue_target(residue_target)
@@ -202,7 +237,10 @@ def compute_output_normalizer_masked(
         if not mask.any():
             continue
         row_vals = row_target_values(p, pole_target, residue_target)
-        mat = np.stack([row_vals[name] for name in names], axis=1)
+        mat = np.stack([
+            encode_numpy(row_vals[name], dict(target_transforms or {}).get(name))
+            for name in names
+        ], axis=1)
         values.append(mat[mask])
     if not values:
         return Normalizer(
@@ -211,6 +249,7 @@ def compute_output_normalizer_masked(
             residue_target=residue_target,
             pole_target=pole_target,
             names=names,
+            target_transforms=target_transforms,
         )
     arr = np.concatenate(values, axis=0).astype(np.float64)
     mean = arr.mean(axis=0)
@@ -218,4 +257,11 @@ def compute_output_normalizer_masked(
     norm_mask = normalize_mask_for(names)
     mean[~norm_mask] = 0.0
     std[~norm_mask] = 1.0
-    return Normalizer(mean=mean, std=std, residue_target=residue_target, pole_target=pole_target, names=names)
+    return Normalizer(
+        mean=mean,
+        std=std,
+        residue_target=residue_target,
+        pole_target=pole_target,
+        names=names,
+        target_transforms=target_transforms,
+    )

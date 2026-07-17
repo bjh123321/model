@@ -102,7 +102,13 @@ def main():
             results = list(executor.map(_train_component_worker, tasks))
         assert all(result["ok"] for result in results), results
         for component in ("frequency", "damping"):
-            ready, reason = _resume_component_ready(version_dir, 1, 8, component)
+            ready, reason = _resume_component_ready(
+                version_dir,
+                1,
+                8,
+                component,
+                required_profile_version=4,
+            )
             assert ready, reason
         ready, _reason = _resume_component_ready(version_dir, 1, 8, "residue_phase")
         assert not ready

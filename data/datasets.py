@@ -32,7 +32,7 @@ def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
     names = out_norm.target_names()
     raw_values = row_target_values(p, out_norm.pole_target, out_norm.residue_target)
     lab = torch.stack([
-        _fixed_len_tensor(raw_values[name], K_max)
+        _fixed_len_tensor(out_norm.encode_target_numpy(name, raw_values[name]), K_max)
         for name in names
     ], dim=0)
     mean, std = _global_stats(out_norm, lab.size(0))

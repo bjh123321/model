@@ -175,11 +175,12 @@ def _resume_component_ready(
     excitation_id: int,
     channel_id: int,
     component: str,
+    required_profile_version: int | None = None,
 ) -> tuple[bool, str]:
     try:
         required = (
             "model.pth", "Normalizer_Input.pth", "Normalizer_Output.pth",
-            "training_config.json", "train_log.csv",
+            "training_config.json", "train_log.csv", "slot_support.json",
         )
         target_names = FDR_COMPONENT_TARGETS[component]
         component_dir = output_dir / component
@@ -203,16 +204,42 @@ def _resume_component_ready(
             normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
             if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
                 return False, f"invalid {filename}"
+        output_normalizer = torch.load(
+            component_dir / "Normalizer_Output.pth", map_location="cpu", weights_only=True
+        )
+        transforms = dict(output_normalizer.get("target_transforms", {}) or {})
+        if any(str(transforms.get(name, {}).get("kind", "identity")) == "identity" for name in target_names if name in {"freq", "magnitude"}):
+            return False, "output normalizer lacks physical target transforms"
         training_config = load_json(component_dir / "training_config.json")
         if int(training_config.get("excitation_id", excitation_id)) != int(excitation_id):
             return False, "training_config excitation_id mismatch"
         if int(training_config.get("channel_id", channel_id)) != int(channel_id):
             return False, "training_config channel_id mismatch"
+        if required_profile_version is not None:
+            actual_profile_version = int(
+                dict(training_config.get("training", {}) or {}).get(
+                    "fdr_profile_version", 1
+                )
+            )
+            if actual_profile_version < int(required_profile_version):
+                return False, (
+                    f"obsolete FDR training profile {actual_profile_version}; "
+                    f"requires {required_profile_version}"
+                )
         if (component_dir / "train_log.csv").stat().st_size <= 0:
             return False, "empty train_log.csv"
     except Exception as exc:
         return False, f"artifact validation failed: {type(exc).__name__}: {exc}"
     return True, "complete"
+
+
+def _required_component_profile_version(cfg, component: str) -> int:
+    versions = dict(
+        getattr(cfg, "fdr_component_training_profile_version", {}) or {}
+    )
+    return int(
+        versions.get(component, getattr(cfg, "fdr_training_profile_version", 1))
+    )
 
 
 def _resume_model_ready(output_dir: Path, excitation_id: int, channel_id: int) -> tuple[bool, str]:
@@ -293,6 +320,11 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=None)
     parser.add_argument("--early_stop_patience", type=int, default=None)
     parser.add_argument("--early_stop_min_delta", type=float, default=None)
+    parser.add_argument("--checkpoint_train_loss_ceiling", type=float, default=None)
+    parser.add_argument("--damping_slope_weight", type=float, default=None)
+    parser.add_argument("--damping_curvature_weight", type=float, default=None)
+    parser.add_argument("--damping_slope_limit_multiplier", type=float, default=None)
+    parser.add_argument("--min_slot_train_samples", type=int, default=None)
     parser.add_argument(
         "--checkpoint_selection",
         choices=["validation", "training"],
@@ -354,6 +386,19 @@ def main():
     args, _unknown = parser.parse_known_args()
     if int(args.parallel_workers) <= 0:
         raise ValueError("--parallel_workers must be a positive integer")
+    if (
+        args.checkpoint_train_loss_ceiling is not None
+        and float(args.checkpoint_train_loss_ceiling) <= 0.0
+    ):
+        raise ValueError("--checkpoint_train_loss_ceiling must be positive")
+    if args.damping_slope_weight is not None and float(args.damping_slope_weight) < 0.0:
+        raise ValueError("--damping_slope_weight must be non-negative")
+    if args.damping_curvature_weight is not None and float(args.damping_curvature_weight) < 0.0:
+        raise ValueError("--damping_curvature_weight must be non-negative")
+    if args.damping_slope_limit_multiplier is not None and float(args.damping_slope_limit_multiplier) <= 0.0:
+        raise ValueError("--damping_slope_limit_multiplier must be positive")
+    if args.min_slot_train_samples is not None and int(args.min_slot_train_samples) <= 0:
+        raise ValueError("--min_slot_train_samples must be positive")
 
     ddp_enabled, rank, _world_size = _ddp_setup()
     if ddp_enabled:
@@ -388,6 +433,18 @@ def main():
         cfg.early_stop_patience_s1 = int(args.early_stop_patience)
     if args.early_stop_min_delta is not None:
         cfg.early_stop_min_delta = float(args.early_stop_min_delta)
+    if args.checkpoint_train_loss_ceiling is not None:
+        cfg.checkpoint_train_loss_ceiling = float(
+            args.checkpoint_train_loss_ceiling
+        )
+    if args.damping_slope_weight is not None:
+        cfg.damping_slope_weight = float(args.damping_slope_weight)
+    if args.damping_curvature_weight is not None:
+        cfg.damping_curvature_weight = float(args.damping_curvature_weight)
+    if args.damping_slope_limit_multiplier is not None:
+        cfg.damping_slope_limit_multiplier = float(args.damping_slope_limit_multiplier)
+    if args.min_slot_train_samples is not None:
+        cfg.min_slot_train_samples = int(args.min_slot_train_samples)
     if args.checkpoint_selection is not None:
         cfg.checkpoint_selection = str(args.checkpoint_selection)
     if args.epochs is not None:
@@ -571,7 +628,13 @@ def main():
         for component in FDR_COMPONENT_TARGETS:
             if args.resume:
                 ready, reason = _resume_component_ready(
-                    output_dir, excitation_id, channel_id, component
+                    output_dir,
+                    excitation_id,
+                    channel_id,
+                    component,
+                    required_profile_version=_required_component_profile_version(
+                        combo_cfg, component
+                    ),
                 )
                 if ready:
                     component_states[key][component] = "resumed"
@@ -616,7 +679,12 @@ def main():
         info = combination_info[key]
         if result.get("ok"):
             ready, reason = _resume_component_ready(
-                combination_dir(model_root, *key), *key, component
+                combination_dir(model_root, *key),
+                *key,
+                component,
+                required_profile_version=_required_component_profile_version(
+                    cfg, component
+                ),
             )
             if ready:
                 component_states[key][component] = "trained"
