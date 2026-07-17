@@ -27,8 +27,8 @@ class Config:
     debug_direct_output: bool = False
 
     # Fixed-SF training
-    batch_real: int = 64
-    batch_sim: int = 256
+    batch_real: int = 8
+    batch_sim: int = 16
     num_workers: int = 8
     prefetch: int = 4
 
@@ -56,10 +56,10 @@ class Config:
     pole_target: str = "freq_damping"
     residue_target: str = "polar"
 
-    epochs_stage1: int = 5000
-    epochs_stage2: int = 5000
-    early_stop_patience_s1: int = 500
-    early_stop_patience_s2: int = 500
+    epochs_stage1: int = 500
+    epochs_stage2: int = 500
+    early_stop_patience_s1: int = 50
+    early_stop_patience_s2: int = 50
     early_stop_min_delta: float = 1e-6
     checkpoint_selection: str = "validation"
 
