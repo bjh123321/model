@@ -94,6 +94,126 @@ def _resolve_id_selection(raw_values, id_to_name: dict[int, str], label: str):
     return selected
 
 
+def _resolve_component_selection(raw_values) -> set[str] | None:
+    """Resolve repeatable comma/semicolon-separated FDR component names."""
+    if not raw_values:
+        return None
+    tokens = [
+        part.strip().lower().replace("-", "_")
+        for raw in raw_values
+        for part in str(raw).replace(";", ",").split(",")
+        if part.strip()
+    ]
+    available = set(FDR_COMPONENT_TARGETS)
+    invalid = sorted({token for token in tokens if token not in available})
+    if invalid:
+        raise ValueError(
+            f"Unknown component selector(s) {invalid}; available: "
+            + ", ".join(FDR_COMPONENT_TARGETS)
+        )
+    selected = set(tokens)
+    if not selected:
+        raise ValueError("At least one component selector is required")
+    return selected
+
+
+def _resolve_component_value_mapping(
+    raw_values,
+    *,
+    label: str,
+    value_type,
+    choices=None,
+    minimum: float | None = None,
+) -> dict[str, object]:
+    """Resolve repeatable ``component=value`` assignments."""
+    if not raw_values:
+        return {}
+    available = set(FDR_COMPONENT_TARGETS)
+    allowed = None if choices is None else {str(value).lower() for value in choices}
+    resolved = {}
+    for raw in raw_values:
+        for assignment in str(raw).replace(";", ",").split(","):
+            assignment = assignment.strip()
+            if not assignment:
+                continue
+            if "=" not in assignment:
+                raise ValueError(
+                    f"Invalid {label} assignment {assignment!r}; expected component=value"
+                )
+            component_raw, value_raw = assignment.split("=", 1)
+            component = component_raw.strip().lower().replace("-", "_")
+            if component not in available:
+                raise ValueError(
+                    f"Unknown component in {label} assignment {component_raw!r}; available: "
+                    + ", ".join(FDR_COMPONENT_TARGETS)
+                )
+            try:
+                value = value_type(value_raw.strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid {label} value for {component}: {value_raw!r}"
+                ) from exc
+            if allowed is not None:
+                normalized = str(value).lower()
+                if normalized not in allowed:
+                    raise ValueError(
+                        f"Invalid {label} value for {component}: {value!r}; "
+                        f"expected one of {sorted(allowed)}"
+                    )
+                value = normalized
+            if minimum is not None:
+                numeric_value = float(value)
+                if not math.isfinite(numeric_value) or numeric_value < float(minimum):
+                    raise ValueError(
+                        f"Invalid {label} value for {component}: {value!r}; "
+                        f"must be finite and >= {minimum:g}"
+                    )
+            resolved[component] = value
+    if not resolved:
+        raise ValueError(f"At least one {label} component=value assignment is required")
+    return resolved
+
+
+def _apply_component_training_cli(cfg: Config, args) -> None:
+    checkpoint_values = _resolve_component_value_mapping(
+        getattr(args, "component_checkpoint_selection", None),
+        label="component checkpoint selection",
+        value_type=str,
+        choices=("training", "validation"),
+    )
+    real_values = _resolve_component_value_mapping(
+        getattr(args, "component_real_loss_weight", None),
+        label="component real loss weight",
+        value_type=float,
+        minimum=0.0,
+    )
+    sim_values = _resolve_component_value_mapping(
+        getattr(args, "component_sim_loss_weight", None),
+        label="component simulation loss weight",
+        value_type=float,
+        minimum=0.0,
+    )
+    cfg.fdr_component_checkpoint_selection.update(checkpoint_values)
+    cfg.fdr_component_real_loss_weight.update(real_values)
+    cfg.fdr_component_sim_loss_weight.update(sim_values)
+
+    scalar_overrides = {
+        "real_loss_weight": "multifidelity_real_loss_weight",
+        "sim_loss_weight": "multifidelity_sim_loss_weight",
+    }
+    for source, destination in scalar_overrides.items():
+        value = getattr(args, source, None)
+        if value is not None:
+            setattr(cfg, destination, value)
+    for name in (
+        "multifidelity_real_loss_weight",
+        "multifidelity_sim_loss_weight",
+    ):
+        value = float(getattr(cfg, name))
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
+
+
 def _filter_combinations(combinations, selected_excitations=None, selected_channels=None):
     return [
         (excitation_id, channel_id)
@@ -493,7 +613,30 @@ def main():
         "--checkpoint_selection",
         choices=["validation", "training"],
         default=None,
-        help="Select the best checkpoint by validation group_FXD loss (default) or total training loss.",
+        help="Select the best checkpoint by total training loss (default) or validation group_FXD loss.",
+    )
+    parser.add_argument(
+        "--component_checkpoint_selection",
+        action="append",
+        default=None,
+        help=(
+            "Per-component early-stop/checkpoint metric as component=training|validation; "
+            "repeat or separate assignments with commas."
+        ),
+    )
+    parser.add_argument("--real_loss_weight", type=float, default=None)
+    parser.add_argument("--sim_loss_weight", type=float, default=None)
+    parser.add_argument(
+        "--component_real_loss_weight",
+        action="append",
+        default=None,
+        help="Per-component stage-2 real-data weights as component=value.",
+    )
+    parser.add_argument(
+        "--component_sim_loss_weight",
+        action="append",
+        default=None,
+        help="Per-component stage-2 simulation weights as component=value.",
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--epochs_s1", type=int, default=None)
@@ -530,6 +673,17 @@ def main():
         action="append",
         default=None,
         help="Train only selected response-channel names or IDs; repeat or separate with commas.",
+    )
+    parser.add_argument(
+        "--component",
+        "--components",
+        action="append",
+        default=None,
+        help=(
+            "Train only selected FDR component networks; repeat or separate with commas. "
+            "Available: frequency, damping, residue_magnitude, residue_phase. Selected "
+            "components are retrained in place even when --resume is used."
+        ),
     )
     parser.add_argument(
         "--height",
@@ -583,6 +737,13 @@ def main():
         raise ValueError("--damping_slope_limit_multiplier must be positive")
     if args.min_slot_train_samples is not None and int(args.min_slot_train_samples) <= 0:
         raise ValueError("--min_slot_train_samples must be positive")
+    for name in (
+        "real_loss_weight",
+        "sim_loss_weight",
+    ):
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(float(value)) or float(value) < 0.0):
+            raise ValueError(f"--{name} must be finite and non-negative")
 
     ddp_enabled, rank, _world_size = _ddp_setup()
     if ddp_enabled:
@@ -599,6 +760,7 @@ def main():
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
     cfg = Config()
+    _apply_component_training_cli(cfg, args)
     if args.embed_excitation_dim is not None:
         cfg.embed_excitation_dim = args.embed_excitation_dim
     if args.embed_channel_dim is not None:
@@ -777,6 +939,7 @@ def main():
         {index: name for index, name in enumerate(CHANNEL_NAMES)},
         "channel",
     )
+    selected_components = _resolve_component_selection(args.component)
     combinations = _filter_combinations(
         all_combinations, selected_excitations, selected_channels
     )
@@ -785,11 +948,16 @@ def main():
             "The excitation/channel selectors matched no combinations in the dataset"
         )
     selected_keys = set(combinations)
-    if selected_excitations is not None or selected_channels is not None:
+    if (
+        selected_excitations is not None
+        or selected_channels is not None
+        or selected_components is not None
+    ):
         print(
             f"[SELECTION] selected_combinations={len(combinations)}/{len(all_combinations)} "
             f"excitations={sorted(selected_excitations) if selected_excitations is not None else 'all'} "
-            f"channels={sorted(selected_channels) if selected_channels is not None else 'all'}",
+            f"channels={sorted(selected_channels) if selected_channels is not None else 'all'} "
+            f"components={sorted(selected_components) if selected_components is not None else 'all'}",
             flush=True,
         )
         rows_by_combination = {
@@ -899,7 +1067,15 @@ def main():
             )
             print(f"[SKIP] {label}: {type(exc).__name__}: {exc}", flush=True)
             for component in FDR_COMPONENT_TARGETS:
-                component_states[key][component] = "failed"
+                if selected_components is None or component in selected_components:
+                    component_states[key][component] = "failed"
+                else:
+                    ready, _reason = _resume_component_ready(
+                        output_dir, excitation_id, channel_id, component
+                    )
+                    component_states[key][component] = (
+                        "resumed" if ready else "unselected"
+                    )
             continue
 
         dataset_metadata = {
@@ -931,7 +1107,27 @@ def main():
             },
         }
         for component in FDR_COMPONENT_TARGETS:
-            if args.resume:
+            if selected_components is not None and component not in selected_components:
+                ready, reason = _resume_component_ready(
+                    output_dir, excitation_id, channel_id, component
+                )
+                component_states[key][component] = "resumed" if ready else "unselected"
+                if ready:
+                    print(f"[SELECTION] retained {label}/{component}", flush=True)
+                else:
+                    print(
+                        f"[SELECTION] skipped unavailable {label}/{component}: {reason}",
+                        flush=True,
+                    )
+                continue
+
+            # An explicit component selector means "retrain this exact network".
+            # It intentionally takes precedence over --resume and writes back to
+            # the existing component directory.
+            if selected_components is not None:
+                if (output_dir / component).exists():
+                    print(f"[SELECTION] overwrite {label}/{component}", flush=True)
+            elif args.resume:
                 ready, reason = _resume_component_ready(
                     output_dir,
                     excitation_id,
@@ -995,6 +1191,7 @@ def main():
             state
             for states in component_states.values()
             for state in states.values()
+            if state != "unselected"
         ]
         total_components = len(state_values)
         trained_components = sum(state == "trained" for state in state_values)

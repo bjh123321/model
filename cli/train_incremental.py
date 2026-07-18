@@ -4,11 +4,13 @@ import argparse
 import copy
 import configparser
 import math
+import multiprocessing as mp
 import os
 import shutil
 import socket
 import sys
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import torch
@@ -18,8 +20,14 @@ from surrogate_model.data.OE_BATCH_PROCESS import batch_process_split
 from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.models.checkpoint_utils import restore_model_config_from_checkpoint
+from surrogate_model.cli.train import (
+    _apply_component_training_cli,
+    _filter_combinations,
+    _resolve_component_selection,
+    _resolve_id_selection,
+    _train_component_worker,
+)
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
-from surrogate_model.train.full_training_runner import run_full_training
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -33,6 +41,8 @@ from surrogate_model.utils.model_artifacts import (
     validate_new_version_directory,
 )
 from surrogate_model.utils.excitation_channel_models import (
+    CHANNEL_NAMES,
+    EXCITATION_NAMES,
     FDR_COMPONENT_TARGETS,
     channel_name,
     combination_dir,
@@ -77,6 +87,86 @@ def _send_finished_udp():
         sock.close()
 
 
+def _run_incremental_component_tasks(
+    tasks: list[dict], parallel_workers: int, *, worker=None
+):
+    """Yield component-worker results; each task owns one staged component directory."""
+    worker = _train_component_worker if worker is None else worker
+    worker_count = int(parallel_workers)
+    if worker_count <= 0:
+        raise ValueError("parallel_workers must be positive")
+    if worker_count == 1:
+        for task in tasks:
+            yield worker(task)
+        return
+    if not tasks:
+        return
+
+    context = mp.get_context("spawn")
+    future_tasks = {}
+    with ProcessPoolExecutor(
+        max_workers=min(worker_count, len(tasks)),
+        mp_context=context,
+    ) as executor:
+        for task in tasks:
+            future_tasks[executor.submit(worker, task)] = task
+        for future in as_completed(future_tasks):
+            task = future_tasks[future]
+            try:
+                yield future.result()
+            except Exception as exc:
+                yield {
+                    "ok": False,
+                    "excitation_id": task["excitation_id"],
+                    "channel_id": task["channel_id"],
+                    "component": task["component"],
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+
+
+def _replace_selected_component_directories(
+    staging_dir: Path, final_dir: Path, components
+) -> None:
+    """Replace only selected component directories, rolling back commit failures."""
+    staging_dir = Path(staging_dir)
+    final_dir = Path(final_dir)
+    selected = tuple(str(component) for component in components)
+    missing = [component for component in selected if not (staging_dir / component).is_dir()]
+    if missing:
+        raise FileNotFoundError(
+            f"Staged component directories are missing: {missing} in {staging_dir}"
+        )
+
+    final_dir.mkdir(parents=True, exist_ok=True)
+    backup_dir = final_dir.parent / f".{final_dir.name}.component_backup"
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    records = []
+    try:
+        for component in selected:
+            staged = staging_dir / component
+            target = final_dir / component
+            backup = backup_dir / component
+            had_previous = target.exists()
+            if had_previous:
+                os.replace(target, backup)
+            records.append((target, backup, had_previous))
+            os.replace(staged, target)
+    except Exception:
+        for target, backup, had_previous in reversed(records):
+            if target.exists():
+                shutil.rmtree(target)
+            if had_previous and backup.exists():
+                os.replace(backup, target)
+        raise
+    finally:
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+
+
 def _restore_parent_configuration(
     base_version_dir: Path, parent_inventory: dict | None = None
 ) -> tuple[Config, dict | None]:
@@ -114,7 +204,6 @@ def _restore_parent_configuration(
             "epochs_stage2": "epochs_stage2",
             "num_workers": "num_workers",
             "prefetch": "prefetch",
-            "checkpoint_selection": "checkpoint_selection",
             "early_stop_patience": "early_stop_patience_s1",
             "early_stop_patience_stage2": "early_stop_patience_s2",
             "early_stop_min_delta": "early_stop_min_delta",
@@ -129,6 +218,24 @@ def _restore_parent_configuration(
             cfg.val_ratio = validation["ratio"]
         if "seed" in validation:
             cfg.val_seed = validation["seed"]
+        if parent_inventory is not None and parent_inventory.get("models"):
+            representative = parent_inventory["models"][0]
+            for component, component_entry in representative.get("components", {}).items():
+                component_training_path = base_version_dir / component_entry.get(
+                    "training_config", ""
+                )
+                if not component_training_path.is_file():
+                    continue
+                component_training = load_json(component_training_path).get("training", {})
+                multifidelity = dict(component_training.get("multifidelity", {}) or {})
+                if "real_loss_weight_stage2" in multifidelity:
+                    cfg.fdr_component_real_loss_weight[component] = float(
+                        multifidelity["real_loss_weight_stage2"]
+                    )
+                if "sim_loss_weight_stage2" in multifidelity:
+                    cfg.fdr_component_sim_loss_weight[component] = float(
+                        multifidelity["sim_loss_weight_stage2"]
+                    )
         return cfg, parent_training
 
     if not checkpoint_path.is_file():
@@ -196,6 +303,7 @@ def _apply_cli_overrides(cfg: Config, args) -> None:
         cfg.pole_target = canonical_pole_target(args.pole_target)
     if args.residue_target is not None:
         cfg.residue_target = canonical_residue_target(args.residue_target)
+    _apply_component_training_cli(cfg, args)
     cfg.use_lora = False
 
 
@@ -212,6 +320,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--early_stop_min_delta", type=float, default=None)
     parser.add_argument("--epochs_after_parent_loss", type=int, default=50)
     parser.add_argument("--checkpoint_selection", choices=["validation", "training"], default=None)
+    parser.add_argument("--component_checkpoint_selection", action="append", default=None)
+    parser.add_argument("--real_loss_weight", type=float, default=None)
+    parser.add_argument("--sim_loss_weight", type=float, default=None)
+    parser.add_argument("--component_real_loss_weight", action="append", default=None)
+    parser.add_argument("--component_sim_loss_weight", action="append", default=None)
     parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
     parser.add_argument("--dropout_prob", type=float, default=None)
     parser.add_argument("--use_modulation", action=argparse.BooleanOptionalAction, default=None)
@@ -221,12 +334,50 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default=None)
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--prefetch", type=int, default=None)
+    parser.add_argument(
+        "--parallel_workers",
+        type=int,
+        default=1,
+        help="Number of independent correction component networks to retrain concurrently.",
+    )
     parser.add_argument("--history_dataset", type=str, default=None)
+    parser.add_argument(
+        "--excitation",
+        "--excitations",
+        action="append",
+        default=None,
+        help=(
+            "Retrain only correction-data networks for selected excitation names or IDs; "
+            "repeat or separate with commas."
+        ),
+    )
+    parser.add_argument(
+        "--channel",
+        "--channels",
+        action="append",
+        default=None,
+        help=(
+            "Retrain only correction-data networks for selected channel names or IDs; "
+            "repeat or separate with commas."
+        ),
+    )
+    parser.add_argument(
+        "--component",
+        "--components",
+        action="append",
+        default=None,
+        help=(
+            "Retrain only selected FDR components in place in the new version. "
+            "Available: frequency, damping, residue_magnitude, residue_phase."
+        ),
+    )
     return parser
 
 
 def main():
     args = _parser().parse_args()
+    if int(args.parallel_workers) <= 0:
+        raise ValueError("--parallel_workers must be positive")
     base_dir = get_exe_dir()
     with (base_dir / "user_input.dat").open("r", encoding="utf-8") as handle:
         lines = [line.strip() for line in handle]
@@ -408,8 +559,41 @@ def main():
     }
     failures = []
     correction_parsed, _ = parse_rows_to_struct(correction_rows)
-    affected_combinations = combinations_in_rows(correction_parsed)
+    correction_combinations = combinations_in_rows(correction_parsed)
+    selected_excitations = _resolve_id_selection(
+        args.excitation, EXCITATION_NAMES, "excitation"
+    )
+    selected_channels = _resolve_id_selection(
+        args.channel,
+        {index: name for index, name in enumerate(CHANNEL_NAMES)},
+        "channel",
+    )
+    selected_components = _resolve_component_selection(args.component)
+    components_to_train = tuple(
+        component
+        for component in FDR_COMPONENT_TARGETS
+        if selected_components is None or component in selected_components
+    )
+    affected_combinations = _filter_combinations(
+        correction_combinations, selected_excitations, selected_channels
+    )
+    if not affected_combinations:
+        raise RuntimeError(
+            "The excitation/channel selectors matched no combinations in the correction "
+            "data listed on user_input.dat line 4 and later"
+        )
+    print(
+        f"[SELECTION] correction_combinations={len(affected_combinations)}/"
+        f"{len(correction_combinations)} "
+        f"excitations={sorted(selected_excitations) if selected_excitations is not None else 'all'} "
+        f"channels={sorted(selected_channels) if selected_channels is not None else 'all'} "
+        f"components={list(components_to_train)}",
+        flush=True,
+    )
+    tasks: list[dict] = []
+    combination_states: dict[tuple[int, int], dict] = {}
     for index, (excitation_id, channel_id) in enumerate(affected_combinations, 1):
+        key = (int(excitation_id), int(channel_id))
         combo_sim_rows = [
             row for row in sim_parsed
             if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
@@ -429,13 +613,13 @@ def main():
             flush=True,
         )
         try:
-            parent_entry = parent_models.get((excitation_id, channel_id))
+            parent_entry = parent_models.get(key)
             if parent_entry is not None:
-                combo_cfg, parent_training = _restore_parent_configuration(
+                combo_cfg, _parent_training = _restore_parent_configuration(
                     base_version_dir, {"models": [parent_entry]}
                 )
             else:
-                combo_cfg, parent_training = copy.deepcopy(cfg), None
+                combo_cfg, _parent_training = copy.deepcopy(cfg), None
             _apply_cli_overrides(combo_cfg, args)
             combo_cfg.validation_metric_scope = "all"
             available_keys = {group_key_from_parsed(row) for row in combo_rows}
@@ -489,45 +673,56 @@ def main():
                 group_key_from_parsed(row) for row in correction_parsed
                 if int(row.exc_id) == excitation_id and int(row.ch_id) == channel_id
             }
-            run_full_training(
-                cfg=combo_cfg,
-                sim_parsed=combo_sim_rows,
-                real_parsed=combo_rows,
-                model_version=new_model_version,
-                version_dir=training_dir,
-                args=args,
-                dataset_metadata={
-                    "manifest": manifest,
-                    "dataset_manifest_path": "../../../dataset_manifest.json",
-                    "training_mode": "correction_full_retrain",
-                    "sim_dataset_fingerprint": sim_manifest["dataset_fingerprint"],
-                    "fidelity_mode": "multifidelity",
-                    "prediction_output": "high",
-                    "model_filename": "model.pth",
-                    "parent_model_version": base_model_version,
-                    "parent_dataset_fingerprint": None if parent_manifest is None else parent_manifest.get("dataset_fingerprint"),
-                    "excitation_id": excitation_id,
-                    "excitation_name": excitation_name(excitation_id),
-                    "channel_id": channel_id,
-                    "corrected_group_keys": [list(key) for key in sorted(combo_correction_keys)],
-                    "replaced_group_keys": [list(key) for key in merge_info["replaced_group_keys"]],
-                    "added_group_keys": [list(key) for key in merge_info["added_group_keys"]],
-                    "target_names": target_names,
-                },
-            )
-            if final_dir.exists():
-                shutil.rmtree(final_dir)
-            os.replace(training_dir, final_dir)
-            result_models[(excitation_id, channel_id)] = model_entry(
-                excitation_id=excitation_id,
-                channel_id=channel_id,
-                row_count=len(combo_rows),
-                status="corrected",
-                source_model_version=base_model_version,
-                fidelity_mode="multifidelity",
-                sim_row_count=len(combo_sim_rows),
-                real_row_count=len(combo_rows),
-            )
+            dataset_metadata = {
+                "manifest": manifest,
+                "dataset_manifest_path": "../../../dataset_manifest.json",
+                "training_mode": "correction_full_retrain",
+                "sim_dataset_fingerprint": sim_manifest["dataset_fingerprint"],
+                "fidelity_mode": "multifidelity",
+                "prediction_output": "high",
+                "model_filename": "model.pth",
+                "parent_model_version": base_model_version,
+                "parent_dataset_fingerprint": None if parent_manifest is None else parent_manifest.get("dataset_fingerprint"),
+                "excitation_id": excitation_id,
+                "excitation_name": excitation_name(excitation_id),
+                "channel_id": channel_id,
+                "corrected_group_keys": [list(key) for key in sorted(combo_correction_keys)],
+                "replaced_group_keys": [list(key) for key in merge_info["replaced_group_keys"]],
+                "added_group_keys": [list(key) for key in merge_info["added_group_keys"]],
+                "selected_components": list(components_to_train),
+                "target_names": target_names,
+            }
+            combination_states[key] = {
+                "label": label,
+                "final_dir": final_dir,
+                "training_dir": training_dir,
+                "has_parent": parent_entry is not None,
+                "row_count": len(combo_rows),
+                "sim_row_count": len(combo_sim_rows),
+                "real_row_count": len(combo_rows),
+                "components": tuple(components_to_train),
+                "results": {},
+                "finalized": False,
+            }
+            for component in components_to_train:
+                print(
+                    f"[CORRECTION-QUEUE] full retrain {label}/{component} from merged data",
+                    flush=True,
+                )
+                tasks.append(
+                    {
+                        "cfg": combo_cfg,
+                        "sim_parsed": combo_sim_rows,
+                        "real_parsed": combo_rows,
+                        "model_version": new_model_version,
+                        "version_dir": str(training_dir),
+                        "args": args,
+                        "dataset_metadata": dataset_metadata,
+                        "excitation_id": excitation_id,
+                        "channel_id": channel_id,
+                        "component": component,
+                    }
+                )
         except Exception as exc:
             if training_dir.exists():
                 shutil.rmtree(training_dir)
@@ -540,21 +735,145 @@ def main():
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
-                    "parent_model_retained": (excitation_id, channel_id) in result_models,
+                    "parent_model_retained": key in result_models,
                 }
             )
             print(f"[SKIP] {label}: {type(exc).__name__}: {exc}", flush=True)
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
-    write_model_inventory(
-        new_version_dir,
-        model_version=new_model_version,
-        parent_model_version=base_model_version,
-        models=result_models.values(),
-        failures=failures,
+    def write_incremental_inventory():
+        write_model_inventory(
+            new_version_dir,
+            model_version=new_model_version,
+            parent_model_version=base_model_version,
+            models=result_models.values(),
+            failures=failures,
+        )
+
+    def finalize_combination(key: tuple[int, int]):
+        state = combination_states[key]
+        if state["finalized"]:
+            return
+        state["finalized"] = True
+        failed_results = [
+            result
+            for result in state["results"].values()
+            if not result.get("ok")
+        ]
+        training_dir = Path(state["training_dir"])
+        if failed_results:
+            if training_dir.exists():
+                shutil.rmtree(training_dir)
+            details = "; ".join(
+                f"{result['component']}: {result.get('error_type', 'WorkerError')}: "
+                f"{result.get('error', 'unknown worker failure')}"
+                for result in failed_results
+            )
+            failures.append(
+                {
+                    "excitation_id": key[0],
+                    "excitation_name": excitation_name(key[0]),
+                    "channel_id": key[1],
+                    "components": [result["component"] for result in failed_results],
+                    "row_count": state["row_count"],
+                    "error_type": "ComponentTrainingError",
+                    "error": details,
+                    "traceback": "\n".join(
+                        result.get("traceback", "") for result in failed_results
+                    ),
+                    "parent_model_retained": key in result_models,
+                }
+            )
+            print(
+                f"[CORRECTION-FAIL] {state['label']}: {details}; "
+                f"parent_retained={key in result_models}",
+                flush=True,
+            )
+            return
+
+        try:
+            _replace_selected_component_directories(
+                training_dir, state["final_dir"], state["components"]
+            )
+            if training_dir.exists():
+                shutil.rmtree(training_dir)
+
+            # A copied parent bundle remains complete after partial replacement.
+            # A brand-new combination is deployable only after all four components.
+            if state["has_parent"] or set(state["components"]) == set(FDR_COMPONENT_TARGETS):
+                result_models[key] = model_entry(
+                    excitation_id=key[0],
+                    channel_id=key[1],
+                    row_count=state["row_count"],
+                    status="corrected",
+                    source_model_version=base_model_version,
+                    fidelity_mode="multifidelity",
+                    sim_row_count=state["sim_row_count"],
+                    real_row_count=state["real_row_count"],
+                )
+                print(f"[CORRECTION-OK] {state['label']}", flush=True)
+            else:
+                result_models.pop(key, None)
+                print(
+                    f"[MODEL-INCOMPLETE] {state['label']}: trained "
+                    f"{list(state['components'])} but no parent bundle supplies the "
+                    "unselected components; omitted from models_manifest.json",
+                    flush=True,
+                )
+        except Exception as exc:
+            if training_dir.exists():
+                shutil.rmtree(training_dir)
+            failures.append(
+                {
+                    "excitation_id": key[0],
+                    "excitation_name": excitation_name(key[0]),
+                    "channel_id": key[1],
+                    "components": list(state["components"]),
+                    "row_count": state["row_count"],
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "parent_model_retained": key in result_models,
+                }
+            )
+            print(
+                f"[CORRECTION-COMMIT-FAIL] {state['label']}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    write_incremental_inventory()
+    print(
+        f"[PARALLEL] workers={args.parallel_workers} "
+        f"pending_components={len(tasks)} combinations={len(combination_states)}",
+        flush=True,
     )
+    completed_tasks = 0
+    for result in _run_incremental_component_tasks(tasks, args.parallel_workers):
+        key = (int(result["excitation_id"]), int(result["channel_id"]))
+        component = str(result["component"])
+        state = combination_states[key]
+        state["results"][component] = result
+        completed_tasks += 1
+        if result.get("ok"):
+            print(f"[TASK-OK] {state['label']}/{component}", flush=True)
+        else:
+            print(
+                f"[TASK-FAIL] {state['label']}/{component}: "
+                f"{result.get('error_type', 'WorkerError')}: "
+                f"{result.get('error', 'unknown worker failure')}",
+                flush=True,
+            )
+        if len(state["results"]) == len(state["components"]):
+            finalize_combination(key)
+            write_incremental_inventory()
+        print(
+            f"[PROGRESS] components={completed_tasks}/{len(tasks)} "
+            f"combinations={sum(item['finalized'] for item in combination_states.values())}/"
+            f"{len(combination_states)}",
+            flush=True,
+        )
+
+    write_incremental_inventory()
     print(
         f"[MODEL-INVENTORY] total={len(result_models)} corrected="
         f"{sum(item.get('status') == 'corrected' for item in result_models.values())} "

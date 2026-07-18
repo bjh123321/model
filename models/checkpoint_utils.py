@@ -21,6 +21,7 @@ STRUCTURE_FIELDS = (
     "lora_alpha", "lora_dropout", "lora_target_hidden_indices", "use_modulation",
     "mod_gamma", "pole_target", "residue_target", "adapt_hidden",
     "model_type", "model_target_names", "target_component",
+    "multifidelity_real_loss_weight", "multifidelity_sim_loss_weight",
 )
 
 
@@ -126,6 +127,8 @@ def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool 
     for field in STRUCTURE_FIELDS:
         if field in checkpoint:
             setattr(cfg, field, checkpoint[field])
+    if "slot_support" in checkpoint:
+        cfg._slot_support_metadata = dict(checkpoint.get("slot_support") or {})
 
     legacy = _state_modulation_kind(state)
     metadata_mode = checkpoint.get("modulation_mode")

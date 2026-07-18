@@ -10,7 +10,12 @@ from surrogate_model.models.blocks import TargetMFDNN, TargetMultifidelityMFDNN
 from surrogate_model.models.checkpoint_utils import build_model_from_checkpoint
 from surrogate_model.test.Predict_user import (
     _bounded_damping_tanh_pull,
+    _c1_smooth_linear_tail,
+    _height_conditioned_mach_bounds,
+    _parse_optional_float,
+    _prediction_damping_slot_mask,
     _run_infer_fdr_bundle_batched,
+    run_infer_batched,
 )
 from surrogate_model.test.Predict_user import _build_yhat_and_slot_strings
 from surrogate_model.train.dataloaders import (
@@ -121,12 +126,21 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_dropout_prob["frequency"] == 0.0
     assert cfg.fdr_component_dropout_prob["damping"] == 0.0
     assert cfg.fdr_component_weight_decay["damping"] == 5e-5
-    assert cfg.fdr_component_early_stop_patience["damping"] == 500
+    assert cfg.fdr_component_early_stop_patience["damping"] == 50
+    assert cfg.fdr_component_epochs_stage1["damping"] == 200
+    assert cfg.fdr_component_epochs_stage2["damping"] == 200
+    assert cfg.fdr_component_epochs_stage1["frequency"] == 500
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["frequency"] == 0.05
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["damping"] is None
     assert cfg.fdr_training_profile_version == 8
-    assert set(cfg.fdr_component_training_profile_version.values()) == {8}
+    assert cfg.fdr_component_training_profile_version["damping"] == 9
+    assert cfg.fdr_component_training_profile_version["frequency"] == 8
     assert cfg.multifidelity_sim_loss_weight == 0.2
+    assert cfg.multifidelity_real_loss_weight == 1.0
+    assert cfg.checkpoint_selection == "training"
+    assert set(cfg.fdr_component_checkpoint_selection.values()) == {"training"}
+    assert cfg.fdr_component_real_loss_weight["damping"] == 1.0
+    assert cfg.fdr_component_sim_loss_weight["damping"] == 0.2
     assert cfg.damping_slope_weight == 0.0
     assert cfg.damping_curvature_weight == 0.0
     assert cfg.sim_slot_outlier_filter_enabled is True
@@ -172,6 +186,21 @@ class _MachDampingModel(torch.nn.Module):
     def forward(self, H, M, excitation_id, channel_id):
         value = self.intercept + self.slope * M[:, :1]
         return {"damping": value.expand(-1, 3)}
+
+
+class _MachTargetModel(torch.nn.Module):
+    outputs_normalized = True
+
+    def __init__(self, name, intercept, slope):
+        super().__init__()
+        self.name = str(name)
+        self.intercept = float(intercept)
+        self.slope = float(slope)
+        self.cfg = SimpleNamespace(K_max=3)
+
+    def forward(self, H, M, excitation_id, channel_id):
+        value = self.intercept + self.slope * M[:, :1]
+        return {self.name: value.expand(-1, 3)}
 
 
 def _normalizer(names, mean, std):
@@ -248,6 +277,123 @@ def test_fdr_inference_merges_components_and_reconstructs_physical_values():
     assert np.all(output["valid_mask"] == 1.0)
 
 
+def test_prediction_damping_bounds_mask_the_whole_slot_after_x200():
+    input_norm = _normalizer(("H", "M"), (0.0, 0.0), (1.0, 1.0))
+    bundle = {
+        "frequency": _component_bundle(
+            _ConstantTargetModel({"freq": [10.0, 20.0, 30.0]}),
+            input_norm,
+            _normalizer(("freq",), (0.0,), (1.0,)),
+        ),
+        "damping": _component_bundle(
+            _ConstantTargetModel({"damping": [0.009, 0.01, 0.60]}),
+            input_norm,
+            _normalizer(("damping",), (0.0,), (1.0,)),
+        ),
+        "residue_magnitude": _component_bundle(
+            _ConstantTargetModel({"magnitude": [1.0, 2.0, 3.0]}),
+            input_norm,
+            _normalizer(("magnitude",), (0.0,), (1.0,)),
+        ),
+        "residue_phase": _component_bundle(
+            _ConstantTargetModel(
+                {"sin_theta": [0.0, 0.6, 1.0], "cos_theta": [1.0, 0.8, 0.0]}
+            ),
+            input_norm,
+            _normalizer(("sin_theta", "cos_theta"), (0.0, 0.0), (1.0, 1.0)),
+        ),
+    }
+    arguments = (
+        bundle,
+        torch.device("cpu"),
+        np.asarray([3.0], dtype=np.float32),
+        np.asarray([0.98], dtype=np.float32),
+        np.asarray([1], dtype=np.int64),
+        np.asarray([8], dtype=np.int64),
+    )
+
+    default_output = _run_infer_fdr_bundle_batched(*arguments)
+    expected_default = np.asarray([[0.0, 1.0, 1.0]], dtype=np.float32)
+    for mask_name in ("valid_mask", "damping_valid_mask"):
+        np.testing.assert_array_equal(default_output[mask_name], expected_default)
+    expected_scan = np.ones((1, 3), dtype=np.float32)
+    for mask_name in (
+        "scan_valid_mask",
+        "frequency_valid_mask",
+        "magnitude_valid_mask",
+        "phase_valid_mask",
+    ):
+        np.testing.assert_array_equal(default_output[mask_name], expected_scan)
+
+    bounded_output = _run_infer_fdr_bundle_batched(
+        *arguments, prediction_damping_max=60.0
+    )
+    expected_bounded = np.asarray([[0.0, 1.0, 0.0]], dtype=np.float32)
+    for mask_name in ("valid_mask", "damping_valid_mask"):
+        np.testing.assert_array_equal(bounded_output[mask_name], expected_bounded)
+    for mask_name in (
+        "scan_valid_mask",
+        "frequency_valid_mask",
+        "magnitude_valid_mask",
+        "phase_valid_mask",
+    ):
+        np.testing.assert_array_equal(bounded_output[mask_name], expected_scan)
+
+    y_hat, freq_slots, damping_slots = _build_yhat_and_slot_strings(
+        bounded_output["alpha"][0],
+        bounded_output["omega"][0],
+        bounded_output["rho"][0],
+        bounded_output["sin_theta"][0],
+        bounded_output["cos_theta"][0],
+        bounded_output["scan_valid_mask"][0],
+        "RRY",
+        None,
+        np.ones(64),
+        1.0 / 512.0,
+        frequency_valid_mask_row=bounded_output["frequency_valid_mask"][0],
+        damping_valid_mask_row=bounded_output["damping_valid_mask"][0],
+    )
+    assert all(freq_slots)
+    assert damping_slots[0] == ""
+    assert damping_slots[1] != ""
+    assert damping_slots[2] == ""
+    assert np.any(np.abs(y_hat) > 0.0)
+
+    _, pr_freq_slots, pr_damping_slots = _build_yhat_and_slot_strings(
+        bounded_output["alpha"][0],
+        bounded_output["omega"][0],
+        bounded_output["rho"][0],
+        bounded_output["sin_theta"][0],
+        bounded_output["cos_theta"][0],
+        bounded_output["valid_mask"][0],
+        "RRY",
+        None,
+        np.ones(64),
+        1.0 / 512.0,
+        frequency_valid_mask_row=bounded_output["valid_mask"][0],
+        damping_valid_mask_row=bounded_output["valid_mask"][0],
+    )
+    assert pr_freq_slots[0] == "" and pr_damping_slots[0] == ""
+    assert pr_freq_slots[1] != "" and pr_damping_slots[1] != ""
+    assert pr_freq_slots[2] == "" and pr_damping_slots[2] == ""
+
+    np.testing.assert_array_equal(
+        _prediction_damping_slot_mask(
+            np.asarray([0.009, 0.01, 0.60]), damping_min=None, damping_max=None
+        ),
+        np.ones(3, dtype=bool),
+    )
+    assert _parse_optional_float("none") is None
+    try:
+        _prediction_damping_slot_mask(
+            np.asarray([0.10]), damping_min=20.0, damping_max=10.0
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("An inverted prediction damping range was accepted")
+
+
 def test_damping_tanh_pull_has_bounded_slope_and_positive_floor():
     boundary = np.asarray([0.15, -0.01], dtype=np.float64)
     center = np.asarray([0.09, 0.04], dtype=np.float64)
@@ -270,12 +416,86 @@ def test_damping_tanh_pull_has_bounded_slope_and_positive_floor():
     assert np.all(far_outside > 0.0)
 
 
-def test_fdr_inference_defaults_to_tanh_and_preserves_in_support_damping():
+def test_height_conditioned_mach_bounds_interpolate_only_supported_heights():
+    support = {
+        "training_height_mach_envelope": [
+            {"height": 3.0, "mach_min": 0.5, "mach_max": 1.0, "count": 3},
+            {"height": 8.0, "mach_min": 0.7, "mach_max": 1.2, "count": 3},
+        ]
+    }
+    lower, upper, supported = _height_conditioned_mach_bounds(
+        support, np.asarray([2.0, 3.0, 5.5, 8.0, 9.0])
+    )
+    np.testing.assert_allclose(lower, [0.5, 0.5, 0.6, 0.7, 0.7])
+    np.testing.assert_allclose(upper, [1.0, 1.0, 1.1, 1.2, 1.2])
+    np.testing.assert_array_equal(supported, [False, True, True, True, False])
+
+
+def test_c1_smooth_linear_tail_matches_boundary_and_linear_tail_derivatives():
+    transition = 0.05
+    epsilon = 1e-6
+    boundary = np.asarray([1.0])
+    value = np.asarray([0.15])
+    boundary_slope = np.asarray([0.10])
+    tail_slope = np.asarray([0.02])
+
+    def evaluate(mach):
+        return _c1_smooth_linear_tail(
+            np.asarray([mach]),
+            boundary,
+            value,
+            boundary_slope,
+            tail_slope,
+            transition,
+            side=1,
+        )[0]
+
+    assert evaluate(1.0) == value[0]
+    boundary_derivative = (evaluate(1.0 + epsilon) - evaluate(1.0)) / epsilon
+    assert abs(boundary_derivative - boundary_slope[0]) < 1e-5
+    derivative_before_join = (
+        evaluate(1.0 + transition) - evaluate(1.0 + transition - epsilon)
+    ) / epsilon
+    derivative_after_join = (
+        evaluate(1.0 + transition + epsilon) - evaluate(1.0 + transition)
+    ) / epsilon
+    assert abs(derivative_before_join - tail_slope[0]) < 1e-5
+    assert abs(derivative_after_join - tail_slope[0]) < 1e-8
+    assert abs((evaluate(1.20) - evaluate(1.10)) / 0.10 - tail_slope[0]) < 1e-10
+
+    def evaluate_lower(mach):
+        return _c1_smooth_linear_tail(
+            np.asarray([mach]),
+            boundary,
+            value,
+            boundary_slope,
+            tail_slope,
+            transition,
+            side=-1,
+        )[0]
+
+    lower_boundary_derivative = (
+        evaluate_lower(1.0) - evaluate_lower(1.0 - epsilon)
+    ) / epsilon
+    assert evaluate_lower(1.0) == value[0]
+    assert abs(lower_boundary_derivative - boundary_slope[0]) < 1e-5
+    assert (
+        abs((evaluate_lower(0.90) - evaluate_lower(0.80)) / 0.10 - tail_slope[0])
+        < 1e-10
+    )
+
+
+def test_fdr_inference_defaults_to_allow_and_smooth_linear_preserves_network_boundary():
     parameter = inspect.signature(_run_infer_fdr_bundle_batched).parameters[
         "extrapolation_policy"
     ]
-    assert parameter.default == "tanh"
+    assert parameter.default == "allow"
+    assert inspect.signature(run_infer_batched).parameters["extrapolation_policy"].default == "allow"
 
+    envelope = [
+        {"height": 3.0, "mach_min": 0.5, "mach_max": 1.0, "count": 4},
+        {"height": 8.0, "mach_min": 0.7, "mach_max": 1.2, "count": 4},
+    ]
     slots = [
         {
             "slot_index": slot,
@@ -286,13 +506,14 @@ def test_fdr_inference_defaults_to_tanh_and_preserves_in_support_damping():
             "mach_max": 1.0,
             "slope_limit": 0.02,
             "train_count": 10,
+            "training_height_mach_envelope": envelope,
         }
         for slot in range(3)
     ]
     input_norm = _normalizer(("H", "M"), (0.0, 0.0), (1.0, 1.0))
     bundle = {
         "frequency": _component_bundle(
-            _ConstantTargetModel({"freq": [10.0, 20.0, 30.0]}),
+            _MachTargetModel("freq", 10.0, 1.0),
             input_norm,
             _support_normalizer(("freq",), (0.0,), (1.0,), slots),
         ),
@@ -302,7 +523,7 @@ def test_fdr_inference_defaults_to_tanh_and_preserves_in_support_damping():
             _support_normalizer(("damping",), (0.0,), (1.0,), slots),
         ),
         "residue_magnitude": _component_bundle(
-            _ConstantTargetModel({"magnitude": [1.0, 2.0, 3.0]}),
+            _MachTargetModel("magnitude", 1.0, 1.0),
             input_norm,
             _support_normalizer(("magnitude",), (0.0,), (1.0,), slots),
         ),
@@ -316,7 +537,9 @@ def test_fdr_inference_defaults_to_tanh_and_preserves_in_support_damping():
             ),
         ),
     }
-    mach = np.asarray([-10.0, 0.5, 0.75, 1.0, 1.5, 10.0], dtype=np.float32)
+    mach = np.asarray(
+        [0.95, 0.999, 1.0, 1.001, 1.05, 1.06, 1.10], dtype=np.float32
+    )
     output = _run_infer_fdr_bundle_batched(
         bundle,
         torch.device("cpu"),
@@ -324,16 +547,36 @@ def test_fdr_inference_defaults_to_tanh_and_preserves_in_support_damping():
         mach,
         np.ones(len(mach), dtype=np.int64),
         np.full(len(mach), 8, dtype=np.int64),
+        extrapolation_policy="smooth_linear",
+        prediction_damping_min=None,
     )
     damping = -output["alpha"][:, 0] / np.hypot(
         output["alpha"][:, 0], output["omega"][:, 0]
     )
 
-    np.testing.assert_allclose(damping[1:4], [0.10, 0.125, 0.15], atol=1e-6)
-    assert 0.10 < damping[0] <= 0.125 + 1e-6
-    assert 0.125 - 1e-6 <= damping[-1] < 0.15
-    assert 0.125 < damping[4] < 0.15
+    np.testing.assert_allclose(damping[:3], 0.05 + 0.10 * mach[:3], atol=1e-6)
+    assert abs(damping[2] - 0.15) < 1e-6
+    boundary_slope = (damping[3] - damping[2]) / (mach[3] - mach[2])
+    assert abs(boundary_slope - 0.10) < 2e-3
+    tail_slopes_x200 = 200.0 * np.diff(damping[4:]) / np.diff(mach[4:])
+    np.testing.assert_allclose(tail_slopes_x200, 20.0, atol=2e-4)
+    np.testing.assert_allclose(output["omega"][-1, 0], 2.0 * np.pi * 11.1, atol=1e-5)
+    np.testing.assert_allclose(output["rho"][-1, 0], 2.1, atol=1e-6)
     assert np.all(output["damping_valid_mask"] == 1.0)
+
+    outside_height = _run_infer_fdr_bundle_batched(
+        bundle,
+        torch.device("cpu"),
+        np.asarray([2.0], dtype=np.float32),
+        np.asarray([1.5], dtype=np.float32),
+        np.asarray([1], dtype=np.int64),
+        np.asarray([8], dtype=np.int64),
+        prediction_damping_min=None,
+    )
+    outside_height_damping = -outside_height["alpha"][0, 0] / np.hypot(
+        outside_height["alpha"][0, 0], outside_height["omega"][0, 0]
+    )
+    np.testing.assert_allclose(outside_height_damping, 0.20, atol=1e-6)
 
 
 def test_slot_support_uses_train_and_validation_coordinates_but_train_only_slopes():
@@ -354,12 +597,15 @@ def test_slot_support_uses_train_and_validation_coordinates_but_train_only_slope
         cfg,
     )
     slot = support["slots"][0]
-    assert support["schema_version"] == 2
+    assert support["schema_version"] == 3
     assert support["coordinate_support_scope"] == "training_and_validation_rows"
     assert support["slope_fit_scope"] == "training_rows_only"
     assert slot["height_max"] == 8.0
     assert slot["mach_max"] == 1.2
     assert slot["support_count"] == 3
+    assert slot["training_height_mach_envelope"] == [
+        {"height": 3.0, "mach_min": 0.7, "mach_max": 0.8, "count": 2}
+    ]
     assert slot["damping_max"] < 0.40
     np.testing.assert_allclose(slot["slope_limit"], 0.15, rtol=1e-5)
 
@@ -571,7 +817,12 @@ def test_new_normalizer_metadata_decodes_fdr_outputs_to_physical_domain():
     np.testing.assert_allclose(output["rho"][0], [1e-3, 2.0, 5.0], rtol=1e-6)
     recovered_damping = -output["alpha"][0] / np.hypot(output["alpha"][0], output["omega"][0])
     np.testing.assert_allclose(recovered_damping, [0.01, 0.05, 0.149], rtol=1e-5)
-    assert np.all(output["damping_valid_mask"] == 1.0)
+    np.testing.assert_array_equal(
+        output["damping_valid_mask"], np.asarray([[1.0, 1.0, 1.0]])
+    )
+    np.testing.assert_array_equal(
+        output["valid_mask"], np.asarray([[1.0, 1.0, 1.0]])
+    )
 
 
 def test_damping_plot_mask_is_independent_from_invalid_magnitude():

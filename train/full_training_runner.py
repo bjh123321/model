@@ -84,10 +84,16 @@ def _training_values(cfg, args) -> dict:
             "slope_limit_floor": float(getattr(cfg, "damping_slope_limit_floor", 0.0)),
         },
         "prediction_support": {
-            "coordinate_scope": "real_training_and_validation_rows",
+            "coordinate_scope": "real_training_rows_per_height",
             "slope_fit_scope": "real_training_rows_only",
-            "default_extrapolation_policy": "tanh",
-            "damping_tanh_asymptote": "network_prediction_at_support_mid_mach",
+            "default_extrapolation_policy": "allow",
+            "damping_extrapolation": {
+                "boundary_join": "c1_cubic_hermite",
+                "tail": "straight_line_fit_on_damping_x200",
+                "height_outside_training_range": "network_prediction",
+                "transition_mach": 0.05,
+                "slope_fit_mach": 0.05,
+            },
         },
         "sim_slot_outlier_filter": {
             "enabled": bool(
@@ -124,6 +130,9 @@ def _training_values(cfg, args) -> dict:
             "log_file": "damping_slot_filter.log",
         },
         "multifidelity": {
+            "real_loss_weight_stage2": float(
+                getattr(cfg, "multifidelity_real_loss_weight", 1.0)
+            ),
             "sim_loss_weight_stage2": float(
                 getattr(cfg, "multifidelity_sim_loss_weight", 0.2)
             ),
@@ -326,6 +335,33 @@ def run_component_training(
     component_cfg.target_component = component
     component_cfg.model_target_names = list(target_names)
     component_cfg.fdr_physical_parameterization = True
+    profile_versions = dict(
+        getattr(component_cfg, "fdr_component_training_profile_version", {}) or {}
+    )
+    component_cfg.fdr_training_profile_version = int(
+        profile_versions.get(component, component_cfg.fdr_training_profile_version)
+    )
+    if hasattr(args, "epochs"):
+        if (
+            getattr(args, "epochs", None) is None
+            and getattr(args, "epochs_s1", None) is None
+        ):
+            profiles = dict(
+                getattr(component_cfg, "fdr_component_epochs_stage1", {}) or {}
+            )
+            component_cfg.epochs_stage1 = int(
+                profiles.get(component, component_cfg.epochs_stage1)
+            )
+        if (
+            getattr(args, "epochs", None) is None
+            and getattr(args, "epochs_s2", None) is None
+        ):
+            profiles = dict(
+                getattr(component_cfg, "fdr_component_epochs_stage2", {}) or {}
+            )
+            component_cfg.epochs_stage2 = int(
+                profiles.get(component, component_cfg.epochs_stage2)
+            )
     if getattr(args, "low_hidden", None) is None:
         profiles = dict(getattr(component_cfg, "fdr_component_low_hidden", {}) or {})
         component_cfg.low_hidden = list(
@@ -364,6 +400,46 @@ def run_component_training(
         component_cfg.checkpoint_train_loss_ceiling = (
             None if ceiling is None else float(ceiling)
         )
+    if getattr(args, "checkpoint_selection", None) is None:
+        profiles = dict(
+            getattr(component_cfg, "fdr_component_checkpoint_selection", {}) or {}
+        )
+        component_cfg.checkpoint_selection = str(
+            profiles.get(component, component_cfg.checkpoint_selection)
+        ).lower()
+    if getattr(args, "real_loss_weight", None) is None:
+        profiles = dict(
+            getattr(component_cfg, "fdr_component_real_loss_weight", {}) or {}
+        )
+        component_cfg.multifidelity_real_loss_weight = float(
+            profiles.get(component, component_cfg.multifidelity_real_loss_weight)
+        )
+    if getattr(args, "sim_loss_weight", None) is None:
+        profiles = dict(
+            getattr(component_cfg, "fdr_component_sim_loss_weight", {}) or {}
+        )
+        component_cfg.multifidelity_sim_loss_weight = float(
+            profiles.get(component, component_cfg.multifidelity_sim_loss_weight)
+        )
+    if str(component_cfg.checkpoint_selection).lower() not in {"training", "validation"}:
+        raise ValueError(
+            f"Unsupported checkpoint selection for {component}: "
+            f"{component_cfg.checkpoint_selection!r}"
+        )
+    if (
+        not np.isfinite(component_cfg.multifidelity_real_loss_weight)
+        or component_cfg.multifidelity_real_loss_weight < 0.0
+    ):
+        raise ValueError(f"Real loss weight for {component} must be finite and non-negative")
+    if (
+        not np.isfinite(component_cfg.multifidelity_sim_loss_weight)
+        or component_cfg.multifidelity_sim_loss_weight < 0.0
+    ):
+        raise ValueError(
+            f"Simulation loss weight for {component} must be finite and non-negative"
+        )
+    if not bool(getattr(component_cfg, "require_validation", True)):
+        component_cfg.checkpoint_selection = "training"
     parent_targets = dict(getattr(component_cfg, "parent_train_loss_targets", {}) or {})
     if parent_targets:
         if component not in parent_targets:

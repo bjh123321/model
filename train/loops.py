@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import os
 import time
 from copy import deepcopy
@@ -419,7 +420,7 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
         "stage": "fixed_single_fidelity",
         "epoch": int(epoch),
         "best_metric": float(metric),
-        "checkpoint_selection": str(getattr(model_core.cfg, "checkpoint_selection", "validation")),
+        "checkpoint_selection": str(getattr(model_core.cfg, "checkpoint_selection", "training")),
         "best_metric_name": str(getattr(model_core.cfg, "_best_metric_name", "loss_val_group_FXD")),
         "model_state_dict": model_core.state_dict(),
         "model_type": type(model_core).__name__,
@@ -433,6 +434,12 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
         "low_hidden": list(getattr(model_core.cfg, "low_hidden", [])),
         "adapt_hidden": list(getattr(model_core.cfg, "adapt_hidden", [])),
         "dropout_prob": float(getattr(model_core.cfg, "dropout_prob", 0.0)),
+        "multifidelity_real_loss_weight": float(
+            getattr(model_core.cfg, "multifidelity_real_loss_weight", 1.0)
+        ),
+        "multifidelity_sim_loss_weight": float(
+            getattr(model_core.cfg, "multifidelity_sim_loss_weight", 0.2)
+        ),
         "use_lora": bool(getattr(model_core.cfg, "use_lora", False)),
         "use_modulation": bool(getattr(model_core.cfg, "use_modulation", False)),
         "modulation_mode": "legacy",
@@ -590,6 +597,11 @@ def train_multifidelity_component(
     train_hist: list[float] = []
     val_hist: list[float] = []
     min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
+    checkpoint_selection = str(
+        getattr(cfg, "checkpoint_selection", "training")
+    ).lower()
+    if checkpoint_selection not in {"training", "validation"}:
+        raise ValueError(f"Unsupported checkpoint_selection={checkpoint_selection!r}")
 
     # Stage 1: train only the simulation low head.  Embeddings remain fixed,
     # matching user_for_win7_fixed_exc_channel's per-combination behavior.
@@ -633,7 +645,11 @@ def train_multifidelity_component(
         val_loss, _ = _eval_model(
             low_view, sim_val_dl, device, mean_sim, std_sim, target_names
         )
-        metric = train_loss if val_loss is None else val_loss
+        metric = (
+            train_loss
+            if checkpoint_selection == "training" or val_loss is None
+            else val_loss
+        )
         scheduler1.step(train_loss)
         logs.append(
             {
@@ -717,8 +733,14 @@ def train_multifidelity_component(
     scheduler2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer2, mode="min", factor=0.5, patience=20, min_lr=1e-6
     )
+    real_weight = float(getattr(cfg, "multifidelity_real_loss_weight", 1.0))
     sim_weight = float(getattr(cfg, "multifidelity_sim_loss_weight", 0.2))
-    checkpoint_selection = str(getattr(cfg, "checkpoint_selection", "validation")).lower()
+    for name, value in (
+        ("multifidelity_real_loss_weight", real_weight),
+        ("multifidelity_sim_loss_weight", sim_weight),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be finite and non-negative")
     ceiling = getattr(cfg, "checkpoint_train_loss_ceiling", None)
     ceiling = None if ceiling is None else float(ceiling)
     cfg._best_metric_name = (
@@ -774,7 +796,7 @@ def train_multifidelity_component(
                     target_names,
                     outputs_normalized=True,
                 )
-            loss_total = loss_real + sim_weight * loss_sim
+            loss_total = real_weight * loss_real + sim_weight * loss_sim
             loss_total.backward()
             torch.nn.utils.clip_grad_norm_(stage2_parameters, 5.0)
             optimizer2.step()
@@ -932,7 +954,7 @@ def train_one_fold(fold: int, cfg: Config, real_parsed, args):
     bad = 0
     patience = int(getattr(cfg, "early_stop_patience_s1", 500))
     min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
-    checkpoint_selection = str(getattr(cfg, "checkpoint_selection", "validation")).lower()
+    checkpoint_selection = str(getattr(cfg, "checkpoint_selection", "training")).lower()
     if checkpoint_selection not in ("validation", "training"):
         raise ValueError(f"Unsupported checkpoint_selection={checkpoint_selection!r}")
     checkpoint_train_loss_ceiling = getattr(

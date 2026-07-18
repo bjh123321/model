@@ -25,6 +25,14 @@ from surrogate_model.utils.excitation_channel_models import (
 )
 
 
+DEFAULT_DAMPING_TANH_MIN_MACH_SCALE = 0.10
+DEFAULT_DAMPING_EXTRAPOLATION_TRANSITION_MACH = 0.05
+DEFAULT_DAMPING_EXTRAPOLATION_FIT_MACH = 0.05
+DEFAULT_DAMPING_PREDICTION_FLOOR = 1e-6
+DEFAULT_PREDICTION_DAMPING_MIN = 2.0
+DEFAULT_PREDICTION_DAMPING_MAX = None
+
+
 def get_exe_dir():
     """
     返回 exe 所在目录：
@@ -392,6 +400,8 @@ def _run_infer_single_model_batched(
     batch_size: int = 20000,
     predict_output: str = "low",
     mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+    prediction_damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
+    prediction_damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
 ):
     """
     输入：
@@ -417,7 +427,22 @@ def _run_infer_single_model_batched(
             f"they will be written as zero/empty outputs. bad_ch={bad_channels}, bad_exc={bad_excitations}",
             flush=True,
         )
-    outs_acc = {k: [] for k in ["alpha", "omega", "rho", "sin_theta", "cos_theta", "valid_mask"]}
+    outs_acc = {
+        key: []
+        for key in [
+            "alpha",
+            "omega",
+            "rho",
+            "sin_theta",
+            "cos_theta",
+            "valid_mask",
+            "scan_valid_mask",
+            "frequency_valid_mask",
+            "damping_valid_mask",
+            "magnitude_valid_mask",
+            "phase_valid_mask",
+        ]
+    }
 
     for s in range(0, N, batch_size):
         e = min(N, s + batch_size)
@@ -428,6 +453,11 @@ def _run_infer_single_model_batched(
         sin_full = np.zeros((nb, kmax), dtype=np.float64)
         cos_full = np.ones((nb, kmax), dtype=np.float64)
         valid_full = np.zeros((nb, kmax), dtype=bool)
+        scan_valid_full = np.zeros((nb, kmax), dtype=bool)
+        frequency_valid_full = np.zeros((nb, kmax), dtype=bool)
+        damping_valid_full = np.zeros((nb, kmax), dtype=bool)
+        magnitude_valid_full = np.zeros((nb, kmax), dtype=bool)
+        phase_valid_full = np.zeros((nb, kmax), dtype=bool)
 
         ch_batch = np.asarray(ch_all[s:e], dtype=np.int64)
         exc_batch = np.asarray(exc_all[s:e], dtype=np.int64)
@@ -466,25 +496,42 @@ def _run_infer_single_model_batched(
             cos_t = np.nan_to_num(cos_t / phase_norm, nan=1.0, posinf=1.0, neginf=1.0)
             freq = omega / (2.0 * np.pi)
             damping = -alpha / np.sqrt(np.maximum(alpha * alpha + omega * omega, 1e-12))
-            valid_mask = (
-                np.isfinite(alpha) & np.isfinite(omega) & np.isfinite(rho)
-                & np.isfinite(sin_t) & np.isfinite(cos_t)
-                & (alpha < 0.0) & (omega > 0.0) & (freq > 0.0)
-                & (damping > 0.0) & (damping < 0.5) & (rho > 1e-12)
+            damping_range_mask = _prediction_damping_slot_mask(
+                damping, prediction_damping_min, prediction_damping_max
             )
+            frequency_valid_mask = np.isfinite(omega) & (omega > 0.0) & (freq > 0.0)
+            damping_valid_mask = (
+                np.isfinite(alpha) & np.isfinite(omega) & (alpha < 0.0)
+                & damping_range_mask
+            )
+            magnitude_valid_mask = np.isfinite(rho) & (rho > 1e-12)
+            phase_valid_mask = np.isfinite(sin_t) & np.isfinite(cos_t)
             if mode_freq_ranges is not None:
                 for local_j, ch_idx in enumerate(ch_batch[valid_input]):
                     ch_name = channels[int(ch_idx)] if 0 <= int(ch_idx) < len(channels) else f"C{int(ch_idx):02d}"
                     ranges = mode_freq_ranges.get(ch_name, [None] * kmax)
                     for slot in range(kmax):
                         rg = ranges[slot] if slot < len(ranges) else None
-                        valid_mask[local_j, slot] = bool(
-                            rg is not None and valid_mask[local_j, slot]
+                        frequency_valid_mask[local_j, slot] = bool(
+                            rg is not None and frequency_valid_mask[local_j, slot]
                             and float(rg[0]) <= float(freq[local_j, slot]) <= float(rg[1])
                         )
+            # Scan files (HF/HG/HA and VF/VG/VA) keep frequency and response
+            # amplitude when only the configured damping bounds fail.  PR response
+            # files retain the stricter whole-slot mask below.
+            scan_valid_mask = (
+                frequency_valid_mask & magnitude_valid_mask & phase_valid_mask
+                & np.isfinite(alpha) & (alpha < 0.0)
+            )
+            valid_mask = scan_valid_mask & damping_valid_mask
 
             alpha_full[local_idx], omega_full[local_idx], rho_full[local_idx] = alpha, omega, rho
             sin_full[local_idx], cos_full[local_idx], valid_full[local_idx] = sin_t, cos_t, valid_mask
+            scan_valid_full[local_idx] = scan_valid_mask
+            frequency_valid_full[local_idx] = frequency_valid_mask
+            damping_valid_full[local_idx] = damping_valid_mask
+            magnitude_valid_full[local_idx] = magnitude_valid_mask
+            phase_valid_full[local_idx] = phase_valid_mask
 
         outs_acc["alpha"].append(alpha_full)
         outs_acc["omega"].append(omega_full)
@@ -492,6 +539,11 @@ def _run_infer_single_model_batched(
         outs_acc["sin_theta"].append(sin_full)
         outs_acc["cos_theta"].append(cos_full)
         outs_acc["valid_mask"].append(valid_full.astype(np.float32))
+        outs_acc["scan_valid_mask"].append(scan_valid_full.astype(np.float32))
+        outs_acc["frequency_valid_mask"].append(frequency_valid_full.astype(np.float32))
+        outs_acc["damping_valid_mask"].append(damping_valid_full.astype(np.float32))
+        outs_acc["magnitude_valid_mask"].append(magnitude_valid_full.astype(np.float32))
+        outs_acc["phase_valid_mask"].append(phase_valid_full.astype(np.float32))
 
     return {key: np.concatenate(values, axis=0) for key, values in outs_acc.items()}
 
@@ -620,8 +672,56 @@ class ExcitationChannelModelRegistry:
         return int(bundle["frequency"]["model"].cfg.K_max)
 
 
-DEFAULT_DAMPING_TANH_MIN_MACH_SCALE = 0.10
-DEFAULT_DAMPING_PREDICTION_FLOOR = 1e-6
+def _parse_optional_float(raw: str) -> float | None:
+    text = str(raw).strip().lower()
+    if text in {"none", "null", "off"}:
+        return None
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite number or 'none', got {raw!r}"
+        ) from exc
+    if not np.isfinite(value):
+        raise argparse.ArgumentTypeError(
+            f"expected a finite number or 'none', got {raw!r}"
+        )
+    return value
+
+
+def _validate_prediction_damping_bounds(
+    damping_min: float | None, damping_max: float | None
+) -> tuple[float | None, float | None]:
+    minimum = None if damping_min is None else float(damping_min)
+    maximum = None if damping_max is None else float(damping_max)
+    if minimum is not None and not np.isfinite(minimum):
+        raise ValueError("prediction_damping_min must be finite or None")
+    if maximum is not None and not np.isfinite(maximum):
+        raise ValueError("prediction_damping_max must be finite or None")
+    if minimum is not None and maximum is not None and maximum < minimum:
+        raise ValueError(
+            "prediction_damping_max must be greater than or equal to "
+            "prediction_damping_min"
+        )
+    return minimum, maximum
+
+
+def _prediction_damping_slot_mask(
+    damping: np.ndarray,
+    damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
+    damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
+) -> np.ndarray:
+    """Return the whole-slot mask using damping after display scaling by 200."""
+    minimum, maximum = _validate_prediction_damping_bounds(damping_min, damping_max)
+    values = 200.0 * np.asarray(damping, dtype=np.float64)
+    mask = np.isfinite(values)
+    if minimum is not None:
+        tolerance = max(1e-8, abs(minimum) * 1e-6)
+        mask &= values >= minimum - tolerance
+    if maximum is not None:
+        tolerance = max(1e-8, abs(maximum) * 1e-6)
+        mask &= values <= maximum + tolerance
+    return mask
 
 
 def _bounded_damping_tanh_pull(
@@ -657,6 +757,87 @@ def _bounded_damping_tanh_pull(
     return np.maximum(pulled, damping_floor)
 
 
+def _height_conditioned_mach_bounds(slot_support: dict, height_values: np.ndarray):
+    """Interpolate per-slot training Mach bounds at supported flight-test heights."""
+    heights_query = np.asarray(height_values, dtype=np.float64)
+    envelope = sorted(
+        list(slot_support.get("training_height_mach_envelope", ())),
+        key=lambda item: float(item["height"]),
+    )
+    if envelope:
+        heights = np.asarray([float(item["height"]) for item in envelope])
+        minima = np.asarray([float(item["mach_min"]) for item in envelope])
+        maxima = np.asarray([float(item["mach_max"]) for item in envelope])
+        if len(heights) == 1:
+            supported = np.isclose(heights_query, heights[0], rtol=0.0, atol=1e-6)
+            return (
+                np.full_like(heights_query, minima[0]),
+                np.full_like(heights_query, maxima[0]),
+                supported,
+            )
+        supported = (heights_query >= heights[0]) & (heights_query <= heights[-1])
+        return (
+            np.interp(heights_query, heights, minima),
+            np.interp(heights_query, heights, maxima),
+            supported,
+        )
+    required = ("height_min", "height_max", "mach_min", "mach_max")
+    if all(key in slot_support for key in required):
+        supported = (
+            (heights_query >= float(slot_support["height_min"]))
+            & (heights_query <= float(slot_support["height_max"]))
+        )
+        return (
+            np.full_like(heights_query, float(slot_support["mach_min"])),
+            np.full_like(heights_query, float(slot_support["mach_max"])),
+            supported,
+        )
+    return (
+        np.full_like(heights_query, np.nan),
+        np.full_like(heights_query, np.nan),
+        np.zeros_like(heights_query, dtype=bool),
+    )
+
+
+def _c1_smooth_linear_tail(
+    mach_values: np.ndarray,
+    boundary_mach: np.ndarray,
+    boundary_values: np.ndarray,
+    boundary_slopes: np.ndarray,
+    target_slopes: np.ndarray,
+    transition_mach: float,
+    side: int,
+) -> np.ndarray:
+    """Cubic-Hermite transition followed by a fitted straight-line tail."""
+    if side not in (-1, 1):
+        raise ValueError("side must be -1 for the lower tail or +1 for the upper tail")
+    transition = float(transition_mach)
+    if not np.isfinite(transition) or transition <= 0.0:
+        raise ValueError("transition_mach must be finite and positive")
+    mach = np.asarray(mach_values, dtype=np.float64)
+    boundary = np.asarray(boundary_mach, dtype=np.float64)
+    value0 = np.asarray(boundary_values, dtype=np.float64)
+    slope0 = np.asarray(boundary_slopes, dtype=np.float64)
+    slope1 = np.asarray(target_slopes, dtype=np.float64)
+    distance = np.maximum(float(side) * (mach - boundary), 0.0)
+    outward_slope0 = float(side) * slope0
+    outward_slope1 = float(side) * slope1
+    value1 = value0 + 0.5 * (outward_slope0 + outward_slope1) * transition
+    t = np.clip(distance / transition, 0.0, 1.0)
+    h00 = 2.0 * t**3 - 3.0 * t**2 + 1.0
+    h10 = t**3 - 2.0 * t**2 + t
+    h01 = -2.0 * t**3 + 3.0 * t**2
+    h11 = t**3 - t**2
+    transition_values = (
+        h00 * value0
+        + h10 * transition * outward_slope0
+        + h01 * value1
+        + h11 * transition * outward_slope1
+    )
+    linear_values = value1 + outward_slope1 * (distance - transition)
+    return np.where(distance <= transition, transition_values, linear_values)
+
+
 @torch.no_grad()
 def _run_infer_fdr_bundle_batched(
     bundle,
@@ -667,13 +848,17 @@ def _run_infer_fdr_bundle_batched(
     ch_all: np.ndarray,
     batch_size: int = 20000,
     mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
-    extrapolation_policy: str = "tanh",
+    extrapolation_policy: str = "allow",
     predict_output: str = "high",
     damping_tanh_min_mach_scale: float = DEFAULT_DAMPING_TANH_MIN_MACH_SCALE,
+    damping_extrapolation_transition_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_TRANSITION_MACH,
+    damping_extrapolation_fit_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_FIT_MACH,
     damping_prediction_floor: float = DEFAULT_DAMPING_PREDICTION_FLOOR,
+    prediction_damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
+    prediction_damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
 ):
     extrapolation_policy = str(extrapolation_policy).lower()
-    if extrapolation_policy not in {"tanh", "clip", "mask", "allow"}:
+    if extrapolation_policy not in {"smooth_linear", "tanh", "clip", "mask", "allow"}:
         raise ValueError(f"Unsupported extrapolation_policy={extrapolation_policy!r}")
     if (
         not np.isfinite(float(damping_tanh_min_mach_scale))
@@ -681,10 +866,25 @@ def _run_infer_fdr_bundle_batched(
     ):
         raise ValueError("damping_tanh_min_mach_scale must be positive")
     if (
+        not np.isfinite(float(damping_extrapolation_transition_mach))
+        or float(damping_extrapolation_transition_mach) <= 0.0
+    ):
+        raise ValueError("damping_extrapolation_transition_mach must be positive")
+    if (
+        not np.isfinite(float(damping_extrapolation_fit_mach))
+        or float(damping_extrapolation_fit_mach) <= 0.0
+    ):
+        raise ValueError("damping_extrapolation_fit_mach must be positive")
+    if (
         not np.isfinite(float(damping_prediction_floor))
         or float(damping_prediction_floor) <= 0.0
     ):
         raise ValueError("damping_prediction_floor must be positive")
+    prediction_damping_min, prediction_damping_max = (
+        _validate_prediction_damping_bounds(
+            prediction_damping_min, prediction_damping_max
+        )
+    )
     component_outputs = {}
     component_support_masks = {}
     expected_kmax = None
@@ -731,13 +931,22 @@ def _run_infer_fdr_bundle_batched(
             support_slots = list(dict(output_normalizer.support or {}).get("slots", []))
             support_mask = np.ones((end - start, kmax), dtype=bool)
 
-            def predict_at(h_input, m_input):
+            def predict_at(h_input, m_input, indices=None):
                 hm = torch.tensor(
                     np.stack([h_input, m_input], axis=1), dtype=torch.float32
                 )
                 hm_norm = input_normalizer.transform(hm).to(device)
+                if indices is None:
+                    exc_tensor = excitation_tensor
+                    ch_tensor = channel_tensor
+                else:
+                    tensor_indices = torch.as_tensor(
+                        indices, dtype=torch.long, device=device
+                    )
+                    exc_tensor = excitation_tensor.index_select(0, tensor_indices)
+                    ch_tensor = channel_tensor.index_select(0, tensor_indices)
                 model_output = model(
-                    hm_norm[:, :1], hm_norm[:, 1:], excitation_tensor, channel_tensor
+                    hm_norm[:, :1], hm_norm[:, 1:], exc_tensor, ch_tensor
                 )
                 if isinstance(model_output, tuple):
                     out_low, out_high = model_output
@@ -747,7 +956,10 @@ def _run_infer_fdr_bundle_batched(
             damping_center_normalized = None
             damping_outside_distance = None
             damping_slope_limits = None
-            if extrapolation_policy in {"tanh", "clip"} and support_slots:
+            if (
+                extrapolation_policy in {"tanh", "clip"}
+                and support_slots
+            ):
                 normalized_by_name = {
                     name: np.zeros((end - start, kmax), dtype=np.float64)
                     for name in target_names
@@ -844,6 +1056,131 @@ def _run_infer_fdr_bundle_batched(
                             damping_floor=damping_prediction_floor,
                         )
                         decoded[outside, slot] = pulled[outside]
+                if (
+                    name == "damping"
+                    and extrapolation_policy == "smooth_linear"
+                    and selected_output == "high"
+                    and support_slots
+                ):
+                    def decoded_slot_at(slot, h_input, m_input, indices):
+                        evaluated = predict_at(h_input, m_input, indices=indices)
+                        normalized = (
+                            evaluated[name][:, slot]
+                            .detach().cpu().numpy().astype(np.float64)
+                        )
+                        evaluated_latent = (
+                            normalized * float(output_normalizer.std[target_index])
+                            + float(output_normalizer.mean[target_index])
+                        )
+                        return output_normalizer.decode_target_numpy(
+                            name, evaluated_latent
+                        ).astype(np.float64)
+
+                    for slot in range(kmax):
+                        slot_support = (
+                            support_slots[slot] if slot < len(support_slots) else {}
+                        )
+                        mach_min, mach_max, height_supported = (
+                            _height_conditioned_mach_bounds(slot_support, h_values)
+                        )
+                        finite_bounds = (
+                            height_supported
+                            & np.isfinite(mach_min)
+                            & np.isfinite(mach_max)
+                            & (mach_max > mach_min)
+                        )
+                        for side, boundary_all, outside in (
+                            (-1, mach_min, finite_bounds & (m_values < mach_min)),
+                            (+1, mach_max, finite_bounds & (m_values > mach_max)),
+                        ):
+                            indices = np.flatnonzero(outside)
+                            if indices.size == 0:
+                                continue
+                            boundary = boundary_all[indices]
+                            interval_width = (mach_max - mach_min)[indices]
+                            fit_width = np.minimum(
+                                float(damping_extrapolation_fit_mach),
+                                0.5 * interval_width,
+                            )
+                            fit_width = np.maximum(fit_width, 1e-5)
+                            local_width = np.maximum(
+                                np.minimum(0.25 * fit_width, 0.01), 1e-5
+                            )
+                            h_selected = h_values[indices]
+                            boundary_values = decoded_slot_at(
+                                slot, h_selected, boundary, indices
+                            )
+                            local_values = decoded_slot_at(
+                                slot,
+                                h_selected,
+                                boundary - float(side) * local_width,
+                                indices,
+                            )
+                            boundary_slopes = (
+                                (boundary_values - local_values)
+                                / (float(side) * local_width)
+                            )
+                            # Fit the extrapolation slope as a straight line in
+                            # the displayed damping scale (damping * 200).  A
+                            # positive constant scale does not change linearity,
+                            # but doing the fit explicitly in display units keeps
+                            # the prediction rule aligned with the generated VG/HG
+                            # curves and avoids the old data-derived slope cap.
+                            fit_fractions = (0.0, 0.25, 0.5, 0.75, 1.0)
+                            fit_mach_points = []
+                            fit_display_values = []
+                            for fraction in fit_fractions:
+                                fit_mach = (
+                                    boundary
+                                    - float(side) * fit_width * float(fraction)
+                                )
+                                fit_mach_points.append(fit_mach)
+                                if fraction == 0.0:
+                                    fit_values = boundary_values
+                                else:
+                                    fit_values = decoded_slot_at(
+                                        slot, h_selected, fit_mach, indices
+                                    )
+                                fit_display_values.append(200.0 * fit_values)
+                            fit_mach_matrix = np.stack(fit_mach_points, axis=1)
+                            fit_value_matrix = np.stack(
+                                fit_display_values, axis=1
+                            )
+                            centered_mach = (
+                                fit_mach_matrix
+                                - np.mean(fit_mach_matrix, axis=1, keepdims=True)
+                            )
+                            centered_values = (
+                                fit_value_matrix
+                                - np.mean(fit_value_matrix, axis=1, keepdims=True)
+                            )
+                            denominator = np.sum(centered_mach**2, axis=1)
+                            target_slopes_display = np.divide(
+                                np.sum(centered_mach * centered_values, axis=1),
+                                denominator,
+                                out=np.zeros_like(denominator),
+                                where=denominator > 1e-12,
+                            )
+                            target_slopes = target_slopes_display / 200.0
+                            target_slopes = np.where(
+                                np.isfinite(target_slopes), target_slopes, 0.0
+                            )
+                            boundary_slopes = np.where(
+                                np.isfinite(boundary_slopes),
+                                boundary_slopes,
+                                target_slopes,
+                            )
+                            decoded[indices, slot] = _c1_smooth_linear_tail(
+                                m_values[indices],
+                                boundary,
+                                boundary_values,
+                                boundary_slopes,
+                                target_slopes,
+                                transition_mach=float(
+                                    damping_extrapolation_transition_mach
+                                ),
+                                side=side,
+                            )
                 accum[name].append(decoded)
             support_accum.append(support_mask)
         for name in target_names:
@@ -852,7 +1189,9 @@ def _run_infer_fdr_bundle_batched(
 
     freq = np.nan_to_num(component_outputs["freq"], nan=0.0, posinf=0.0, neginf=0.0)
     raw_damping = np.asarray(component_outputs["damping"], dtype=np.float64)
-    damping_finite_mask = np.isfinite(raw_damping)
+    damping_range_mask = _prediction_damping_slot_mask(
+        raw_damping, prediction_damping_min, prediction_damping_max
+    )
     damping = np.nan_to_num(raw_damping, nan=0.0, posinf=0.0, neginf=0.0)
     damping = np.maximum(damping, float(damping_prediction_floor))
     rho = np.nan_to_num(component_outputs["magnitude"], nan=0.0, posinf=0.0, neginf=0.0)
@@ -868,8 +1207,7 @@ def _run_infer_fdr_bundle_batched(
         np.isfinite(freq) & (freq > 0.0) & component_support_masks["frequency"]
     )
     damping_valid_mask = (
-        damping_finite_mask & (damping > 0.0) & (damping < 0.5)
-        & component_support_masks["damping"]
+        damping_range_mask & component_support_masks["damping"]
     )
     magnitude_valid_mask = (
         np.isfinite(rho) & (rho > 1e-12) & component_support_masks["residue_magnitude"]
@@ -878,21 +1216,18 @@ def _run_infer_fdr_bundle_batched(
         np.isfinite(sin_t) & np.isfinite(cos_t)
         & component_support_masks["residue_phase"]
     )
-    valid_mask = frequency_valid_mask & damping_valid_mask & magnitude_valid_mask & phase_valid_mask
     if mode_freq_ranges is not None:
         for row_index, channel_id in enumerate(np.asarray(ch_all, dtype=np.int64)):
             ch_name = channels[int(channel_id)] if 0 <= int(channel_id) < len(channels) else f"C{int(channel_id):02d}"
             ranges = mode_freq_ranges.get(ch_name, [None] * int(expected_kmax))
             for slot in range(int(expected_kmax)):
                 rg = ranges[slot] if slot < len(ranges) else None
-                valid_mask[row_index, slot] = bool(
-                    rg is not None and valid_mask[row_index, slot]
-                    and float(rg[0]) <= float(freq[row_index, slot]) <= float(rg[1])
-                )
                 frequency_valid_mask[row_index, slot] = bool(
                     rg is not None and frequency_valid_mask[row_index, slot]
                     and float(rg[0]) <= float(freq[row_index, slot]) <= float(rg[1])
                 )
+    scan_valid_mask = frequency_valid_mask & magnitude_valid_mask & phase_valid_mask
+    valid_mask = scan_valid_mask & damping_valid_mask
     return {
         "alpha": alpha,
         "omega": omega,
@@ -900,6 +1235,7 @@ def _run_infer_fdr_bundle_batched(
         "sin_theta": sin_t,
         "cos_theta": cos_t,
         "valid_mask": valid_mask.astype(np.float32),
+        "scan_valid_mask": scan_valid_mask.astype(np.float32),
         "frequency_valid_mask": frequency_valid_mask.astype(np.float32),
         "damping_valid_mask": damping_valid_mask.astype(np.float32),
         "magnitude_valid_mask": magnitude_valid_mask.astype(np.float32),
@@ -920,16 +1256,27 @@ def run_infer_batched(
     batch_size: int = 20000,
     predict_output: str = "low",
     mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
-    extrapolation_policy: str = "tanh",
+    extrapolation_policy: str = "allow",
     damping_tanh_min_mach_scale: float = DEFAULT_DAMPING_TANH_MIN_MACH_SCALE,
+    damping_extrapolation_transition_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_TRANSITION_MACH,
+    damping_extrapolation_fit_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_FIT_MACH,
     damping_prediction_floor: float = DEFAULT_DAMPING_PREDICTION_FLOOR,
+    prediction_damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
+    prediction_damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
 ):
+    prediction_damping_min, prediction_damping_max = (
+        _validate_prediction_damping_bounds(
+            prediction_damping_min, prediction_damping_max
+        )
+    )
     if not isinstance(model, ExcitationChannelModelRegistry):
         return _run_infer_single_model_batched(
             model, in_norm, omegaN, device, H_all, M_all, exc_all, ch_all,
             batch_size=batch_size,
             predict_output=predict_output,
             mode_freq_ranges=mode_freq_ranges,
+            prediction_damping_min=prediction_damping_min,
+            prediction_damping_max=prediction_damping_max,
         )
 
     registry = model
@@ -942,6 +1289,7 @@ def run_infer_batched(
         "sin_theta": np.zeros((count, kmax), dtype=np.float64),
         "cos_theta": np.ones((count, kmax), dtype=np.float64),
         "valid_mask": np.zeros((count, kmax), dtype=np.float32),
+        "scan_valid_mask": np.zeros((count, kmax), dtype=np.float32),
         "frequency_valid_mask": np.zeros((count, kmax), dtype=np.float32),
         "damping_valid_mask": np.zeros((count, kmax), dtype=np.float32),
         "magnitude_valid_mask": np.zeros((count, kmax), dtype=np.float32),
@@ -971,7 +1319,11 @@ def run_infer_batched(
             extrapolation_policy=extrapolation_policy,
             predict_output=predict_output,
             damping_tanh_min_mach_scale=damping_tanh_min_mach_scale,
+            damping_extrapolation_transition_mach=damping_extrapolation_transition_mach,
+            damping_extrapolation_fit_mach=damping_extrapolation_fit_mach,
             damping_prediction_floor=damping_prediction_floor,
+            prediction_damping_min=prediction_damping_min,
+            prediction_damping_max=prediction_damping_max,
         )
         for name in combined:
             combined[name][selected] = output[name]
@@ -1111,8 +1463,8 @@ def save_response_dat(
             outs_resp["sin_theta"][ch_idx], outs_resp["cos_theta"][ch_idx],
             outs_resp["valid_mask"][ch_idx], ch_name, csv_path, u, Ts,
             exist_thresh=exist_thresh, use_freq_filter=use_freq_filter,
-            frequency_valid_mask_row=outs_resp.get("frequency_valid_mask", outs_resp["valid_mask"])[ch_idx],
-            damping_valid_mask_row=outs_resp.get("damping_valid_mask", outs_resp["valid_mask"])[ch_idx],
+            frequency_valid_mask_row=outs_resp["valid_mask"][ch_idx],
+            damping_valid_mask_row=outs_resp["valid_mask"][ch_idx],
         )
         if not any(freq_slots):
             fd_lines.append(f"{ch_name}," + ",".join([""] * 9) + "\n")
@@ -1283,7 +1635,7 @@ def save_HF_HG_for_entry(
                 rho_row=rho[row],
                 sin_row=outs_hscan["sin_theta"][row],
                 cos_row=outs_hscan["cos_theta"][row],
-                valid_mask_row=valid_mask[row],
+                valid_mask_row=outs_hscan.get("scan_valid_mask", valid_mask)[row],
                 ch_name=ch_name,
                 csv_path=csv_path,
                 u=u,
@@ -1383,7 +1735,7 @@ def save_VF_VG_for_entry(
                 rho_row=rho[row],
                 sin_row=outs_mscan["sin_theta"][row],
                 cos_row=outs_mscan["cos_theta"][row],
-                valid_mask_row=valid_mask[row],
+                valid_mask_row=outs_mscan.get("scan_valid_mask", valid_mask)[row],
                 ch_name=ch_name,
                 csv_path=csv_path,
                 u=u,
@@ -1447,12 +1799,14 @@ def main():
     )
     parser.add_argument(
         "--extrapolation_policy",
-        choices=["tanh", "clip", "mask", "allow"],
-        default="tanh",
+        choices=["smooth_linear", "tanh", "clip", "mask", "allow"],
+        default="allow",
         help=(
-            "Handle points outside each modal slot's support: tanh pulls damping "
-            "toward the mid-Mach prediction while clipping other components "
-            "(default); clip, mask, and allow retain their previous behavior."
+            "Handle points outside each modal slot's support: allow directly "
+            "uses every component network prediction (default). smooth_linear "
+            "keeps in-range damping unchanged, joins it with a C1-smooth cubic "
+            "transition, then uses a straight-line fitted tail. tanh, clip, and "
+            "mask retain their legacy behavior."
         ),
     )
     parser.add_argument(
@@ -1462,12 +1816,53 @@ def main():
         help="Minimum Mach-number scale for bounded damping tanh extrapolation.",
     )
     parser.add_argument(
+        "--damping_extrapolation_transition_mach",
+        type=float,
+        default=DEFAULT_DAMPING_EXTRAPOLATION_TRANSITION_MACH,
+        help=(
+            "Mach width of the C1-smooth damping transition from the network "
+            "boundary slope to the fitted straight-tail slope (default: 0.05)."
+        ),
+    )
+    parser.add_argument(
+        "--damping_extrapolation_fit_mach",
+        type=float,
+        default=DEFAULT_DAMPING_EXTRAPOLATION_FIT_MACH,
+        help=(
+            "In-support Mach width used to fit the damping*200 straight-tail "
+            "slope (default: 0.05)."
+        ),
+    )
+    parser.add_argument(
         "--damping_prediction_floor",
         type=float,
         default=DEFAULT_DAMPING_PREDICTION_FLOOR,
         help="Small positive numerical floor applied to predicted damping ratios.",
     )
+    parser.add_argument(
+        "--prediction_damping_min",
+        type=_parse_optional_float,
+        default=DEFAULT_PREDICTION_DAMPING_MIN,
+        help=(
+            "Reject an entire predicted modal slot when damping*200 is below "
+            "this value (default: 2). Use 'none' to disable."
+        ),
+    )
+    parser.add_argument(
+        "--prediction_damping_max",
+        type=_parse_optional_float,
+        default=DEFAULT_PREDICTION_DAMPING_MAX,
+        help=(
+            "Reject an entire predicted modal slot when damping*200 is above "
+            "this value (default: no upper limit)."
+        ),
+    )
     args, _unknown = parser.parse_known_args()
+    args.prediction_damping_min, args.prediction_damping_max = (
+        _validate_prediction_damping_bounds(
+            args.prediction_damping_min, args.prediction_damping_max
+        )
+    )
 
     fs = 512
     Ts = 1.0 / fs
@@ -1554,11 +1949,23 @@ def main():
     mode_freq_ranges = _load_channel_freq_ranges(csv_path) if args.use_freq_filter else None
     print(f"==> Frequency range filter enabled: {args.use_freq_filter}", flush=True)
     print(f"==> Extrapolation policy: {args.extrapolation_policy}", flush=True)
+    print(
+        "==> Prediction damping slot filter (after x200): "
+        f"min={args.prediction_damping_min}, max={args.prediction_damping_max}",
+        flush=True,
+    )
     if args.extrapolation_policy == "tanh":
         print(
             "==> Damping tanh extrapolation: "
             f"min_mach_scale={args.damping_tanh_min_mach_scale:g}, "
             f"floor={args.damping_prediction_floor:g}",
+            flush=True,
+        )
+    if args.extrapolation_policy == "smooth_linear":
+        print(
+            "==> Damping*200 C1 smooth straight-line extrapolation: "
+            f"transition_mach={args.damping_extrapolation_transition_mach:g}, "
+            f"fit_mach={args.damping_extrapolation_fit_mach:g}",
             flush=True,
         )
 
@@ -1602,7 +2009,11 @@ def main():
             mode_freq_ranges=mode_freq_ranges,
             extrapolation_policy=args.extrapolation_policy,
             damping_tanh_min_mach_scale=args.damping_tanh_min_mach_scale,
+            damping_extrapolation_transition_mach=args.damping_extrapolation_transition_mach,
+            damping_extrapolation_fit_mach=args.damping_extrapolation_fit_mach,
             damping_prediction_floor=args.damping_prediction_floor,
+            prediction_damping_min=args.prediction_damping_min,
+            prediction_damping_max=args.prediction_damping_max,
         )
 
         # 2) 生成激励 u(t)
@@ -1634,7 +2045,11 @@ def main():
                 mode_freq_ranges=mode_freq_ranges,
                 extrapolation_policy=args.extrapolation_policy,
                 damping_tanh_min_mach_scale=args.damping_tanh_min_mach_scale,
+                damping_extrapolation_transition_mach=args.damping_extrapolation_transition_mach,
+                damping_extrapolation_fit_mach=args.damping_extrapolation_fit_mach,
                 damping_prediction_floor=args.damping_prediction_floor,
+                prediction_damping_min=args.prediction_damping_min,
+                prediction_damping_max=args.prediction_damping_max,
             )
             save_HF_HG_for_entry(
                 entry, H_axis, outs_hscan, csv_path,
@@ -1662,7 +2077,11 @@ def main():
                 mode_freq_ranges=mode_freq_ranges,
                 extrapolation_policy=args.extrapolation_policy,
                 damping_tanh_min_mach_scale=args.damping_tanh_min_mach_scale,
+                damping_extrapolation_transition_mach=args.damping_extrapolation_transition_mach,
+                damping_extrapolation_fit_mach=args.damping_extrapolation_fit_mach,
                 damping_prediction_floor=args.damping_prediction_floor,
+                prediction_damping_min=args.prediction_damping_min,
+                prediction_damping_max=args.prediction_damping_max,
             )
             save_VF_VG_for_entry(
                 entry, M_axis, outs_mscan, csv_path,

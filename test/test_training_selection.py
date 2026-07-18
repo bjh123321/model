@@ -5,6 +5,8 @@ from surrogate_model.cli.train import (
     _filter_combinations,
     _filter_rows_by_heights,
     _height_selection_matches,
+    _resolve_component_selection,
+    _resolve_component_value_mapping,
     _resolve_height_selection,
     _resolve_id_selection,
 )
@@ -17,6 +19,23 @@ def main():
     assert _resolve_id_selection(["fxd_fdc,1"], EXCITATION_NAMES, "excitation") == {0, 1}
     assert _resolve_id_selection(["LVT1;9"], channel_names, "channel") == {8, 9}
     assert _resolve_id_selection(None, EXCITATION_NAMES, "excitation") is None
+    assert _resolve_component_selection(None) is None
+    assert _resolve_component_selection(["damping"]) == {"damping"}
+    assert _resolve_component_selection(
+        ["frequency,damping", "residue-phase"]
+    ) == {"frequency", "damping", "residue_phase"}
+    assert _resolve_component_value_mapping(
+        ["frequency=training,residue-phase=validation"],
+        label="checkpoint",
+        value_type=str,
+        choices=("training", "validation"),
+    ) == {"frequency": "training", "residue_phase": "validation"}
+    assert _resolve_component_value_mapping(
+        ["damping=0.75", "frequency=0.2"],
+        label="simulation weight",
+        value_type=float,
+        minimum=0.0,
+    ) == {"damping": 0.75, "frequency": 0.2}
 
     combinations = [(0, 8), (0, 9), (1, 8), (2, 20)]
     assert _filter_combinations(combinations, {0, 1}, {8}) == [(0, 8), (1, 8)]
@@ -62,6 +81,12 @@ def main():
         assert "Unknown excitation selector" in str(exc)
     else:
         raise AssertionError("Invalid excitation selector was accepted")
+    try:
+        _resolve_component_selection(["not_a_component"])
+    except ValueError as exc:
+        assert "Unknown component selector" in str(exc)
+    else:
+        raise AssertionError("Invalid component selector was accepted")
     for invalid_height in ("not-a-height", "nan", "inf"):
         try:
             _resolve_height_selection([invalid_height])

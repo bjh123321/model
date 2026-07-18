@@ -73,6 +73,21 @@ def _observed_mach_slopes(values):
     return slopes
 
 
+def _training_height_mach_envelope(values):
+    groups: dict[float, list[float]] = {}
+    for height, mach, _damping in values:
+        groups.setdefault(round(float(height), 8), []).append(float(mach))
+    return [
+        {
+            "height": float(height),
+            "mach_min": float(min(mach_values)),
+            "mach_max": float(max(mach_values)),
+            "count": len(mach_values),
+        }
+        for height, mach_values in sorted(groups.items())
+    ]
+
+
 def _build_slot_support(real_train: List[ParsedRow], real_val: List[ParsedRow], cfg: Config):
     kmax = int(cfg.K_max)
     minimum_count = int(getattr(cfg, "min_slot_train_samples", 8))
@@ -102,6 +117,7 @@ def _build_slot_support(real_train: List[ParsedRow], real_val: List[ParsedRow], 
             "support_count": len(support_values),
             "low_confidence": len(values) < minimum_count,
             "slope_limit": slope_limit,
+            "training_height_mach_envelope": _training_height_mach_envelope(values),
         }
         if support_values:
             slot_data.update({
@@ -117,16 +133,21 @@ def _build_slot_support(real_train: List[ParsedRow], real_val: List[ParsedRow], 
             })
         slots.append(slot_data)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "minimum_train_samples": minimum_count,
         "coordinate_support_scope": "training_and_validation_rows",
         "slope_fit_scope": "training_rows_only",
+        "height_mach_envelope_scope": "training_rows_only",
         "slots": slots,
     }
 
 
 def _attach_and_write_slot_support(
-    out_norm: Normalizer, real_train: List[ParsedRow], real_val: List[ParsedRow], cfg: Config, out_dir: Path
+    out_norm: Normalizer,
+    real_train: List[ParsedRow],
+    real_val: List[ParsedRow],
+    cfg: Config,
+    out_dir: Path,
 ):
     support = _build_slot_support(real_train, real_val, cfg)
     out_norm.support = support

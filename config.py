@@ -61,12 +61,13 @@ class Config:
     early_stop_patience_s1: int = 50
     early_stop_patience_s2: int = 50
     early_stop_min_delta: float = 1e-6
-    checkpoint_selection: str = "validation"
+    checkpoint_selection: str = "training"
 
     # Optim
     lr_low_adam: float = 1e-3
     lr_high_adam: float = 1e-3
     weight_decay: float = 5e-5
+    multifidelity_real_loss_weight: float = 1.0
     multifidelity_sim_loss_weight: float = 0.2
     freeze_low_stage2: bool = False
 
@@ -77,7 +78,7 @@ class Config:
     fdr_training_profile_version: int = 8
     fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
         "frequency": 8,
-        "damping": 8,
+        "damping": 9,
         "residue_magnitude": 8,
         "residue_phase": 8,
     })
@@ -105,9 +106,39 @@ class Config:
     })
     fdr_component_early_stop_patience: Dict[str, int] = field(default_factory=lambda: {
         "frequency": 500,
-        "damping": 500,
+        "damping": 50,
         "residue_magnitude": 500,
         "residue_phase": 500,
+    })
+    fdr_component_epochs_stage1: Dict[str, int] = field(default_factory=lambda: {
+        "frequency": 500,
+        "damping": 200,
+        "residue_magnitude": 500,
+        "residue_phase": 500,
+    })
+    fdr_component_epochs_stage2: Dict[str, int] = field(default_factory=lambda: {
+        "frequency": 500,
+        "damping": 200,
+        "residue_magnitude": 500,
+        "residue_phase": 500,
+    })
+    fdr_component_checkpoint_selection: Dict[str, str] = field(default_factory=lambda: {
+        "frequency": "training",
+        "damping": "training",
+        "residue_magnitude": "training",
+        "residue_phase": "training",
+    })
+    fdr_component_real_loss_weight: Dict[str, float] = field(default_factory=lambda: {
+        "frequency": 1.0,
+        "damping": 1.0,
+        "residue_magnitude": 1.0,
+        "residue_phase": 1.0,
+    })
+    fdr_component_sim_loss_weight: Dict[str, float] = field(default_factory=lambda: {
+        "frequency": 0.2,
+        "damping": 0.2,
+        "residue_magnitude": 0.2,
+        "residue_phase": 0.2,
     })
     fdr_checkpoint_train_loss_ceiling: float = 0.05
     fdr_component_checkpoint_train_loss_ceiling: Dict[str, Optional[float]] = field(default_factory=lambda: {
