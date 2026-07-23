@@ -9,6 +9,7 @@ import os
 import shutil
 import socket
 import sys
+import tempfile
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -424,6 +425,7 @@ def main():
         candidate = Path(raw).expanduser()
         return candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
 
+    generated_dataset_tmp = None
     direct_paths = [resolve_user_path(raw) for raw in lines[3:] if raw]
     if direct_paths:
         missing = [path for path in direct_paths if not path.is_file()]
@@ -433,12 +435,17 @@ def main():
         correction_paths = direct_paths
     else:
         correction_mode = "cg_oe"
+        generated_dataset_tmp = tempfile.TemporaryDirectory(
+            prefix="xgd_correction_dataset_"
+        )
+        generated_dataset_dir = Path(generated_dataset_tmp.name)
         correction_paths = list(
             batch_process_split(
                 data_dir,
-                base_dir,
+                generated_dataset_dir,
                 base_dir / "selected_CG_path.txt",
                 reserved_names_dir=(base_version_dir / "dataset_snapshot"),
+                modal_band_config_path=base_dir / "极点频段配置.xlsx",
             )
         )
     print(f"[CORRECTION] mode={correction_mode} files={len(correction_paths)}", flush=True)
@@ -464,6 +471,9 @@ def main():
                 )
             correction_group_owner[key] = path
         correction_rows.extend(file_rows)
+    if generated_dataset_tmp is not None:
+        generated_dataset_tmp.cleanup()
+        generated_dataset_tmp = None
     group_rows(correction_rows, source="selected correction files")
     merged_rows, merge_info = merge_dataset_rows(parent_rows, correction_rows)
     parsed_rows, stats = parse_rows_to_struct(merged_rows)

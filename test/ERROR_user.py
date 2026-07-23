@@ -60,6 +60,7 @@ else:
     raise ValueError(f"无法根据模型名判断路径类型：{model_name}")
 
 VERBOSE = True
+MAX_MATCH_DIFF = 0.1
 SCAN_TYPES = ("HF", "HG", "HA", "VF", "VG", "VA")
 H_SCAN_TYPES = ("HF", "HG", "HA")
 V_SCAN_TYPES = ("VF", "VG", "VA")
@@ -127,6 +128,21 @@ def nearest_value(values: np.ndarray, target: float) -> float:
     return float(values[idx])
 
 
+def find_first_axis_token(parts: List[str], axis: str, path: Path) -> str:
+    pattern = rf"{re.escape(axis)}\d+"
+    token = next((part for part in parts if re.fullmatch(pattern, part, flags=re.IGNORECASE)), None)
+    if token is None:
+        raise ValueError(f"{path.name} 中未找到 {axis.upper()}xxxx 字段")
+    return token.upper()
+
+
+def find_first_excitation(parts: List[str], path: Path) -> str:
+    for left, right in zip(parts, parts[1:]):
+        if re.fullmatch(r"(?:DC|FDC)", right, flags=re.IGNORECASE):
+            return f"{left}_{right}".upper()
+    raise ValueError(f"{path.name} 中未找到形如 FXD_DC 的激励方式字段")
+
+
 def parse_a_filename(path: Path) -> Dict[str, object]:
     """
     例如：
@@ -135,18 +151,16 @@ def parse_a_filename(path: Path) -> Dict[str, object]:
     """
     stem = path.stem
     parts = stem.split("_")
-    if len(parts) < 8:
+    if not parts:
         raise ValueError(f"A 文件名格式异常：{path.name}")
 
-    scan_type = parts[0]
+    scan_type = parts[0].upper()
     if scan_type not in SCAN_TYPES:
         raise ValueError(f"A 文件 scan_type 非法：{path.name}")
 
-    fixed_token = parts[3]
-    excitation = f"{parts[4]}_{parts[5]}"
-    date_idx = next((i for i, p in enumerate(parts) if re.fullmatch(r"\d{8}", p)), None)
-    if date_idx is None:
-        raise ValueError(f"A 文件名中未找到日期：{path.name}")
+    fixed_axis = "M" if scan_type in H_SCAN_TYPES else "H"
+    fixed_token = find_first_axis_token(parts[1:], fixed_axis, path)
+    excitation = find_first_excitation(parts[1:], path)
 
     info: Dict[str, object] = {
         "stem": stem,
@@ -154,7 +168,6 @@ def parse_a_filename(path: Path) -> Dict[str, object]:
         "scan_type": scan_type,
         "excitation": excitation,
         "fixed_token": fixed_token,
-        "date": parts[date_idx],
     }
 
     if scan_type in H_SCAN_TYPES:
@@ -184,18 +197,16 @@ def parse_a_filename(path: Path) -> Dict[str, object]:
 def parse_pred_filename(path: Path) -> Dict[str, object]:
     stem = path.stem
     parts = stem.split("_")
-    if len(parts) < 7:
+    if len(parts) < 2:
         raise ValueError(f"预测文件名格式异常：{path.name}")
 
-    scan_type = parts[0]
-    if scan_type not in SCAN_TYPES or parts[1] != "PR":
+    scan_type = parts[0].upper()
+    if scan_type not in SCAN_TYPES or parts[1].upper() != "PR":
         raise ValueError(f"非法预测文件名：{path.name}")
 
-    fixed_token = parts[2]
-    excitation = f"{parts[3]}_{parts[4]}"
-    date_idx = next((i for i, p in enumerate(parts) if re.fullmatch(r"\d{8}", p)), None)
-    if date_idx is None:
-        raise ValueError(f"预测文件名中未找到日期：{path.name}")
+    fixed_axis = "M" if scan_type in H_SCAN_TYPES else "H"
+    fixed_token = find_first_axis_token(parts[2:], fixed_axis, path)
+    excitation = find_first_excitation(parts[2:], path)
 
     info: Dict[str, object] = {
         "stem": stem,
@@ -203,8 +214,6 @@ def parse_pred_filename(path: Path) -> Dict[str, object]:
         "scan_type": scan_type,
         "excitation": excitation,
         "fixed_token": fixed_token,
-        "date": parts[date_idx],
-        "tail": "_".join(parts[5:]),
         "path": path,
     }
     if scan_type in H_SCAN_TYPES:
@@ -263,11 +272,19 @@ def choose_nearest_pred_file(folder: Path, a_info: Dict[str, object], scan_type:
     if not cands:
         return None
     target_fixed_val = float(a_info["fixed_val"])
-    return min(cands, key=lambda x: abs(float(x["fixed_val"]) - target_fixed_val))
+    nearest = min(cands, key=lambda x: abs(float(x["fixed_val"]) - target_fixed_val))
+    if abs(float(nearest["fixed_val"]) - target_fixed_val) > MAX_MATCH_DIFF:
+        return None
+    return nearest
 
 
-def build_output_filename(scan_type: str, out_dir: Path) -> Path:
-    return out_dir / f"ERROR_{scan_type}.dat"
+def build_output_filename(
+    scan_type: str,
+    fixed_token: str,
+    excitation: str,
+    out_dir: Path,
+) -> Path:
+    return out_dir / f"ERROR_{scan_type}_{fixed_token}_{excitation}.dat"
 
 def calc_error_for_one_pair(a_file: Path, pred_info: Dict[str, object], out_dir: Path) -> Optional[Path]:
     df_a = read_dat_table(a_file)
@@ -290,37 +307,38 @@ def calc_error_for_one_pair(a_file: Path, pred_info: Dict[str, object], out_dir:
     scan_axis = str(a_info["scan_axis"])
     a_scan_col = a_cols[scan_axis]
     p_scan_col = pred_cols[scan_axis]
-    fixed_axis = str(a_info["fixed_axis"])
-    a_fixed_col = a_cols[fixed_axis]
-    p_fixed_col = pred_cols[fixed_axis]
-    fixed_val = float(a_info["fixed_val"])
 
-    # 仅保留预测文件中固定轴最近的子集；正常情况下整文件都相同，这里做稳健处理
-    pred_fixed_vals = df_pred[p_fixed_col].dropna().to_numpy(dtype=float)
-    if pred_fixed_vals.size == 0:
-        raise ValueError(f"{pred_info['name']} 中固定轴列 {p_fixed_col} 没有有效数值")
-    pred_fixed_nearest = nearest_value(pred_fixed_vals, fixed_val)
-    df_pred_fixed = df_pred[np.isclose(df_pred[p_fixed_col].astype(float), pred_fixed_nearest, atol=1e-12, rtol=0.0)].copy()
-
-    # 仅保留 A 文件中固定轴最近的子集；应对文件内存在轻微浮动
-    a_fixed_vals = df_a[a_fixed_col].dropna().to_numpy(dtype=float)
-    if a_fixed_vals.size == 0:
-        raise ValueError(f"{a_file.name} 中固定轴列 {a_fixed_col} 没有有效数值")
-    a_fixed_nearest = nearest_value(a_fixed_vals, fixed_val)
-    df_a_fixed = df_a[np.isclose(df_a[a_fixed_col].astype(float), a_fixed_nearest, atol=1e-12, rtol=0.0)].copy()
-
-    pred_scan_vals = df_pred_fixed[p_scan_col].dropna().to_numpy(dtype=float)
+    # 文件已经按文件名中的固定轴完成配对。扫描文件内部不再检查或筛选固定轴：
+    # VF/VG/VA 只按 M + 通道匹配，HF/HG/HA 只按 H + 通道匹配。
+    pred_scan_vals = df_pred[p_scan_col].dropna().to_numpy(dtype=float)
     if pred_scan_vals.size == 0:
         raise ValueError(f"{pred_info['name']} 中扫描轴列 {p_scan_col} 没有有效数值")
 
     result_rows = []
     unmatched = []
-    unique_targets = sorted(df_a_fixed[a_scan_col].dropna().astype(float).unique().tolist())
+    unique_targets = sorted(df_a[a_scan_col].dropna().astype(float).unique().tolist())
 
     for target_scan in unique_targets:
         matched_scan = nearest_value(pred_scan_vals, target_scan)
-        df_a_grp = df_a_fixed[np.isclose(df_a_fixed[a_scan_col].astype(float), target_scan, atol=1e-12, rtol=0.0)].copy()
-        df_p_grp = df_pred_fixed[np.isclose(df_pred_fixed[p_scan_col].astype(float), matched_scan, atol=1e-12, rtol=0.0)].copy()
+        df_a_grp = df_a[np.isclose(df_a[a_scan_col].astype(float), target_scan, atol=1e-12, rtol=0.0)].copy()
+        scan_diff = abs(matched_scan - target_scan)
+        if scan_diff > MAX_MATCH_DIFF:
+            log(
+                f"[WARN] {a_file.name} 扫描轴 {scan_axis}={target_scan:.6g} "
+                f"没有差值不超过 {MAX_MATCH_DIFF:g} 的预测点；最近={matched_scan:.6g}，"
+                f"差值={scan_diff:.6g}"
+            )
+            for _, a_row in df_a_grp.iterrows():
+                result_rows.append([
+                    to_float(a_row[a_cols["H"]]),
+                    to_float(a_row[a_cols["M"]]),
+                    clean_channel(a_row[a_cols["ch"]]),
+                    np.nan,
+                    np.nan,
+                    np.nan,
+                ])
+            continue
+        df_p_grp = df_pred[np.isclose(df_pred[p_scan_col].astype(float), matched_scan, atol=1e-12, rtol=0.0)].copy()
         df_p_grp = df_p_grp.set_index(pred_cols["ch"], drop=False)
 
         for _, a_row in df_a_grp.iterrows():
@@ -360,7 +378,12 @@ def calc_error_for_one_pair(a_file: Path, pred_info: Dict[str, object], out_dir:
     )
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = build_output_filename(pred_info["scan_type"], out_dir)
+    out_path = build_output_filename(
+        scan_type=str(a_info["scan_type"]),
+        fixed_token=str(a_info["fixed_token"]),
+        excitation=str(a_info["excitation"]),
+        out_dir=out_dir,
+    )
     df_out.to_csv(out_path, index=False)
 
     if unmatched:
@@ -374,13 +397,16 @@ def process_one_a_file(a_file: Path, pred_root: Path, out_dir: Path) -> List[Pat
     log(f"\n========== 处理 A 文件：{a_file.name} ==========")
     log(
         f"提取信息：scan_type={a_info['scan_type']}, excitation={a_info['excitation']}, "
-        f"fixed_axis={a_info['fixed_axis']}, fixed_val={float(a_info['fixed_val']):.2f}, date={a_info['date']}"
+        f"fixed_axis={a_info['fixed_axis']}, fixed_val={float(a_info['fixed_val']):.2f}"
     )
 
     outputs: List[Path] = []
     pred_info = choose_nearest_pred_file(pred_root, a_info, str(a_info["scan_type"]))
     if pred_info is None:
-        log(f"[SKIP] 未找到 {a_info['scan_type']} 对应文件")
+        log(
+            f"[SKIP] 未找到与 {a_file.name} 匹配的 {a_info['scan_type']} 预测文件："
+            f"固定轴 {a_info['fixed_axis']} 的差值必须不超过 {MAX_MATCH_DIFF:g}"
+        )
         return outputs
 
     log(

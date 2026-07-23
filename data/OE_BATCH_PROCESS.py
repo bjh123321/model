@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 import traceback
 from dataclasses import dataclass
@@ -42,7 +41,8 @@ OE_KWARGS = {
 PEAK_PARAMS = dict(DEFAULT_PEAK_PARAMS)
 PEAK_PARAMS["min_prominence_db"] = 0.0
 POLE_FILTER_PARAMS = dict(DEFAULT_POLE_FILTER_PARAMS)
-MODAL_BAND_CONFIG_PATH = Path.home() / ".analyze_signal_app" / "oe_batch_mode_bands.json"
+MODAL_BAND_CONFIG_FILENAME = "极点频段配置.xlsx"
+MODAL_BAND_HEADERS = ("通道", "频段1", "频段2", "频段3", "允许误差", "OE阶数")
 
 EXCITATION_ID = {
     "FXD_FDC": 0,
@@ -173,55 +173,90 @@ def _coerce_band(value: object) -> Optional[Tuple[float, float]]:
 def _coerce_tolerances(value: object) -> Tuple[float, float, float]:
     parts = list(value) if isinstance(value, (list, tuple)) else re.split(r"\s*[-~:,，；;]\s*", str(value or "").strip())
     if len(parts) != 3:
-        return DEFAULT_MODAL_TOLERANCES
+        raise ValueError(f"允许误差必须写成三个正数，例如 2-2-5，实际为 {value!r}")
     values = tuple(float(item) for item in parts)
     if not all(np.isfinite(item) and item > 0 for item in values):
-        return DEFAULT_MODAL_TOLERANCES
+        raise ValueError(f"允许误差必须写成三个正数，例如 2-2-5，实际为 {value!r}")
     return values
 
 
-def load_modal_band_config() -> Dict[str, Dict[str, object]]:
+def _coerce_model_order(value: object) -> Optional[Tuple[int, int]]:
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return None
+    parts = re.split(r"\s*[-~:,，；;]\s*", text)
+    if len(parts) != 2:
+        raise ValueError(f"OE阶数必须写成 F-B，例如 30-30，实际为 {text!r}")
+    nf, nb = int(float(parts[0])), int(float(parts[1]))
+    if nf <= 0 or nb <= 0:
+        raise ValueError(f"OE阶数必须为正整数，实际为 {text!r}")
+    return nf, nb
+
+
+def load_modal_band_config(config_path: Path) -> Dict[str, Dict[str, object]]:
+    """Load the modal-identification table using the App table's six columns."""
+
+    config_path = Path(config_path)
+    if not config_path.is_file():
+        raise FileNotFoundError(f"极点频段配置文件不存在: {config_path}")
+
     config = {
-        channel: {"bands": list(DEFAULT_MODAL_BANDS), "tolerances": DEFAULT_MODAL_TOLERANCES}
+        channel: {
+            "bands": list(DEFAULT_MODAL_BANDS),
+            "tolerances": DEFAULT_MODAL_TOLERANCES,
+            "model_order": None,
+        }
         for channels in CHANNELS_BY_POS.values()
         for channel in channels
     }
-    try:
-        if not MODAL_BAND_CONFIG_PATH.exists():
-            return config
-        raw = json.loads(MODAL_BAND_CONFIG_PATH.read_text(encoding="utf-8"))
-        if not isinstance(raw, dict):
-            return config
-        for channel, value in raw.items():
-            if isinstance(value, dict):
-                band_values = value.get("bands", [])
-                tolerance_values = value.get("tolerances")
-            else:
-                band_values = value if isinstance(value, list) else []
-                tolerance_values = None
-            bands = [_coerce_band(item) for item in list(band_values)[:3]]
-            while len(bands) < 3:
-                bands.append(None)
-            config[str(channel)] = {
-                "bands": bands[:3],
-                "tolerances": _coerce_tolerances(tolerance_values),
-            }
-    except Exception:
-        return config
+    frame = pd.read_excel(config_path, sheet_name=0, dtype=object)
+    frame.columns = [str(column).strip() for column in frame.columns]
+    missing = [header for header in MODAL_BAND_HEADERS if header not in frame.columns]
+    if missing:
+        raise KeyError(f"{config_path} 缺少列: {', '.join(missing)}")
+
+    for row_number, row in frame.iterrows():
+        channel = str(row["通道"]).strip()
+        if not channel or channel.lower() == "nan":
+            continue
+        bands = [_coerce_band(row[name]) for name in ("频段1", "频段2", "频段3")]
+        tolerance_raw = row["允许误差"]
+        tolerances = (
+            DEFAULT_MODAL_TOLERANCES
+            if str(tolerance_raw).strip().lower() in ("", "nan")
+            else _coerce_tolerances(tolerance_raw)
+        )
+        if not any(band is not None for band in bands):
+            raise ValueError(f"{config_path} 第 {row_number + 2} 行 {channel} 没有有效频段")
+        config[channel] = {
+            "bands": bands,
+            "tolerances": tolerances,
+            "model_order": _coerce_model_order(row["OE阶数"]),
+        }
     return config
 
 
-def _modal_config_for_channel(channel_name: Optional[str]) -> Dict[str, object]:
-    config = load_modal_band_config()
+def _modal_config_for_channel(
+    config: Dict[str, Dict[str, object]], channel_name: Optional[str]
+) -> Dict[str, object]:
     if channel_name is not None and str(channel_name) in config:
         return config[str(channel_name)]
-    return {"bands": list(DEFAULT_MODAL_BANDS), "tolerances": DEFAULT_MODAL_TOLERANCES}
+    return {
+        "bands": list(DEFAULT_MODAL_BANDS),
+        "tolerances": DEFAULT_MODAL_TOLERANCES,
+        "model_order": None,
+    }
 
 
-def find_spectrum_peaks(y: np.ndarray, fs: int, channel_name: Optional[str] = None) -> np.ndarray:
+def find_spectrum_peaks(
+    y: np.ndarray,
+    fs: int,
+    modal_config: Dict[str, Dict[str, object]],
+    channel_name: Optional[str] = None,
+) -> np.ndarray:
     frequency, amplitude = amplitude_spectrum(y, fs)
     robust_spectrum_peaks(frequency, amplitude, **PEAK_PARAMS)
-    entry = _modal_config_for_channel(channel_name)
+    entry = _modal_config_for_channel(modal_config, channel_name)
     slots = marker_slots_from_bands(
         frequency,
         amplitude,
@@ -231,13 +266,19 @@ def find_spectrum_peaks(y: np.ndarray, fs: int, channel_name: Optional[str] = No
     return np.array([value for value in slots if value is not None], dtype=float)
 
 
-def oe_extract_modes(u: np.ndarray, y: np.ndarray, fs: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def oe_extract_modes(
+    u: np.ndarray,
+    y: np.ndarray,
+    fs: int,
+    model_order: Optional[Tuple[int, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    nf, nb = model_order or (int(OE_KWARGS["na"]), int(OE_KWARGS["nb"]))
     result = fit_oe_modal(
         u,
         y,
         fs,
-        nb=int(OE_KWARGS["nb"]),
-        nf=int(OE_KWARGS["na"]),
+        nb=nb,
+        nf=nf,
         nk=int(OE_KWARGS["nk"]),
         max_iter=int(OE_KWARGS["max_nfev"]),
     )
@@ -325,7 +366,9 @@ def read_selected_dat_files(root_dir: Path, selected_list_file: Path) -> List[Pa
     return files
 
 
-def _extract_rows_from_dat(file_path: Path) -> List[str]:
+def _extract_rows_from_dat(
+    file_path: Path, modal_config: Dict[str, Dict[str, object]]
+) -> List[str]:
     meta = parse_excitation_from_filename(file_path)
     values, header = read_table_dat(file_path)
     input_signal = get_input_signal(header, values, INPUT_SIGNAL_NAME)
@@ -340,9 +383,16 @@ def _extract_rows_from_dat(file_path: Path) -> List[str]:
             valid = np.isfinite(input_signal) & np.isfinite(output_signal)
             paired_input = input_signal[valid]
             paired_output = output_signal[valid]
-            markers = find_spectrum_peaks(paired_output, FS, channel_name)
-            poles, residues, continuous_poles = oe_extract_modes(paired_input, paired_output, FS)
-            entry = _modal_config_for_channel(channel_name)
+            entry = _modal_config_for_channel(modal_config, channel_name)
+            markers = find_spectrum_peaks(
+                paired_output, FS, modal_config, channel_name
+            )
+            poles, residues, continuous_poles = oe_extract_modes(
+                paired_input,
+                paired_output,
+                FS,
+                model_order=entry.get("model_order"),
+            )
             selected = match_peaks_to_oe(
                 markers,
                 poles,
@@ -390,14 +440,21 @@ def batch_process_split(
     output_dir: Path,
     selected_list_file: Path,
     reserved_names_dir: Optional[Path] = None,
+    modal_band_config_path: Optional[Path] = None,
 ) -> List[Path]:
     root_dir, output_dir = Path(root_dir), Path(output_dir)
     files = read_selected_dat_files(root_dir, Path(selected_list_file))
+    config_path = (
+        Path(modal_band_config_path)
+        if modal_band_config_path is not None
+        else Path(selected_list_file).parent / MODAL_BAND_CONFIG_FILENAME
+    )
+    modal_config = load_modal_band_config(config_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     generated: List[Path] = []
     for file_path in files:
         try:
-            rows = _extract_rows_from_dat(file_path)
+            rows = _extract_rows_from_dat(file_path, modal_config)
             if not rows:
                 raise RuntimeError(f"No usable modal rows extracted from: {file_path}")
             output_path = _next_split_dataset_path(output_dir, _split_dataset_stem(file_path), reserved_names_dir)
@@ -413,14 +470,25 @@ def batch_process_split(
     return generated
 
 
-def batch_process(root_dir: Path, out_file: Path, selected_list_file: Path) -> None:
+def batch_process(
+    root_dir: Path,
+    out_file: Path,
+    selected_list_file: Path,
+    modal_band_config_path: Optional[Path] = None,
+) -> None:
     root_dir, out_file = Path(root_dir), Path(out_file)
     files = read_selected_dat_files(root_dir, Path(selected_list_file))
+    config_path = (
+        Path(modal_band_config_path)
+        if modal_band_config_path is not None
+        else Path(selected_list_file).parent / MODAL_BAND_CONFIG_FILENAME
+    )
+    modal_config = load_modal_band_config(config_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     with out_file.open("w", encoding="utf-8") as stream:
         for file_path in files:
             try:
-                rows = _extract_rows_from_dat(file_path)
+                rows = _extract_rows_from_dat(file_path, modal_config)
                 if rows:
                     stream.write("\n".join(rows) + "\n")
             except Exception as exc:

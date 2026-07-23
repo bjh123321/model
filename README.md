@@ -154,6 +154,13 @@ line 3 is the new model version, and every non-empty line from line 4 onward is 
 added/replacement data file. These files determine the candidate excitation/channel
 networks. `--excitation`, `--channel`, and `--component` further restrict that set:
 
+When line 4 and later are empty, correction reads `selected_CG_path.txt` and
+`极点频段配置.xlsx` beside `train_incremental.py` (or beside the packaged
+executable), runs the App-aligned OE extractor with `prom=0`, and creates the
+correction split files in a temporary directory. The temporary files are removed
+after merging. The only persistent copy is the merged data in the new version's
+`dataset_snapshot/`.
+
 ```bash
 python -m surrogate_model.cli.train_incremental --component damping
 python -m surrogate_model.cli.train_incremental --component damping --excitation PW_FDC --channel LHT1
