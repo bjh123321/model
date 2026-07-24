@@ -126,7 +126,8 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_dropout_prob["frequency"] == 0.0
     assert cfg.fdr_component_dropout_prob["damping"] == 0.0
     assert cfg.fdr_component_weight_decay["damping"] == 5e-5
-    assert cfg.fdr_component_early_stop_patience["damping"] == 50
+    assert cfg.fdr_early_stop_patience == 50
+    assert set(cfg.fdr_component_early_stop_patience.values()) == {50}
     assert cfg.fdr_component_epochs_stage1["damping"] == 200
     assert cfg.fdr_component_epochs_stage2["damping"] == 200
     assert cfg.fdr_component_epochs_stage1["frequency"] == 500

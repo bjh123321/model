@@ -85,7 +85,7 @@ class Config:
     fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     fdr_dropout_prob: float = 0.0
     fdr_weight_decay: float = 5e-5
-    fdr_early_stop_patience: int = 500
+    fdr_early_stop_patience: int = 50
     fdr_component_low_hidden: Dict[str, List[int]] = field(default_factory=lambda: {
         "frequency": [64, 128, 64],
         "damping": [64, 128, 64],
@@ -105,10 +105,10 @@ class Config:
         "residue_phase": 5e-5,
     })
     fdr_component_early_stop_patience: Dict[str, int] = field(default_factory=lambda: {
-        "frequency": 500,
+        "frequency": 50,
         "damping": 50,
-        "residue_magnitude": 500,
-        "residue_phase": 500,
+        "residue_magnitude": 50,
+        "residue_phase": 50,
     })
     fdr_component_epochs_stage1: Dict[str, int] = field(default_factory=lambda: {
         "frequency": 500,

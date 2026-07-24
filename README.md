@@ -120,8 +120,8 @@ The same training options are accepted by `train_incremental`. Multifidelity
 training remains one global network with fixed component-level real/simulation
 loss weights; it does not divide the model or change its loss weights by Mach.
 Without an explicit epoch override, the damping component uses at most 200 epochs
-in each multifidelity stage and an early-stop patience of 50 in each stage. Other
-component epoch and patience defaults remain unchanged. All four component networks
+in each multifidelity stage. All four FDR components use an early-stop patience
+of 50 in both stages. Other component epoch defaults remain unchanged. All four component networks
 select checkpoints and apply early stopping from training loss by default; pass
 `--checkpoint_selection validation` or a per-component override to use validation loss.
 
