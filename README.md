@@ -22,7 +22,9 @@ python -m surrogate_model.test.Predict_user
 
 - Input txt rows keep the base format: `H, M, exc_id, ch_id, Re, Im, rho, theta ...`
 - Every FDR component model keeps the forward signature `model(Hn, Mn, exc_t, ch_t)`.
-- `Normalizer_Input.pth` is for two input features: `[H, M]`.
+- `Normalizer_Input_Sim.pth` and `Normalizer_Input_Real.pth` contain the two
+  input features `[H, M]`. They store the same shared simulation-coordinate
+  transform; simulation and real output transforms are fitted separately.
 - Prediction output directories include `PR_XGD`, `RESULT_PR_XGD`, `HF_PR_XGD`, `HG_PR_XGD`, `HA_PR_XGD`, `VF_PR_XGD`, `VG_PR_XGD`, and `VA_PR_XGD`.
 - Stage 2 trains `low + lin + adaptation` together.
 - Validation is enabled by default. `val_split_strategy="height_max_mach"` keeps the existing validation rule; `val_split_strategy="height_mach_kfold"` splits complete `(H, M)` operating-point groups.
@@ -45,8 +47,10 @@ organized as:
   FXD_FDC/LVT1/
     frequency/
       model.pth
-      Normalizer_Input.pth
-      Normalizer_Output.pth
+      Normalizer_Input_Sim.pth
+      Normalizer_Output_Sim.pth
+      Normalizer_Input_Real.pth
+      Normalizer_Output_Real.pth
       training_config.json
       train_log.csv
     damping/

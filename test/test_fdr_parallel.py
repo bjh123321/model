@@ -1,4 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor
+import json
 from multiprocessing import get_context
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -108,6 +109,24 @@ def main():
             results = list(executor.map(_train_component_worker, tasks))
         assert all(result["ok"] for result in results), results
         for component in ("frequency", "damping"):
+            component_dir = version_dir / component
+            assert {
+                path.name for path in component_dir.glob("Normalizer_*.pth")
+            } == {
+                "Normalizer_Input_Sim.pth",
+                "Normalizer_Output_Sim.pth",
+                "Normalizer_Input_Real.pth",
+                "Normalizer_Output_Real.pth",
+            }
+            with (component_dir / "training_config.json").open(
+                encoding="utf-8"
+            ) as handle:
+                saved_config = json.load(handle)
+            normalizers = saved_config["normalizers"]
+            assert normalizers["sim_input_file"] == "Normalizer_Input_Sim.pth"
+            assert normalizers["sim_output_file"] == "Normalizer_Output_Sim.pth"
+            assert normalizers["real_input_file"] == "Normalizer_Input_Real.pth"
+            assert normalizers["real_output_file"] == "Normalizer_Output_Real.pth"
             ready, reason = _resume_component_ready(
                 version_dir,
                 1,

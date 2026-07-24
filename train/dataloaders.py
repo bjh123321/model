@@ -759,24 +759,28 @@ def build_dataloaders(sim_parsed: List[ParsedRow], real_parsed: List[ParsedRow],
     if not real_train:
         raise RuntimeError("No valid real training rows remain after filtering")
 
-    # Both fidelities use the simulation input coordinates.  Output statistics
-    # remain separate because simulation and real targets can have different
-    # offsets and scales.
+    # Both fidelities use the simulation input coordinates.  Save that shared
+    # transform under both fidelity-specific names so the artifact inventory is
+    # explicit without changing the coordinates seen by the model.  Output
+    # statistics remain separate because simulation and real targets can have
+    # different offsets and scales.
     in_norm_sim = compute_input_normalizer_sim(sim_train)
     out_norm_sim = _output_normalizer(sim_train, cfg)
     if is_main_process():
         in_norm_sim.save(out_dir / "Normalizer_Input_Sim.pth")
         out_norm_sim.save(out_dir / "Normalizer_Output_Sim.pth")
 
+    in_norm_real = in_norm_sim
     out_norm_real = _output_normalizer(real_train, cfg)
     _attach_and_write_slot_support(out_norm_real, real_train, real_val, cfg, out_dir)
     if is_main_process():
-        out_norm_real.save(out_dir / f"Normalizer_Output_Real_Fold{fold_idx}.pth")
+        in_norm_real.save(out_dir / "Normalizer_Input_Real.pth")
+        out_norm_real.save(out_dir / "Normalizer_Output_Real.pth")
 
     sim_ds = ModalDataset(sim_train, cfg.K_max, in_norm_sim, out_norm_sim)
     sim_va = ModalDataset(sim_val, cfg.K_max, in_norm_sim, out_norm_sim)
-    real_tr = ModalDataset(real_train, cfg.K_max, in_norm_sim, out_norm_real)
-    real_va = ModalDataset(real_val, cfg.K_max, in_norm_sim, out_norm_real)
+    real_tr = ModalDataset(real_train, cfg.K_max, in_norm_real, out_norm_real)
+    real_va = ModalDataset(real_val, cfg.K_max, in_norm_real, out_norm_real)
 
     if _ddp_ready():
         sim_sampler = DistributedSampler(sim_ds, shuffle=True, drop_last=True) if len(sim_ds) > 0 else None

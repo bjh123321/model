@@ -414,8 +414,12 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
     model_save_path.parent.mkdir(parents=True, exist_ok=True)
     normalizer_dir = Path(getattr(args, "normalizer_dir", "") or out_dir)
     normalizer_dir.mkdir(parents=True, exist_ok=True)
-    in_norm.save(normalizer_dir / "Normalizer_Input.pth")
-    out_norm.save(normalizer_dir / "Normalizer_Output.pth")
+    fidelity_normalizer_names = bool(
+        getattr(args, "fidelity_normalizer_names", False)
+    )
+    if not fidelity_normalizer_names:
+        in_norm.save(normalizer_dir / "Normalizer_Input.pth")
+        out_norm.save(normalizer_dir / "Normalizer_Output.pth")
     payload = {
         "stage": "fixed_single_fidelity",
         "epoch": int(epoch),
@@ -470,7 +474,7 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
     deploy_normalizer_dir = getattr(args, "deploy_normalizer_dir", "")
     if deploy_normalizer_dir:
         deploy_normalizer_dir = Path(deploy_normalizer_dir)
-        if deploy_normalizer_dir != normalizer_dir:
+        if deploy_normalizer_dir != normalizer_dir and not fidelity_normalizer_names:
             deploy_normalizer_dir.mkdir(parents=True, exist_ok=True)
             in_norm.save(deploy_normalizer_dir / "Normalizer_Input.pth")
             out_norm.save(deploy_normalizer_dir / "Normalizer_Output.pth")

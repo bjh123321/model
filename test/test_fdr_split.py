@@ -620,6 +620,15 @@ def test_inventory_entry_lists_all_four_component_artifacts():
     )
     assert tuple(entry["components"]) == tuple(FDR_COMPONENT_TARGETS)
     assert entry["components"]["frequency"]["checkpoint"] == "FXD_DC/LVT1/frequency/model.pth"
+    assert entry["components"]["frequency"]["normalizer_input_sim"] == (
+        "FXD_DC/LVT1/frequency/Normalizer_Input_Sim.pth"
+    )
+    assert entry["components"]["frequency"]["normalizer_input_real"] == (
+        "FXD_DC/LVT1/frequency/Normalizer_Input_Real.pth"
+    )
+    assert entry["components"]["frequency"]["normalizer_output_real"] == (
+        "FXD_DC/LVT1/frequency/Normalizer_Output_Real.pth"
+    )
     assert entry["components"]["residue_magnitude"]["target_names"] == ["magnitude"]
     assert entry["components"]["residue_phase"]["target_names"] == [
         "sin_theta",

@@ -185,11 +185,23 @@ def build_checkpoint_metadata(*, model_version: str, dataset_metadata: Mapping) 
         ),
         "data_selection": dict(dataset_metadata.get("data_selection", {}) or {}),
         "training_config": "training_config.json",
-        "normalizer_input": "Normalizer_Input.pth",
-        "normalizer_output": "Normalizer_Output.pth",
+        "normalizer_input": (
+            "Normalizer_Input_Sim.pth"
+            if fidelity_mode == "sim_only"
+            else "Normalizer_Input_Real.pth"
+        ),
+        "normalizer_output": (
+            "Normalizer_Output_Sim.pth"
+            if fidelity_mode == "sim_only"
+            else "Normalizer_Output_Real.pth"
+        ),
+        "normalizer_input_sim": "Normalizer_Input_Sim.pth",
         "normalizer_output_sim": "Normalizer_Output_Sim.pth",
+        "normalizer_input_real": (
+            None if fidelity_mode == "sim_only" else "Normalizer_Input_Real.pth"
+        ),
         "normalizer_output_real": (
-            None if fidelity_mode == "sim_only" else "Normalizer_Output_Real_Fold0.pth"
+            None if fidelity_mode == "sim_only" else "Normalizer_Output_Real.pth"
         ),
         "corrected_group_keys": dataset_metadata.get("corrected_group_keys", []),
         "replaced_group_keys": dataset_metadata.get("replaced_group_keys", []),
@@ -216,10 +228,24 @@ def write_training_config(
     manifest = dataset_metadata["manifest"]
     training_mode = str(dataset_metadata.get("training_mode", "base_full_training"))
     fidelity_mode = str(dataset_metadata.get("fidelity_mode", "multifidelity"))
-    input_path = version_dir / "Normalizer_Input.pth"
-    output_path = version_dir / "Normalizer_Output.pth"
+    input_file = (
+        "Normalizer_Input_Sim.pth"
+        if fidelity_mode == "sim_only"
+        else "Normalizer_Input_Real.pth"
+    )
+    output_file = (
+        "Normalizer_Output_Sim.pth"
+        if fidelity_mode == "sim_only"
+        else "Normalizer_Output_Real.pth"
+    )
+    input_path = version_dir / input_file
+    output_path = version_dir / output_file
+    sim_input_path = version_dir / "Normalizer_Input_Sim.pth"
+    sim_output_path = version_dir / "Normalizer_Output_Sim.pth"
+    real_input_path = version_dir / "Normalizer_Input_Real.pth"
+    real_output_path = version_dir / "Normalizer_Output_Real.pth"
     training_config = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_version": model_version,
         "parent_model_version": dataset_metadata.get("parent_model_version"),
         "training_mode": training_mode,
@@ -255,15 +281,28 @@ def write_training_config(
         },
         "slot_support": dict(getattr(cfg, "_slot_support_metadata", {}) or {}),
         "normalizers": {
-            "input_file": "Normalizer_Input.pth",
-            "output_file": "Normalizer_Output.pth",
+            "input_file": input_file,
+            "output_file": output_file,
             "fit_on": "training_split_only",
             "input_sha256": sha256_file(input_path),
             "output_sha256": sha256_file(output_path),
+            "sim_input_file": "Normalizer_Input_Sim.pth",
             "sim_output_file": "Normalizer_Output_Sim.pth",
-            "real_output_file": (
-                None if fidelity_mode == "sim_only" else "Normalizer_Output_Real_Fold0.pth"
+            "sim_input_sha256": sha256_file(sim_input_path),
+            "sim_output_sha256": sha256_file(sim_output_path),
+            "real_input_file": (
+                None if fidelity_mode == "sim_only" else "Normalizer_Input_Real.pth"
             ),
+            "real_output_file": (
+                None if fidelity_mode == "sim_only" else "Normalizer_Output_Real.pth"
+            ),
+            "real_input_sha256": (
+                None if fidelity_mode == "sim_only" else sha256_file(real_input_path)
+            ),
+            "real_output_sha256": (
+                None if fidelity_mode == "sim_only" else sha256_file(real_output_path)
+            ),
+            "input_coordinate_policy": "shared_simulation_coordinates",
         },
         "training": _training_values(cfg, args),
         "selection": dict(getattr(cfg, "_last_training_result", {})),
@@ -481,6 +520,7 @@ def run_component_training(
     run_args.kfold = int(getattr(run_args, "kfold", 0) or 0)
     run_args.fold_index = 0
     run_args.num_folds = 1
+    run_args.fidelity_normalizer_names = True
     run_args.checkpoint_metadata = build_checkpoint_metadata(
         model_version=model_version, dataset_metadata=component_metadata
     )

@@ -8,7 +8,7 @@ from typing import Iterable, Mapping
 from surrogate_model.utils.model_artifacts import atomic_write_json, load_json
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 MODEL_INVENTORY_NAME = "models_manifest.json"
 TRAINING_FAILURES_NAME = "training_failures.json"
 FDR_COMPONENT_TARGETS = {
@@ -83,16 +83,32 @@ def model_entry(
     components = {}
     for component, target_names in FDR_COMPONENT_TARGETS.items():
         component_dir = f"{relative_dir}/{component}"
+        selected_input = (
+            f"{component_dir}/Normalizer_Input_Sim.pth"
+            if fidelity_mode == "sim_only"
+            else f"{component_dir}/Normalizer_Input_Real.pth"
+        )
+        selected_output = (
+            f"{component_dir}/Normalizer_Output_Sim.pth"
+            if fidelity_mode == "sim_only"
+            else f"{component_dir}/Normalizer_Output_Real.pth"
+        )
         components[component] = {
             "target_names": list(target_names),
             "checkpoint": f"{component_dir}/model.pth",
-            "normalizer_input": f"{component_dir}/Normalizer_Input.pth",
-            "normalizer_output": f"{component_dir}/Normalizer_Output.pth",
+            "normalizer_input": selected_input,
+            "normalizer_output": selected_output,
+            "normalizer_input_sim": f"{component_dir}/Normalizer_Input_Sim.pth",
             "normalizer_output_sim": f"{component_dir}/Normalizer_Output_Sim.pth",
+            "normalizer_input_real": (
+                None
+                if fidelity_mode == "sim_only"
+                else f"{component_dir}/Normalizer_Input_Real.pth"
+            ),
             "normalizer_output_real": (
                 None
                 if fidelity_mode == "sim_only"
-                else f"{component_dir}/Normalizer_Output_Real_Fold0.pth"
+                else f"{component_dir}/Normalizer_Output_Real.pth"
             ),
             "fidelity_mode": fidelity_mode,
             "prediction_output": prediction_output,

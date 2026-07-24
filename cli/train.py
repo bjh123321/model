@@ -425,14 +425,16 @@ def _resume_component_ready(
 ) -> tuple[bool, str]:
     try:
         required = [
-            "model.pth", "Normalizer_Input.pth", "Normalizer_Output.pth",
-            "Normalizer_Input_Sim.pth", "Normalizer_Output_Sim.pth",
-            "training_config.json", "train_log.csv", "slot_support.json",
+            "model.pth", "Normalizer_Input_Sim.pth",
+            "Normalizer_Output_Sim.pth", "training_config.json",
+            "train_log.csv", "slot_support.json",
         ]
         if required_profile_version is not None and int(required_profile_version) >= 6:
             required.append("sim_slot_outlier_filter.json")
         if expected_fidelity_mode == "multifidelity":
-            required.append("Normalizer_Output_Real_Fold0.pth")
+            required.extend(
+                ["Normalizer_Input_Real.pth", "Normalizer_Output_Real.pth"]
+            )
         target_names = FDR_COMPONENT_TARGETS[component]
         component_dir = output_dir / component
         missing = [name for name in required if not (component_dir / name).is_file()]
@@ -449,23 +451,34 @@ def _resume_component_ready(
         checkpoint_fidelity_mode = str(checkpoint.get("fidelity_mode", ""))
         if (
             (expected_fidelity_mode == "multifidelity" or checkpoint_fidelity_mode == "multifidelity")
-            and not (component_dir / "Normalizer_Output_Real_Fold0.pth").is_file()
+            and not (component_dir / "Normalizer_Output_Real.pth").is_file()
         ):
-            return False, "missing Normalizer_Output_Real_Fold0.pth"
+            return False, "missing Normalizer_Output_Real.pth"
         if tuple(checkpoint.get("target_names", ())) != tuple(target_names):
             return False, "checkpoint target_names mismatch"
         for key, expected in (("excitation_id", excitation_id), ("channel_id", channel_id)):
             if key in checkpoint and int(checkpoint[key]) != int(expected):
                 return False, f"checkpoint {key}={checkpoint[key]} does not match {expected}"
-        for filename in (
-            "Normalizer_Input.pth", "Normalizer_Output.pth",
-            "Normalizer_Input_Sim.pth", "Normalizer_Output_Sim.pth",
-        ):
+        normalizer_filenames = [
+            "Normalizer_Input_Sim.pth", "Normalizer_Output_Sim.pth"
+        ]
+        if expected_fidelity_mode == "multifidelity" or checkpoint_fidelity_mode == "multifidelity":
+            normalizer_filenames.extend(
+                ["Normalizer_Input_Real.pth", "Normalizer_Output_Real.pth"]
+            )
+        for filename in normalizer_filenames:
             normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
             if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
                 return False, f"invalid {filename}"
         output_normalizer = torch.load(
-            component_dir / "Normalizer_Output.pth", map_location="cpu", weights_only=True
+            component_dir
+            / (
+                "Normalizer_Output_Real.pth"
+                if checkpoint_fidelity_mode == "multifidelity"
+                else "Normalizer_Output_Sim.pth"
+            ),
+            map_location="cpu",
+            weights_only=True,
         )
         transforms = dict(output_normalizer.get("target_transforms", {}) or {})
         if any(str(transforms.get(name, {}).get("kind", "identity")) == "identity" for name in target_names if name in {"freq", "magnitude"}):

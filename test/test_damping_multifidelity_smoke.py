@@ -79,6 +79,7 @@ def test_damping_multifidelity_training_smoke():
             num_folds=1,
             deploy_model_save_path="",
             deploy_normalizer_dir="",
+            fidelity_normalizer_names=True,
         )
         best, train_history, _validation_history = train_multifidelity_component(
             0, cfg, sim_parsed, real_parsed, args
@@ -86,6 +87,28 @@ def test_damping_multifidelity_training_smoke():
         assert math.isfinite(best)
         assert len(train_history) == 2
         checkpoint = torch.load(out_dir / "model.pth", map_location="cpu", weights_only=True)
+        assert {
+            path.name for path in out_dir.glob("Normalizer_*.pth")
+        } == {
+            "Normalizer_Input_Sim.pth",
+            "Normalizer_Output_Sim.pth",
+            "Normalizer_Input_Real.pth",
+            "Normalizer_Output_Real.pth",
+        }
+        input_sim = torch.load(
+            out_dir / "Normalizer_Input_Sim.pth",
+            map_location="cpu",
+            weights_only=True,
+        )
+        input_real = torch.load(
+            out_dir / "Normalizer_Input_Real.pth",
+            map_location="cpu",
+            weights_only=True,
+        )
+        assert input_sim["target_names"] == ["H", "M"]
+        assert len(input_sim["mean"]) == 2
+        torch.testing.assert_close(input_sim["mean"], input_real["mean"])
+        torch.testing.assert_close(input_sim["std"], input_real["std"])
         assert (
             checkpoint["slot_support"]["height_mach_envelope_scope"]
             == "training_rows_only"
