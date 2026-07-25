@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,7 +19,7 @@ class MLP(nn.Module):
         lora_rank: int = 4,
         lora_alpha: float = 1.0,
         lora_dropout: float = 0.0,
-        lora_target_hidden_indices: Iterable[int] | None = None,
+        lora_target_hidden_indices: Optional[Iterable[int]] = None,
     ):
         super().__init__()
         dims = list(dims)
@@ -296,10 +296,10 @@ class TargetMultifidelityMFDNN(nn.Module):
         self.lin = TargetLinearHighFidelityHead(len(self.target_names))
         self.adaptation = TargetAdaptationHead(cfg)
 
-    def _as_tensor(self, values: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _as_tensor(self, values: Dict[str, torch.Tensor]) -> torch.Tensor:
         return torch.stack([values[name] for name in self.target_names], dim=-1)
 
-    def _as_dict(self, values: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _as_dict(self, values: torch.Tensor) -> Dict[str, torch.Tensor]:
         result = {
             name: values[..., index]
             for index, name in enumerate(self.target_names)
@@ -345,13 +345,13 @@ def get_lora_parameters(model: nn.Module):
     ]
 
 
-def count_parameters(model: nn.Module) -> tuple[int, int]:
+def count_parameters(model: nn.Module) -> Tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return trainable, total
 
 
-def count_parameter_groups(model: nn.Module) -> dict[str, int]:
+def count_parameter_groups(model: nn.Module) -> Dict[str, int]:
     low = model.low
     groups = {
         "main_mlp_parameters": sum(p.numel() for p in low.mlp.parameters()),
@@ -376,7 +376,7 @@ def _copy_tensor(dst: torch.Tensor, src: torch.Tensor, key: str):
 
 def load_base_weights_into_lora_model(model: nn.Module, state_dict: dict):
     model_state = model.state_dict()
-    consumed: set[str] = set()
+    consumed: Set[str] = set()
     missing = []
 
     with torch.no_grad():

@@ -10,7 +10,7 @@ import tempfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -21,19 +21,19 @@ SCHEMA_VERSION = 1
 EXCITATION_NAMES = {value: key for key, value in SPLIT_EXCITATION_IDS.items()}
 
 
-def group_key_from_row(row: Sequence[float]) -> tuple[int, int, int]:
+def group_key_from_row(row: Sequence[float]) -> Tuple[int, int, int]:
     return int(round(float(row[0]) * 100)), int(round(float(row[1]) * 100)), int(round(float(row[2])))
 
 
-def group_key_from_parsed(row) -> tuple[int, int, int]:
+def group_key_from_parsed(row) -> Tuple[int, int, int]:
     return int(round(float(row.H) * 100)), int(round(float(row.M) * 100)), int(row.exc_id)
 
 
 def group_rows(
     rows: Iterable[Sequence[float]], *, source: str, allow_duplicate_keys: bool = False
-) -> dict[tuple[int, int, int], list[list[float]]]:
-    grouped: dict[tuple[int, int, int], list[list[float]]] = {}
-    seen: set[tuple[int, int, int, int]] = set()
+) -> Dict[Tuple[int, int, int], List[List[float]]]:
+    grouped: Dict[Tuple[int, int, int], List[List[float]]] = {}
+    seen: Set[Tuple[int, int, int, int]] = set()
     for row in rows:
         if len(row) < 4:
             raise ValueError(f"{source}: data row has fewer than four columns")
@@ -51,20 +51,20 @@ def group_rows(
     return grouped
 
 
-def load_dataset_rows(path: Path) -> list[list[float]]:
+def load_dataset_rows(path: Path) -> List[List[float]]:
     return [list(row) for row in read_real_dataset(Path(path))]
 
 
 def merge_dataset_rows(
     parent_rows: Iterable[Sequence[float]], correction_rows: Iterable[Sequence[float]]
-) -> tuple[list[list[float]], dict]:
+) -> Tuple[List[List[float]], dict]:
     parent = group_rows(parent_rows, source="parent dataset")
     correction = group_rows(correction_rows, source="correction dataset")
-    replaced: list[tuple[int, int, int]] = []
-    added: list[tuple[int, int, int]] = []
-    changes: list[dict] = []
+    replaced: List[Tuple[int, int, int]] = []
+    added: List[Tuple[int, int, int]] = []
+    changes: List[dict] = []
     merged = {key: [list(row) for row in rows] for key, rows in parent.items()}
-    expected_channels_by_excitation: dict[int, set[int]] = {}
+    expected_channels_by_excitation: Dict[int, Set[int]] = {}
     for excitation_id in {key[2] for key in parent}:
         channel_sets = [
             frozenset(int(round(row[3])) for row in values)
@@ -164,19 +164,21 @@ def load_json(path: Path) -> dict:
         return json.load(handle)
 
 
-def _snapshot_filename(key: tuple[int, int, int]) -> str:
+def _snapshot_filename(key: Tuple[int, int, int]) -> str:
     h_code, m_code, excitation_id = key
     name = EXCITATION_NAMES.get(excitation_id, f"EXC_{excitation_id}")
     return f"SF_XGD_{name}_H{h_code:04d}_M{m_code:03d}.txt"
 
 
-def build_dataset_snapshot(rows: Iterable[Sequence[float]], snapshot_dir: Path) -> dict[tuple[int, int, int], Path]:
+def build_dataset_snapshot(
+    rows: Iterable[Sequence[float]], snapshot_dir: Path
+) -> Dict[Tuple[int, int, int], Path]:
     snapshot_dir = Path(snapshot_dir)
     grouped = group_rows(rows, source="snapshot source")
     snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{snapshot_dir.name}.", dir=str(snapshot_dir.parent)))
     try:
-        result: dict[tuple[int, int, int], Path] = {}
+        result: Dict[Tuple[int, int, int], Path] = {}
         for key, values in sorted(grouped.items()):
             destination = temp_dir / _snapshot_filename(key)
             destination.write_bytes(_stable_rows_bytes(values))
@@ -192,13 +194,13 @@ def build_dataset_snapshot(rows: Iterable[Sequence[float]], snapshot_dir: Path) 
 
 def build_input_dataset_snapshot(
     input_path: Path, snapshot_dir: Path, *, allow_duplicate_keys: bool = False
-) -> dict[tuple[int, int, int], list[str]]:
+) -> Dict[Tuple[int, int, int], List[str]]:
     """Copy the exact files used by base training and index groups to relative snapshot files."""
     input_path = Path(input_path)
     snapshot_dir = Path(snapshot_dir)
     snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{snapshot_dir.name}.", dir=str(snapshot_dir.parent)))
-    relative_files: dict[tuple[int, int, int], list[str]] = {}
+    relative_files: Dict[Tuple[int, int, int], List[str]] = {}
     try:
         if input_path.is_file():
             sources = [(input_path, "real_dataset.txt")]
@@ -255,12 +257,14 @@ def build_dataset_manifest(
     train_group_keys: Iterable[Sequence[int]],
     validation_group_keys: Iterable[Sequence[int]],
     correction_group_keys: Iterable[Sequence[int]] = (),
-    parent_manifest: Mapping | None = None,
-    parent_model_version: str | None = None,
-    source_types: Mapping[tuple[int, int, int], str] | None = None,
-    changes: Mapping | None = None,
+    parent_manifest: Optional[Mapping] = None,
+    parent_model_version: Optional[str] = None,
+    source_types: Optional[Mapping[Tuple[int, int, int], str]] = None,
+    changes: Optional[Mapping] = None,
     split_strategy: str = "",
-    relative_files_by_group: Mapping[tuple[int, int, int], Sequence[str]] | None = None,
+    relative_files_by_group: Optional[
+        Mapping[Tuple[int, int, int], Sequence[str]]
+    ] = None,
     allow_duplicate_keys: bool = False,
 ) -> dict:
     grouped = group_rows(
@@ -338,7 +342,9 @@ def read_code_metadata(repo_dir: Path) -> dict:
     }
 
 
-def resolve_parent_dataset(base_version_dir: Path, history_dataset: Path | None) -> tuple[Path, dict | None]:
+def resolve_parent_dataset(
+    base_version_dir: Path, history_dataset: Optional[Path]
+) -> Tuple[Path, Optional[dict]]:
     snapshot = Path(base_version_dir) / "dataset_snapshot"
     manifest_path = Path(base_version_dir) / "dataset_manifest.json"
     if snapshot.is_dir() and manifest_path.is_file():

@@ -7,6 +7,7 @@ import time
 from copy import deepcopy
 from itertools import cycle
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -42,7 +43,7 @@ EXCITATION_LOSS_SCOPES = (
 )
 
 
-def _format_duration(seconds: float | None) -> str:
+def _format_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "--:--"
     total_seconds = max(0, int(round(float(seconds))))
@@ -53,7 +54,9 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _elapsed_and_eta(started_at: float, completed: int, total: int) -> tuple[str, str]:
+def _elapsed_and_eta(
+    started_at: float, completed: int, total: int
+) -> Tuple[str, str]:
     elapsed = time.perf_counter() - started_at
     eta = None
     if completed > 0:
@@ -496,7 +499,7 @@ class _TargetOutputView(torch.nn.Module):
         return high
 
 
-def _write_multifidelity_log(path: Path, rows: list[dict]):
+def _write_multifidelity_log(path: Path, rows: List[dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
     preferred = [
         "stage", "epoch", "loss_sim", "loss_real", "loss_total",
@@ -597,9 +600,9 @@ def train_multifidelity_component(
         flush=True,
     )
 
-    logs: list[dict] = []
-    train_hist: list[float] = []
-    val_hist: list[float] = []
+    logs: List[dict] = []
+    train_hist: List[float] = []
+    val_hist: List[float] = []
     min_delta = float(getattr(cfg, "early_stop_min_delta", 0.0))
     checkpoint_selection = str(
         getattr(cfg, "checkpoint_selection", "training")

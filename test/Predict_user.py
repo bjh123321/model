@@ -399,9 +399,11 @@ def _run_infer_single_model_batched(
     ch_all: np.ndarray,
     batch_size: int = 20000,
     predict_output: str = "low",
-    mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
-    prediction_damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
-    prediction_damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
+    mode_freq_ranges: Optional[
+        Dict[str, List[Optional[Tuple[float, float]]]]
+    ] = None,
+    prediction_damping_min: Optional[float] = DEFAULT_PREDICTION_DAMPING_MIN,
+    prediction_damping_max: Optional[float] = DEFAULT_PREDICTION_DAMPING_MAX,
 ):
     """
     输入：
@@ -672,7 +674,7 @@ class ExcitationChannelModelRegistry:
         return int(bundle["frequency"]["model"].cfg.K_max)
 
 
-def _parse_optional_float(raw: str) -> float | None:
+def _parse_optional_float(raw: str) -> Optional[float]:
     text = str(raw).strip().lower()
     if text in {"none", "null", "off"}:
         return None
@@ -690,8 +692,8 @@ def _parse_optional_float(raw: str) -> float | None:
 
 
 def _validate_prediction_damping_bounds(
-    damping_min: float | None, damping_max: float | None
-) -> tuple[float | None, float | None]:
+    damping_min: Optional[float], damping_max: Optional[float]
+) -> Tuple[Optional[float], Optional[float]]:
     minimum = None if damping_min is None else float(damping_min)
     maximum = None if damping_max is None else float(damping_max)
     if minimum is not None and not np.isfinite(minimum):
@@ -708,8 +710,8 @@ def _validate_prediction_damping_bounds(
 
 def _prediction_damping_slot_mask(
     damping: np.ndarray,
-    damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
-    damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
+    damping_min: Optional[float] = DEFAULT_PREDICTION_DAMPING_MIN,
+    damping_max: Optional[float] = DEFAULT_PREDICTION_DAMPING_MAX,
 ) -> np.ndarray:
     """Return the whole-slot mask using damping after display scaling by 200."""
     minimum, maximum = _validate_prediction_damping_bounds(damping_min, damping_max)
@@ -847,15 +849,17 @@ def _run_infer_fdr_bundle_batched(
     exc_all: np.ndarray,
     ch_all: np.ndarray,
     batch_size: int = 20000,
-    mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+    mode_freq_ranges: Optional[
+        Dict[str, List[Optional[Tuple[float, float]]]]
+    ] = None,
     extrapolation_policy: str = "allow",
     predict_output: str = "high",
     damping_tanh_min_mach_scale: float = DEFAULT_DAMPING_TANH_MIN_MACH_SCALE,
     damping_extrapolation_transition_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_TRANSITION_MACH,
     damping_extrapolation_fit_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_FIT_MACH,
     damping_prediction_floor: float = DEFAULT_DAMPING_PREDICTION_FLOOR,
-    prediction_damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
-    prediction_damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
+    prediction_damping_min: Optional[float] = DEFAULT_PREDICTION_DAMPING_MIN,
+    prediction_damping_max: Optional[float] = DEFAULT_PREDICTION_DAMPING_MAX,
 ):
     extrapolation_policy = str(extrapolation_policy).lower()
     if extrapolation_policy not in {"smooth_linear", "tanh", "clip", "mask", "allow"}:
@@ -1255,14 +1259,16 @@ def run_infer_batched(
     ch_all: np.ndarray,
     batch_size: int = 20000,
     predict_output: str = "low",
-    mode_freq_ranges: Dict[str, List[Optional[Tuple[float, float]]]] | None = None,
+    mode_freq_ranges: Optional[
+        Dict[str, List[Optional[Tuple[float, float]]]]
+    ] = None,
     extrapolation_policy: str = "allow",
     damping_tanh_min_mach_scale: float = DEFAULT_DAMPING_TANH_MIN_MACH_SCALE,
     damping_extrapolation_transition_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_TRANSITION_MACH,
     damping_extrapolation_fit_mach: float = DEFAULT_DAMPING_EXTRAPOLATION_FIT_MACH,
     damping_prediction_floor: float = DEFAULT_DAMPING_PREDICTION_FLOOR,
-    prediction_damping_min: float | None = DEFAULT_PREDICTION_DAMPING_MIN,
-    prediction_damping_max: float | None = DEFAULT_PREDICTION_DAMPING_MAX,
+    prediction_damping_min: Optional[float] = DEFAULT_PREDICTION_DAMPING_MIN,
+    prediction_damping_max: Optional[float] = DEFAULT_PREDICTION_DAMPING_MAX,
 ):
     prediction_damping_min, prediction_damping_max = (
         _validate_prediction_damping_bounds(
@@ -1525,8 +1531,8 @@ def _build_yhat_and_slot_strings(
     Ts: float,
     exist_thresh: float = 0.5,
     use_freq_filter: bool = True,
-    frequency_valid_mask_row: np.ndarray | None = None,
-    damping_valid_mask_row: np.ndarray | None = None,
+    frequency_valid_mask_row: Optional[np.ndarray] = None,
+    damping_valid_mask_row: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, List[str], List[str]]:
     """对单个扫描点/单个通道：
     1) 按存在性与频段范围筛选槽位；

@@ -12,6 +12,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -41,7 +42,7 @@ from surrogate_model.utils.excitation_channel_models import (
 )
 
 
-def _format_duration(seconds: float | None) -> str:
+def _format_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return "--:--"
     total_seconds = max(0, int(round(float(seconds))))
@@ -52,7 +53,7 @@ def _format_duration(seconds: float | None) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _parse_int_list(raw: str) -> list[int]:
+def _parse_int_list(raw: str) -> List[int]:
     values = []
     for part in str(raw).replace(";", ",").split(","):
         part = part.strip()
@@ -63,7 +64,9 @@ def _parse_int_list(raw: str) -> list[int]:
     return values
 
 
-def _resolve_id_selection(raw_values, id_to_name: dict[int, str], label: str):
+def _resolve_id_selection(
+    raw_values, id_to_name: Dict[int, str], label: str
+):
     """Resolve repeatable comma/semicolon-separated names or numeric IDs."""
     if not raw_values:
         return None
@@ -94,7 +97,7 @@ def _resolve_id_selection(raw_values, id_to_name: dict[int, str], label: str):
     return selected
 
 
-def _resolve_component_selection(raw_values) -> set[str] | None:
+def _resolve_component_selection(raw_values) -> Optional[Set[str]]:
     """Resolve repeatable comma/semicolon-separated FDR component names."""
     if not raw_values:
         return None
@@ -123,8 +126,8 @@ def _resolve_component_value_mapping(
     label: str,
     value_type,
     choices=None,
-    minimum: float | None = None,
-) -> dict[str, object]:
+    minimum: Optional[float] = None,
+) -> Dict[str, object]:
     """Resolve repeatable ``component=value`` assignments."""
     if not raw_values:
         return {}
@@ -223,7 +226,7 @@ def _filter_combinations(combinations, selected_excitations=None, selected_chann
     ]
 
 
-def _resolve_height_selection(raw_values) -> list[float] | None:
+def _resolve_height_selection(raw_values) -> Optional[List[float]]:
     """Resolve repeatable comma/semicolon-separated finite height values."""
     if not raw_values:
         return None
@@ -306,9 +309,9 @@ def _configure_validation_for_height_selection(cfg, selected_heights, real_parse
 
 def _height_selection_matches(
     training_config: dict,
-    expected_heights: list[float] | None,
+    expected_heights: Optional[List[float]],
     expected_tolerance: float,
-) -> tuple[bool, str]:
+) -> Tuple[bool, str]:
     dataset_config = dict(training_config.get("dataset", {}) or {})
     actual_selection = dict(dataset_config.get("data_selection", {}) or {})
     actual_heights = actual_selection.get("heights")
@@ -348,7 +351,7 @@ def _ddp_backend() -> str:
     return "gloo"
 
 
-def _ddp_setup() -> tuple[bool, int, int]:
+def _ddp_setup() -> Tuple[bool, int, int]:
     if not _ddp_is_requested():
         return False, 0, 1
     dist.init_process_group(backend=_ddp_backend(), init_method="env://")
@@ -359,7 +362,7 @@ def _ddp_setup() -> tuple[bool, int, int]:
     return True, rank, world_size
 
 
-def _path_from_ini(paths_ini_path: Path, section: str) -> Path | None:
+def _path_from_ini(paths_ini_path: Path, section: str) -> Optional[Path]:
     cp = configparser.ConfigParser()
     if not paths_ini_path.exists():
         return None
@@ -417,12 +420,12 @@ def _resume_component_ready(
     excitation_id: int,
     channel_id: int,
     component: str,
-    required_profile_version: int | None = None,
-    expected_fidelity_mode: str | None = None,
-    expected_heights: list[float] | None = None,
+    required_profile_version: Optional[int] = None,
+    expected_fidelity_mode: Optional[str] = None,
+    expected_heights: Optional[List[float]] = None,
     expected_height_tolerance: float = 1e-6,
     check_height_selection: bool = False,
-) -> tuple[bool, str]:
+) -> Tuple[bool, str]:
     try:
         required = [
             "model.pth", "Normalizer_Input_Sim.pth",
@@ -536,7 +539,9 @@ def _required_component_profile_version(cfg, component: str) -> int:
     )
 
 
-def _resume_model_ready(output_dir: Path, excitation_id: int, channel_id: int) -> tuple[bool, str]:
+def _resume_model_ready(
+    output_dir: Path, excitation_id: int, channel_id: int
+) -> Tuple[bool, str]:
     for component in FDR_COMPONENT_TARGETS:
         ready, reason = _resume_component_ready(
             output_dir, excitation_id, channel_id, component

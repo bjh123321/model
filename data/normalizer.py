@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -16,7 +16,7 @@ RESIDUE_POLAR = "polar"
 RESIDUE_CARTESIAN = "cartesian"
 
 
-def canonical_pole_target(value: str | None) -> str:
+def canonical_pole_target(value: Optional[str]) -> str:
     v = str(value or POLE_ALPHA_OMEGA).strip().lower()
     aliases = {
         "pole": POLE_ALPHA_OMEGA,
@@ -34,7 +34,7 @@ def canonical_pole_target(value: str | None) -> str:
     return aliases[v]
 
 
-def canonical_residue_target(value: str | None) -> str:
+def canonical_residue_target(value: Optional[str]) -> str:
     v = str(value or RESIDUE_POLAR).strip().lower()
     aliases = {
         "polar": RESIDUE_POLAR,
@@ -53,10 +53,12 @@ def canonical_residue_target(value: str | None) -> str:
     return aliases[v]
 
 
-def target_names_for(pole_target: str | None = None, residue_target: str | None = None) -> list[str]:
+def target_names_for(
+    pole_target: Optional[str] = None, residue_target: Optional[str] = None
+) -> List[str]:
     pole = canonical_pole_target(pole_target)
     residue = canonical_residue_target(residue_target)
-    names: list[str] = []
+    names: List[str] = []
     if pole == POLE_ALPHA_OMEGA:
         names += ["alpha", "omega"]
     else:
@@ -68,16 +70,20 @@ def target_names_for(pole_target: str | None = None, residue_target: str | None 
     return names
 
 
-def normalize_mask_for(names: list[str]) -> np.ndarray:
+def normalize_mask_for(names: List[str]) -> np.ndarray:
     # Keep the historical alpha/omega/rho/sin/cos path unchanged:
     # sin_theta and cos_theta are already bounded direction cosines and are not z-scored.
     return np.asarray([name not in {"sin_theta", "cos_theta"} for name in names], dtype=bool)
 
 
-def row_target_values(p: ParsedRow, pole_target: str | None = None, residue_target: str | None = None) -> dict[str, np.ndarray]:
+def row_target_values(
+    p: ParsedRow,
+    pole_target: Optional[str] = None,
+    residue_target: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
     pole = canonical_pole_target(pole_target)
     residue = canonical_residue_target(residue_target)
-    out: dict[str, np.ndarray] = {}
+    out: Dict[str, np.ndarray] = {}
     if pole == POLE_ALPHA_OMEGA:
         out["alpha"] = np.asarray(p.alpha, dtype=np.float32)
         out["omega"] = np.asarray(p.omega, dtype=np.float32)
@@ -103,9 +109,9 @@ class Normalizer:
     std: np.ndarray
     residue_target: str = RESIDUE_POLAR
     pole_target: str = POLE_ALPHA_OMEGA
-    names: list[str] | None = None
-    target_transforms: dict[str, dict] | None = None
-    support: dict | None = None
+    names: Optional[List[str]] = None
+    target_transforms: Optional[Dict[str, dict]] = None
+    support: Optional[dict] = None
 
     def __post_init__(self):
         self.pole_target = canonical_pole_target(self.pole_target)
@@ -176,10 +182,10 @@ class Normalizer:
         s = torch.as_tensor(self.std, dtype=x.dtype, device=x.device)
         return x * s + m
 
-    def residue_names(self) -> list[str]:
+    def residue_names(self) -> List[str]:
         return target_names_for(self.pole_target, self.residue_target)[2:]
 
-    def target_names(self) -> list[str]:
+    def target_names(self) -> List[str]:
         return list(self.names or target_names_for(self.pole_target, self.residue_target))
 
     def target_transform(self, name: str) -> dict:
@@ -213,8 +219,8 @@ def compute_output_normalizer_masked(
     parsed: List[ParsedRow],
     residue_target: str = RESIDUE_POLAR,
     pole_target: str = POLE_ALPHA_OMEGA,
-    target_names: list[str] | tuple[str, ...] | None = None,
-    target_transforms: dict[str, dict] | None = None,
+    target_names: Optional[Union[List[str], Tuple[str, ...]]] = None,
+    target_transforms: Optional[Dict[str, dict]] = None,
 ) -> Normalizer:
     pole_target = canonical_pole_target(pole_target)
     residue_target = canonical_residue_target(residue_target)

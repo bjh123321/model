@@ -8,7 +8,7 @@ import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from surrogate_model.data.io import SPLIT_DATASET_NAME_RE, read_real_dataset
 
@@ -237,7 +237,7 @@ def _rows_for_keys(groups: Dict[GroupKey, List[str]], keys: Iterable[GroupKey]) 
     ]
 
 
-def _range(values: List[float]) -> List[float] | None:
+def _range(values: List[float]) -> Optional[List[float]]:
     return [min(values), max(values)] if values else None
 
 
@@ -291,7 +291,7 @@ def split_history_groups_for_replay_guard(
     *,
     replay_fraction: float = 0.75,
     seed: int = 42,
-    excluded_group_keys: Set[GroupKey] | None = None,
+    excluded_group_keys: Optional[Set[GroupKey]] = None,
 ) -> Dict[str, Any]:
     """Split complete operating-point groups into mutually exclusive global replay/guard sets."""
     if not 0.0 < float(replay_fraction) < 1.0:
@@ -421,19 +421,19 @@ def _keys_from_manifest(
 
 def build_replay_data(
     base_dir: Path,
-    model_dir: Path | None = None,
-    replay_dataset_path: Path | None = None,
-    selected_names: Iterable[str] | None = None,
+    model_dir: Optional[Path] = None,
+    replay_dataset_path: Optional[Path] = None,
+    selected_names: Optional[Iterable[str]] = None,
     *,
     structured: bool = False,
-    history_dataset_path: Path | None = None,
+    history_dataset_path: Optional[Path] = None,
     replay_fraction: float = 0.75,
     split_seed: int = 42,
-    split_manifest_path: Path | None = None,
+    split_manifest_path: Optional[Path] = None,
     rebuild_split: bool = False,
     reuse_split: bool = True,
     **_deprecated_local_selection_options: Any,
-) -> List[List[float]] | Dict[str, Any]:
+) -> Union[List[List[float]], Dict[str, Any]]:
     """Build global replay/guard from one stable, group-wise history split."""
     base_dir = Path(base_dir)
     history_path = Path(history_dataset_path or replay_dataset_path or (

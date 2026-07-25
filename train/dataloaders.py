@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional, Tuple
 from copy import deepcopy
 
 import numpy as np
@@ -23,7 +23,7 @@ def _ddp_ready() -> bool:
     return dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
 
 
-def _target_modes(cfg: Config) -> tuple[str, str]:
+def _target_modes(cfg: Config) -> Tuple[str, str]:
     pole_target = str(getattr(cfg, "pole_target", "alpha_omega"))
     residue_target = str(getattr(cfg, "residue_target", "polar"))
     return pole_target, residue_target
@@ -60,7 +60,7 @@ def _slot_values(rows: List[ParsedRow], slot: int):
 
 
 def _observed_mach_slopes(values):
-    groups: dict[float, list[tuple[float, float]]] = {}
+    groups: Dict[float, List[Tuple[float, float]]] = {}
     for height, mach, damping in values:
         groups.setdefault(round(float(height), 8), []).append((float(mach), float(damping)))
     slopes = []
@@ -74,7 +74,7 @@ def _observed_mach_slopes(values):
 
 
 def _training_height_mach_envelope(values):
-    groups: dict[float, list[float]] = {}
+    groups: Dict[float, List[float]] = {}
     for height, mach, _damping in values:
         groups.setdefault(round(float(height), 8), []).append(float(mach))
     return [
@@ -163,7 +163,7 @@ def _attach_and_write_slot_support(
         print(f"[SLOT-SUPPORT] {summary}", flush=True)
 
 
-def _real_damping_upper_rules(cfg: Config | None):
+def _real_damping_upper_rules(cfg: Optional[Config]):
     if cfg is None or not bool(
         getattr(cfg, "real_damping_upper_filter_enabled", True)
     ):
@@ -202,7 +202,7 @@ def _real_damping_upper_rules(cfg: Config | None):
 def _filter_damping_slots(
     parsed: List[ParsedRow],
     split_name: str,
-    cfg: Config | None = None,
+    cfg: Optional[Config] = None,
     apply_real_upper_limits: bool = False,
 ):
     """Mask invalid damping slots and optionally apply real-data upper limits."""
@@ -300,7 +300,7 @@ def _filter_sim_outlier_slots(
     if scale_floor_ratio <= 0.0:
         raise ValueError("sim_slot_outlier_scale_floor_ratio must be positive")
 
-    grouped: dict[tuple[int, int, int], list[tuple[float, float]]] = {}
+    grouped: Dict[Tuple[int, int, int], List[Tuple[float, float]]] = {}
     for row in sim_train:
         mask = np.asarray(row.mask, dtype=np.float64)
         frequency = np.asarray(row.freq, dtype=np.float64)
@@ -467,7 +467,9 @@ def _write_sim_outlier_filter_report(out_dir: Path, report: dict):
     )
 
 
-def _write_damping_filter_log(out_dir: Path, dropped: list[dict], cfg: Config):
+def _write_damping_filter_log(
+    out_dir: Path, dropped: List[dict], cfg: Config
+):
     if not is_main_process():
         return
     path = Path(out_dir) / "damping_slot_filter.log"
@@ -591,7 +593,7 @@ def _split_by_height_mach_groups(parsed: List[ParsedRow], cfg: Config, kfold: in
         return parsed, [], []
     h_tol = float(getattr(cfg, "val_height_tol", 1e-6))
     m_tol = float(getattr(cfg, "val_mach_tol", 1e-6))
-    groups: dict[tuple, list[int]] = {}
+    groups: Dict[tuple, List[int]] = {}
     for i, p in enumerate(parsed):
         groups.setdefault(_hm_key(p, h_tol, m_tol), []).append(i)
     keys = sorted(groups.keys())

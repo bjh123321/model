@@ -6,6 +6,7 @@ subpackages = find_packages(where=".")
 setup(
     name="surrogate_model",
     version="0.1.0",
+    python_requires=">=3.8",
     packages=[
         "surrogate_model",
         *[f"surrogate_model.{package}" for package in subpackages],

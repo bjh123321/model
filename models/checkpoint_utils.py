@@ -3,7 +3,7 @@ from __future__ import annotations
 import warnings
 import re
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -34,7 +34,7 @@ def checkpoint_state_dict(checkpoint: Mapping) -> Mapping[str, torch.Tensor]:
     return state
 
 
-def checkpoint_uses_lora(checkpoint: Mapping, state: Mapping | None = None) -> bool:
+def checkpoint_uses_lora(checkpoint: Mapping, state: Optional[Mapping] = None) -> bool:
     state = checkpoint_state_dict(checkpoint) if state is None else state
     state_uses_lora = any(".A.weight" in key or ".B.weight" in key or ".base.weight" in key for key in state)
     if "use_lora" in checkpoint and bool(checkpoint["use_lora"]) != state_uses_lora:
@@ -45,7 +45,7 @@ def checkpoint_uses_lora(checkpoint: Mapping, state: Mapping | None = None) -> b
     return state_uses_lora
 
 
-def infer_lora_target_hidden_indices(state: Mapping) -> tuple[int, ...]:
+def infer_lora_target_hidden_indices(state: Mapping) -> Tuple[int, ...]:
     """Infer logical hidden-layer indices from sequential module positions in a LoRA state."""
     linear_pattern = re.compile(r"^low\.mlp\.net\.(\d+)\.(?:base\.)?weight$")
     lora_pattern = re.compile(r"^low\.mlp\.net\.(\d+)\.A\.weight$")
@@ -121,7 +121,9 @@ def _restore_embedding_shape(cfg: Config, checkpoint: Mapping, state: Mapping, k
     setattr(cfg, dim_attr, actual[1])
 
 
-def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool | None = None) -> Config:
+def restore_model_config_from_checkpoint(
+    checkpoint: Mapping, *, use_lora: Optional[bool] = None
+) -> Config:
     state = checkpoint_state_dict(checkpoint)
     cfg = Config()
     for field in STRUCTURE_FIELDS:
@@ -166,7 +168,12 @@ def restore_model_config_from_checkpoint(checkpoint: Mapping, *, use_lora: bool 
     return cfg
 
 
-def build_model_from_checkpoint(checkpoint: Mapping, *, device=None, checkpoint_path: str | Path = "<memory>") -> MFDNN | TargetMFDNN | TargetMultifidelityMFDNN:
+def build_model_from_checkpoint(
+    checkpoint: Mapping,
+    *,
+    device=None,
+    checkpoint_path: Union[str, Path] = "<memory>",
+) -> Union[MFDNN, TargetMFDNN, TargetMultifidelityMFDNN]:
     state = checkpoint_state_dict(checkpoint)
     cfg = restore_model_config_from_checkpoint(checkpoint)
     model_type = str(checkpoint.get("model_type", getattr(cfg, "model_type", "MFDNN")))

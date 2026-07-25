@@ -1,0 +1,9 @@
+# Runtime/test environment for Windows 7 x64 + CPython 3.8.5.
+# Keep exact pins: newer releases of several packages no longer support Python 3.8.
+numpy==1.23.5
+scipy==1.10.1
+pandas==1.5.3
+scikit-learn==1.2.2
+openpyxl==3.1.2
+torch==1.13.1
+pytest==7.4.4

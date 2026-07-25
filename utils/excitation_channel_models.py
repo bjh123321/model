@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 from surrogate_model.utils.model_artifacts import atomic_write_json, load_json
 
@@ -47,11 +47,11 @@ def channel_name(channel_id: int) -> str:
     return f"channel_{channel_id:02d}"
 
 
-def combination_from_row(row) -> tuple[int, int]:
+def combination_from_row(row) -> Tuple[int, int]:
     return int(row.exc_id), int(row.ch_id)
 
 
-def combinations_in_rows(rows: Iterable) -> list[tuple[int, int]]:
+def combinations_in_rows(rows: Iterable) -> List[Tuple[int, int]]:
     return sorted({combination_from_row(row) for row in rows})
 
 
@@ -69,11 +69,11 @@ def model_entry(
     channel_id: int,
     row_count: int,
     status: str,
-    source_model_version: str | None = None,
+    source_model_version: Optional[str] = None,
     fidelity_mode: str = "multifidelity",
-    prediction_output: str | None = None,
-    sim_row_count: int | None = None,
-    real_row_count: int | None = None,
+    prediction_output: Optional[str] = None,
+    sim_row_count: Optional[int] = None,
+    real_row_count: Optional[int] = None,
 ) -> dict:
     fidelity_mode = str(fidelity_mode)
     prediction_output = str(
@@ -143,7 +143,7 @@ def write_model_inventory(
     model_version: str,
     models: Iterable[Mapping],
     failures: Iterable[Mapping],
-    parent_model_version: str | None = None,
+    parent_model_version: Optional[str] = None,
 ) -> dict:
     models = sorted(
         (dict(item) for item in models),
@@ -183,7 +183,7 @@ def load_model_inventory(version_dir: Path) -> dict:
     return payload
 
 
-def inventory_index(inventory: Mapping) -> dict[tuple[int, int], dict]:
+def inventory_index(inventory: Mapping) -> Dict[Tuple[int, int], dict]:
     return {
         (int(item["excitation_id"]), int(item["channel_id"])): dict(item)
         for item in inventory.get("models", [])
@@ -194,7 +194,7 @@ def copy_parent_model_directories(
     parent_version_dir: Path,
     new_version_dir: Path,
     parent_inventory: Mapping,
-) -> list[dict]:
+) -> List[dict]:
     copied = []
     for item in parent_inventory.get("models", []):
         source = Path(parent_version_dir) / str(item["relative_dir"])

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Mapping
+from typing import Dict, Iterable, Mapping, Optional
 
 import numpy as np
 import torch
@@ -25,11 +25,11 @@ def damping_max_for_excitation(excitation_id: int) -> float:
 
 def build_target_transform_specs(
     target_names: Iterable[str], excitation_ids: Iterable[int], *, enabled: bool
-) -> dict[str, dict]:
+) -> Dict[str, dict]:
     names = [str(name) for name in target_names]
     if not enabled:
         return {name: {"kind": "identity"} for name in names}
-    specs: dict[str, dict] = {}
+    specs: Dict[str, dict] = {}
     for name in names:
         if name == "freq":
             specs[name] = {"kind": "log", "epsilon": 1e-8}
@@ -44,11 +44,11 @@ def build_target_transform_specs(
     return specs
 
 
-def _spec(spec: Mapping | None) -> dict:
+def _spec(spec: Optional[Mapping]) -> dict:
     return dict(spec or {"kind": "identity"})
 
 
-def encode_numpy(values, spec: Mapping | None):
+def encode_numpy(values, spec: Optional[Mapping]):
     values = np.asarray(values)
     cfg = _spec(spec)
     kind = str(cfg.get("kind", "identity"))
@@ -71,7 +71,7 @@ def encode_numpy(values, spec: Mapping | None):
     raise ValueError(f"Unsupported target transform kind={kind!r}")
 
 
-def decode_numpy(values, spec: Mapping | None):
+def decode_numpy(values, spec: Optional[Mapping]):
     values = np.asarray(values)
     cfg = _spec(spec)
     kind = str(cfg.get("kind", "identity"))
@@ -93,7 +93,7 @@ def decode_numpy(values, spec: Mapping | None):
     raise ValueError(f"Unsupported target transform kind={kind!r}")
 
 
-def decode_torch(values: torch.Tensor, spec: Mapping | None) -> torch.Tensor:
+def decode_torch(values: torch.Tensor, spec: Optional[Mapping]) -> torch.Tensor:
     cfg = _spec(spec)
     kind = str(cfg.get("kind", "identity"))
     if kind == "identity":

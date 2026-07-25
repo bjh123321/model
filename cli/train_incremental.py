@@ -13,6 +13,7 @@ import tempfile
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -71,7 +72,7 @@ def _path_from_ini(cp: configparser.ConfigParser, paths_ini_path: Path, section:
         raise KeyError(f"{paths_ini_path} is missing [{section}] / {key}") from None
 
 
-def _parse_int_list(raw: str) -> list[int]:
+def _parse_int_list(raw: str) -> List[int]:
     values = [int(part.strip()) for part in str(raw).replace(";", ",").split(",") if part.strip()]
     if not values:
         raise argparse.ArgumentTypeError("expected comma-separated integers")
@@ -89,7 +90,7 @@ def _send_finished_udp():
 
 
 def _run_incremental_component_tasks(
-    tasks: list[dict], parallel_workers: int, *, worker=None
+    tasks: List[dict], parallel_workers: int, *, worker=None
 ):
     """Yield component-worker results; each task owns one staged component directory."""
     worker = _train_component_worker if worker is None else worker
@@ -169,8 +170,8 @@ def _replace_selected_component_directories(
 
 
 def _restore_parent_configuration(
-    base_version_dir: Path, parent_inventory: dict | None = None
-) -> tuple[Config, dict | None]:
+    base_version_dir: Path, parent_inventory: Optional[dict] = None
+) -> Tuple[Config, Optional[dict]]:
     cfg = Config()
     training_path = base_version_dir / "training_config.json"
     checkpoint_path = base_version_dir / f"{base_version_dir.name}.pth"
@@ -248,7 +249,9 @@ def _restore_parent_configuration(
     return cfg, None
 
 
-def _parent_component_train_losses(base_version_dir: Path, parent_entry: dict) -> dict[str, float]:
+def _parent_component_train_losses(
+    base_version_dir: Path, parent_entry: dict
+) -> Dict[str, float]:
     losses = {}
     components = parent_entry.get("components", {})
     for component in FDR_COMPONENT_TARGETS:
@@ -459,7 +462,7 @@ def main():
     parent_source, parent_manifest = resolve_parent_dataset(base_version_dir, history_dataset)
     parent_rows = read_real_dataset(parent_source)
     correction_rows = []
-    correction_group_owner: dict[tuple[int, int, int], Path] = {}
+    correction_group_owner: Dict[Tuple[int, int, int], Path] = {}
     for path in correction_paths:
         file_rows = read_real_dataset(path)
         file_groups = group_rows(file_rows, source=str(path))
@@ -600,8 +603,8 @@ def main():
         f"components={list(components_to_train)}",
         flush=True,
     )
-    tasks: list[dict] = []
-    combination_states: dict[tuple[int, int], dict] = {}
+    tasks: List[dict] = []
+    combination_states: Dict[Tuple[int, int], dict] = {}
     for index, (excitation_id, channel_id) in enumerate(affected_combinations, 1):
         key = (int(excitation_id), int(channel_id))
         combo_sim_rows = [
@@ -759,7 +762,7 @@ def main():
             failures=failures,
         )
 
-    def finalize_combination(key: tuple[int, int]):
+    def finalize_combination(key: Tuple[int, int]):
         state = combination_states[key]
         if state["finalized"]:
             return

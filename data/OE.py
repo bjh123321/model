@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import lgamma
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import signal
@@ -23,7 +23,7 @@ SPECTRUM_PREPROCESS_OFF = {
     "max_normalize": False,
 }
 
-DEFAULT_PEAK_PARAMS: dict[str, object] = {
+DEFAULT_PEAK_PARAMS: Dict[str, object] = {
     "fmin": 0.0,
     "fmax": 60.0,
     "median_width_hz": 0.25,
@@ -57,7 +57,7 @@ def _build_arx_regression(
     na: int,
     nb: int,
     nk: int = 0,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     y = np.asarray(y, dtype=float).ravel()
     u = np.asarray(u, dtype=float).ravel()
     if y.shape != u.shape:
@@ -85,7 +85,9 @@ def _build_arx_regression(
     return phi[max_lag:, :], y[max_lag:]
 
 
-def _arx_init(y: np.ndarray, u: np.ndarray, na: int, nb: int, nk: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def _arx_init(
+    y: np.ndarray, u: np.ndarray, na: int, nb: int, nk: int = 0
+) -> Tuple[np.ndarray, np.ndarray]:
     phi, target = _build_arx_regression(y, u, na, nb, nk=nk)
     theta, *_ = np.linalg.lstsq(phi, target, rcond=None)
     return np.hstack(([1.0], theta[:na])), theta[na:]
@@ -114,7 +116,7 @@ def _rpm_init(
     nb: int,
     nk: int = 0,
     khat: int = 75,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     y = np.asarray(y, dtype=float).ravel()
     u = np.asarray(u, dtype=float).ravel()
     if y.shape != u.shape:
@@ -176,7 +178,7 @@ class OEModel:
     init_method: str = "rpm"
     B_: Optional[np.ndarray] = None
     F_: Optional[np.ndarray] = None
-    fit_info_: Optional[dict[str, Any]] = None
+    fit_info_: Optional[Dict[str, Any]] = None
 
     def fit(self, y: np.ndarray, u: np.ndarray, x0: Optional[np.ndarray] = None) -> "OEModel":
         y = np.asarray(y, dtype=float).ravel()
@@ -257,7 +259,7 @@ class OEModel:
         y = np.asarray(y, dtype=float).ravel()
         return y - self.simulate(u)
 
-    def residues(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def residues(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         self._check_fitted()
         b_effective = np.hstack((np.zeros(self.nk, dtype=float), self.B_)) if self.nk > 0 else self.B_
         return signal.residuez(b_effective, self.F_)
@@ -283,7 +285,9 @@ class ResidueMode:
         return abs(complex(self.alpha, self.omega)) / (2.0 * np.pi)
 
 
-def standardize_pair(u: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray, float, float, float, float]:
+def standardize_pair(
+    u: np.ndarray, y: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, float, float, float, float]:
     u_mean = float(np.mean(u))
     y_mean = float(np.mean(y))
     u_centered = u - u_mean
@@ -304,7 +308,7 @@ def fit_oe_modal(
     nf: int = 30,
     nk: int = 0,
     max_iter: int = 50,
-) -> dict[str, object]:
+) -> Dict[str, object]:
     u = np.asarray(u, dtype=float).ravel()
     y = np.asarray(y, dtype=float).ravel()
     if u.shape != y.shape:
@@ -352,7 +356,9 @@ def fit_oe_modal(
     }
 
 
-def pole_frequency_damping(poles: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+def pole_frequency_damping(
+    poles: np.ndarray, fs: float
+) -> Tuple[np.ndarray, np.ndarray]:
     poles = np.asarray(poles, dtype=complex).ravel()
     frequency = np.full(poles.shape, np.nan, dtype=float)
     damping = np.full(poles.shape, np.nan, dtype=float)
@@ -365,7 +371,9 @@ def pole_frequency_damping(poles: np.ndarray, fs: float) -> tuple[np.ndarray, np
     return frequency, damping
 
 
-def amplitude_spectrum(x: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+def amplitude_spectrum(
+    x: np.ndarray, fs: float
+) -> Tuple[np.ndarray, np.ndarray]:
     y = np.asarray(x, dtype=float).ravel()
     if y.size < 4 or not np.all(np.isfinite(y)):
         raise ValueError("Spectrum input must contain at least four finite samples.")
@@ -379,7 +387,7 @@ def amplitude_spectrum(x: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray
     return frequency.astype(float), amplitude.astype(float)
 
 
-def robust_spectrum_peaks(freq, amp, **overrides) -> dict[str, Any]:
+def robust_spectrum_peaks(freq, amp, **overrides) -> Dict[str, Any]:
     params = dict(DEFAULT_PEAK_PARAMS)
     params.update(overrides)
     freq = np.asarray(freq, dtype=float).reshape(-1)
@@ -431,7 +439,7 @@ def robust_spectrum_peaks(freq, amp, **overrides) -> dict[str, Any]:
     linear_candidates, _ = signal.find_peaks(amp_smooth, distance=distance, prominence=linear_prominence, width=width_arg)
     candidates = np.array(sorted(set(map(int, db_candidates)) | set(map(int, linear_candidates))), dtype=int)
     min_height = 0.0 if params["min_height_ratio"] is None else float(params["min_height_ratio"]) * float(np.nanmax(amp))
-    rows: list[dict[str, float]] = []
+    rows: List[Dict[str, float]] = []
     for index in candidates:
         refined_freq, peak_amp, peak_amp_db = _refine_peak(freq, amp, y_db, y_median, index, float(params["refine_width_hz"]))
         if peak_amp < min_height:
@@ -480,15 +488,15 @@ def robust_spectrum_peaks(freq, amp, **overrides) -> dict[str, Any]:
 def marker_slots_from_bands(
     frequency: np.ndarray,
     amplitude: np.ndarray,
-    bands: list[tuple[float, float] | None],
+    bands: List[Optional[Tuple[float, float]]],
     *,
-    peak_params: Optional[dict[str, object]] = None,
-) -> list[Optional[float]]:
+    peak_params: Optional[Dict[str, object]] = None,
+) -> List[Optional[float]]:
     freq = np.asarray(frequency, dtype=float).ravel()
     amp = np.abs(np.asarray(amplitude, dtype=float).ravel())
     params = dict(DEFAULT_PEAK_PARAMS)
     params.update(peak_params or {})
-    band_slots: list[Optional[tuple[float, float]]] = []
+    band_slots: List[Optional[Tuple[float, float]]] = []
     for band in (list(bands[:3]) + [None, None, None])[:3]:
         if band is None:
             band_slots.append(None)
@@ -505,7 +513,7 @@ def marker_slots_from_bands(
     candidate_freq, candidate_amp = _panel_controlled_peak_candidates(freq, amp, search_fmin, search_fmax, params)
     if candidate_freq.size == 0:
         return [None, None, None]
-    markers: list[Optional[float]] = []
+    markers: List[Optional[float]] = []
     for band in band_slots:
         if band is None:
             markers.append(None)
@@ -532,7 +540,7 @@ def match_modes_to_marker_frequencies(
     max_frequency: float = 70.0,
     min_damping: float = 0.0,
     max_damping: float = 0.3,
-) -> list[tuple[float, ResidueMode]]:
+) -> List[Tuple[float, ResidueMode]]:
     poles = np.asarray(poles, dtype=complex).ravel()
     residues = np.asarray(residues, dtype=complex).ravel()
     count = min(poles.size, residues.size)
@@ -551,7 +559,7 @@ def match_modes_to_marker_frequencies(
     if thresholds.size < markers.size:
         thresholds = np.pad(thresholds, (0, markers.size - thresholds.size), constant_values=float(f_threshold))
     used = np.zeros(count, dtype=bool)
-    matched: list[tuple[float, ResidueMode]] = []
+    matched: List[Tuple[float, ResidueMode]] = []
     for marker_index, target in enumerate(markers):
         threshold = float(thresholds[marker_index])
         candidates = np.flatnonzero(valid & (np.abs(frequencies - target) <= threshold))
@@ -573,7 +581,9 @@ def match_modes_to_marker_frequencies(
     return matched
 
 
-def build_ba_from_residue_modes(modes: list[ResidueMode], fs: float) -> tuple[np.ndarray, np.ndarray]:
+def build_ba_from_residue_modes(
+    modes: List[ResidueMode], fs: float
+) -> Tuple[np.ndarray, np.ndarray]:
     if not modes:
         return np.array([0.0]), np.array([1.0])
     ts = 1.0 / float(fs)
@@ -591,7 +601,7 @@ def build_ba_from_residue_modes(modes: list[ResidueMode], fs: float) -> tuple[np
 
 def simulate_reduced_response(
     excitation: np.ndarray,
-    modes: list[ResidueMode],
+    modes: List[ResidueMode],
     fs: float,
     *,
     output_scale: float = 1.0,
@@ -626,7 +636,7 @@ def _panel_controlled_peak_candidates(freq, amp, fmin, fmax, params):
         if window > sg_order and window >= 3:
             peak_signal = signal.savgol_filter(peak_signal, window, min(sg_order, window - 1))
     distance = max(1, int(round(float(params.get("min_distance_hz", 1.0) or 1.0) / df)))
-    kwargs: dict[str, object] = {"distance": distance}
+    kwargs: Dict[str, object] = {"distance": distance}
     if params.get("min_prominence_db") is not None:
         kwargs["prominence"] = max(0.0, float(params["min_prominence_db"]))
     width = _width_points_arg(params, df)
@@ -646,7 +656,7 @@ def _hz_to_odd_window(width_hz: float, df: float, size: int, *, minimum: int) ->
     return max(points, 1)
 
 
-def _width_points_arg(params: dict[str, object], df: float):
+def _width_points_arg(params: Dict[str, object], df: float):
     min_width, max_width = params.get("min_width_hz"), params.get("max_width_hz")
     if min_width is None and max_width is None:
         return None

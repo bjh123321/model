@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch.utils.data import Dataset
+from typing import List
 
 from surrogate_model.data.io import ParsedRow
 from surrogate_model.data.normalizer import Normalizer, row_target_values
@@ -40,7 +41,13 @@ def build_label_tensor(p: ParsedRow, K_max: int, out_norm: Normalizer):
 
 
 class ModalDataset(Dataset):
-    def __init__(self, parsed: list[ParsedRow], K_max: int, input_norm: Normalizer, output_norm: Normalizer):
+    def __init__(
+        self,
+        parsed: List[ParsedRow],
+        K_max: int,
+        input_norm: Normalizer,
+        output_norm: Normalizer,
+    ):
         self.parsed = parsed
         self.K_max = K_max
         self.in_norm = input_norm
