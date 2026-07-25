@@ -18,6 +18,7 @@ from surrogate_model.data.xlsx_utils import load_signal_type_rows
 from surrogate_model.test.residue_pred import build_BA_from_residues
 # from Error import calc_relative_error
 from surrogate_model.test.pp_utils import build_exc_seg_list, calc_pp_for_freq
+from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.excitation_channel_models import (
     FDR_COMPONENT_TARGETS,
     inventory_index,
@@ -1799,7 +1800,7 @@ def main():
     )
     parser.add_argument(
         "--use_freq_filter",
-        action=argparse.BooleanOptionalAction,
+        action=BooleanOptionalAction,
         default=False,
         help="Apply per-channel/per-slot frequency ranges when explicitly enabled; direct valid model outputs are the default.",
     )

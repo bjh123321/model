@@ -273,8 +273,10 @@ class OEModel:
         return np.hstack((self.B_, self.F_[1:]))
 
 
-@dataclass(slots=True)
+@dataclass
 class ResidueMode:
+    __slots__ = ("alpha", "omega", "residue_abs", "residue_phase")
+
     alpha: float
     omega: float
     residue_abs: float

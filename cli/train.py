@@ -22,6 +22,7 @@ from surrogate_model.data.io import parse_rows_to_struct, read_real_dataset
 from surrogate_model.data.normalizer import canonical_pole_target, canonical_residue_target
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
 from surrogate_model.train.full_training_runner import run_component_training
+from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -615,7 +616,7 @@ def main():
     parser.add_argument("--embed_excitation_dim", type=int, default=None)
     parser.add_argument("--embed_channel_dim", type=int, default=None)
     parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
-    parser.add_argument("--use_modulation", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use_modulation", action=BooleanOptionalAction, default=None)
     parser.add_argument("--dropout_prob", type=float, default=None)
     parser.add_argument("--mod_gamma", type=float, default=None)
     parser.add_argument("--lr", type=float, default=None)
@@ -663,7 +664,7 @@ def main():
     parser.add_argument("--batch_sim", type=int, default=None)
     parser.add_argument(
         "--freeze_low_stage2",
-        action=argparse.BooleanOptionalAction,
+        action=BooleanOptionalAction,
         default=None,
         help="Freeze the simulation low head during real-data correction.",
     )

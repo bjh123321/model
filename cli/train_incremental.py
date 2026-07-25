@@ -30,6 +30,7 @@ from surrogate_model.cli.train import (
     _train_component_worker,
 )
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
+from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -331,7 +332,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--component_sim_loss_weight", action="append", default=None)
     parser.add_argument("--low_hidden", type=_parse_int_list, default=None)
     parser.add_argument("--dropout_prob", type=float, default=None)
-    parser.add_argument("--use_modulation", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--use_modulation", action=BooleanOptionalAction, default=None)
     parser.add_argument("--mod_gamma", type=float, default=None)
     parser.add_argument("--pole_target", choices=["alpha_omega", "freq_damping", "pole", "modal"], default=None)
     parser.add_argument("--residue_target", choices=["polar", "cartesian", "fixed"], default=None)
