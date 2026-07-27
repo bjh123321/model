@@ -9,6 +9,8 @@ import configparser
 import numpy as np
 import pandas as pd
 
+from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
+
 
 def get_exe_dir():
     if getattr(sys, "frozen", False):
@@ -28,36 +30,6 @@ def load_paths_ini(paths_ini: str) -> Dict[str, str]:
         out[sec.strip()] = str(v).strip()
     return out
 
-
-base_dir = get_exe_dir()
-user_input_path = base_dir / "user_input.dat"
-with open(user_input_path, "r", encoding="utf-8") as f:
-    lines = f.readlines()
-
-paths_ini_path = Path(lines[0].strip()).expanduser()
-model_name = lines[1].strip()
-data = [line.strip() for line in lines[2:] if line.strip()]
-cp = configparser.ConfigParser()
-cp.read(paths_ini_path, encoding="utf-8")
-
-model_prefix = model_name.split("_", 1)[0].upper()
-if model_prefix == "NH":
-    section = "PR_NH"
-    key = f"path_{section}".lower()
-    pred_root_dir = Path(cp[section][key]) / model_name
-    pred_out_dir = pred_root_dir / "ERROR_PR_NH"
-elif model_prefix == "BH":
-    section = "PR_BH"
-    key = f"path_{section}".lower()
-    pred_root_dir = Path(cp[section][key]) / model_name
-    pred_out_dir = pred_root_dir / "ERROR_PR_BH"
-elif model_prefix == "XGD":
-    section = "PR_XGD"
-    key = f"path_{section}".lower()
-    pred_root_dir = Path(cp[section][key]) / model_name
-    pred_out_dir = pred_root_dir / "ERROR_PR_XGD"
-else:
-    raise ValueError(f"无法根据模型名判断路径类型：{model_name}")
 
 VERBOSE = True
 MAX_MATCH_DIFF = 0.1
@@ -437,9 +409,48 @@ def batch_process_all_a_files(a_files: List[Path], pred_root: Path, out_dir: Pat
     return all_outputs
 
 
-if __name__ == "__main__":
+def main(argv: Optional[List[str]] = None) -> int:
+    base_dir = get_exe_dir()
+    user_input_path, _runtime_args = split_user_input_arg(argv, base_dir)
+    with user_input_path.open("r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle]
+    if len(lines) < 2 or not all(lines[:2]):
+        raise ValueError(
+            "user_input.dat 至少需要路径配置 ini、模型名称和一个 A 文件路径"
+        )
+
+    paths_ini_path = Path(lines[0]).expanduser()
+    model_name = lines[1]
+    data = [line for line in lines[2:] if line]
+    cp = configparser.ConfigParser()
+    if not cp.read(paths_ini_path, encoding="utf-8"):
+        raise FileNotFoundError(f"无法读取路径配置文件：{paths_ini_path}")
+
+    model_prefix = model_name.split("_", 1)[0].upper()
+    if model_prefix == "NH":
+        section = "PR_NH"
+        output_name = "ERROR_PR_NH"
+    elif model_prefix == "BH":
+        section = "PR_BH"
+        output_name = "ERROR_PR_BH"
+    elif model_prefix == "XGD":
+        section = "PR_XGD"
+        output_name = "ERROR_PR_XGD"
+    else:
+        raise ValueError(f"无法根据模型名判断路径类型：{model_name}")
+
+    key = "path_{}".format(section).lower()
+    pred_root_dir = Path(cp[section][key]) / model_name
+    pred_out_dir = pred_root_dir / output_name
     batch_process_all_a_files(
-        a_files=[Path(x) for x in data],
+        a_files=[Path(value) for value in data],
         pred_root=pred_root_dir,
         out_dir=pred_out_dir,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        run_executable(main, "error_calculation", get_exe_dir())
     )

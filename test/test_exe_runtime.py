@@ -22,11 +22,16 @@ class ExecutableRuntimeTests(unittest.TestCase):
                 ["--user_input", str(selected), "--epochs", "2"],
                 program_dir,
             )
+            positional_path, positional_args = split_user_input_arg(
+                [str(selected), "--epochs", "2"], program_dir
+            )
 
             self.assertEqual(default_path, program_dir / "user_input.dat")
             self.assertEqual(default_args, ["--epochs", "2"])
             self.assertEqual(selected_path, selected)
             self.assertEqual(selected_args, ["--epochs", "2"])
+            self.assertEqual(positional_path, selected)
+            self.assertEqual(positional_args, ["--epochs", "2"])
 
     def test_success_and_failure_write_valid_word_logs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

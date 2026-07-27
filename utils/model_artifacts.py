@@ -329,8 +329,7 @@ def read_code_metadata(repo_dir: Path) -> dict:
             return subprocess.check_output(
                 ["git", *args], cwd=str(repo_dir), stderr=subprocess.DEVNULL, text=True, timeout=5
             ).strip() or None
-        except Exception as exc:
-            print(f"[WARN] unable to read Git metadata: {exc}", flush=True)
+        except Exception:
             return None
 
     return {

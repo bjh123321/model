@@ -30,12 +30,15 @@ def _xml_safe_text(text: str) -> str:
 def split_user_input_arg(
     argv: Optional[Sequence[str]], program_dir: Path
 ) -> Tuple[Path, List[str]]:
-    """Resolve and remove the optional user-input argument."""
+    """Resolve and remove a positional or named user-input path."""
 
     arguments = list(sys.argv[1:] if argv is None else argv)
     remaining: List[str] = []
     selected: Optional[str] = None
     index = 0
+    if arguments and not arguments[0].startswith("-"):
+        selected = arguments[0]
+        index = 1
     while index < len(arguments):
         argument = arguments[index]
         if argument in USER_INPUT_FLAGS:
