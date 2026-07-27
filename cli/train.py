@@ -6,7 +6,6 @@ import copy
 import math
 import multiprocessing as mp
 import os
-import socket
 import sys
 import time
 import traceback
@@ -23,6 +22,7 @@ from surrogate_model.data.normalizer import canonical_pole_target, canonical_res
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
 from surrogate_model.train.full_training_runner import run_component_training
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
+from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -405,17 +405,6 @@ def _enable_fast_cuda(args) -> torch.device:
     return device
 
 
-def _send_finished_udp():
-    host, port, message = "localhost", 12345, "XGD_GENERATION_EXE_FINISHED"
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.sendto(message.encode("utf-8"), (host, port))
-    except Exception as exc:
-        print(f"[WARN] UDP notification failed: {exc}")
-    finally:
-        sock.close()
-
-
 def _resume_component_ready(
     output_dir: Path,
     excitation_id: int,
@@ -590,10 +579,10 @@ def _train_component_worker(task: dict) -> dict:
             torch.cuda.empty_cache()
 
 
-def main():
+def main(argv: Optional[List[str]] = None) -> int:
     run_started_at = time.perf_counter()
     base_dir = get_exe_dir()
-    user_input_path = base_dir / "user_input.dat"
+    user_input_path, runtime_args = split_user_input_arg(argv, base_dir)
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     if len(lines) < 2:
@@ -740,7 +729,7 @@ def main():
     parser.add_argument("--debug_overfit_n", type=int, default=0)
     parser.add_argument("--debug_overfit_offset", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
-    args, _unknown = parser.parse_known_args()
+    args, _unknown = parser.parse_known_args(runtime_args)
     if int(args.parallel_workers) <= 0:
         raise ValueError("--parallel_workers must be a positive integer")
     if (
@@ -1373,7 +1362,7 @@ def main():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
-    _send_finished_udp()
+    return 0
 
 
 if __name__ == "__main__":
@@ -1382,4 +1371,4 @@ if __name__ == "__main__":
         mp.set_start_method("spawn", force=True)
     except RuntimeError:
         pass
-    main()
+    raise SystemExit(run_executable(main, "train", get_exe_dir()))

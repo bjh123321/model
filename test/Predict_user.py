@@ -19,6 +19,7 @@ from surrogate_model.test.residue_pred import build_BA_from_residues
 # from Error import calc_relative_error
 from surrogate_model.test.pp_utils import build_exc_seg_list, calc_pp_for_freq
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
+from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
 from surrogate_model.utils.excitation_channel_models import (
     FDR_COMPONENT_TARGETS,
     inventory_index,
@@ -1782,7 +1783,9 @@ def save_VF_VG_for_entry(
     with open(va_path, "w", encoding="utf-8") as f:
         f.writelines(va_lines)
 
-def main():
+def main(argv: Optional[List[str]] = None) -> int:
+    base_dir = get_exe_dir()
+    user_input_path, runtime_args = split_user_input_arg(argv, base_dir)
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model_path",
@@ -1864,7 +1867,7 @@ def main():
             "this value (default: no upper limit)."
         ),
     )
-    args, _unknown = parser.parse_known_args()
+    args, _unknown = parser.parse_known_args(runtime_args)
     args.prediction_damping_min, args.prediction_damping_max = (
         _validate_prediction_damping_bounds(
             args.prediction_damping_min, args.prediction_damping_max
@@ -1876,8 +1879,6 @@ def main():
     omegaN = np.pi * fs
     exist_thresh = 0.2
 
-    base_dir = get_exe_dir()
-    user_input_path = base_dir / "user_input.dat"
     csv_path = base_dir / "mode_freq_range.csv"
     if args.use_freq_filter and not csv_path.exists():
         raise FileNotFoundError(f"Fixed-SF prediction requires mode frequency ranges: {csv_path}")
@@ -2100,35 +2101,8 @@ def main():
             print(f"  [WARN] exc_id={entry.exc_id} 无 plot 通道，跳过 VF/VG")
 
     print("Done.")
+    return 0
 
 
-    import socket
-    def udp_sender():
-        # 配置参数
-        HOST = 'localhost'
-        PORT = 12345
-        MESSAGE = "XGD_PREDICTION_EXE_FINISHED"
-
-        # 创建UDP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        try:
-            print("UDP发送端已启动")
-            print(f"目标地址: {HOST}:{PORT}")
-            print(f"发送内容: {MESSAGE}")
-            print("\n正在发送...")
-
-            # 发送消息
-            sock.sendto(MESSAGE.encode('utf-8'), (HOST, PORT))
-
-            print("消息发送成功！")
-
-        except Exception as e:
-            print(f"发送失败: {e}")
-        finally:
-            sock.close()
-            print("发送端已关闭")
-
-    udp_sender()
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run_executable(main, "predict", get_exe_dir()))

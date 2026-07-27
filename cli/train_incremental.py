@@ -7,7 +7,6 @@ import math
 import multiprocessing as mp
 import os
 import shutil
-import socket
 import sys
 import tempfile
 import traceback
@@ -31,6 +30,7 @@ from surrogate_model.cli.train import (
 )
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
+from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -78,16 +78,6 @@ def _parse_int_list(raw: str) -> List[int]:
     if not values:
         raise argparse.ArgumentTypeError("expected comma-separated integers")
     return values
-
-
-def _send_finished_udp():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.sendto(b"XGD_CORRECTION_EXE_FINISHED", ("localhost", 12345))
-    except Exception as exc:
-        print(f"[WARN] UDP notification failed: {exc}", flush=True)
-    finally:
-        sock.close()
 
 
 def _run_incremental_component_tasks(
@@ -379,12 +369,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main():
-    args = _parser().parse_args()
+def main(argv: Optional[List[str]] = None) -> int:
+    base_dir = get_exe_dir()
+    user_input_path, runtime_args = split_user_input_arg(argv, base_dir)
+    args = _parser().parse_args(runtime_args)
     if int(args.parallel_workers) <= 0:
         raise ValueError("--parallel_workers must be positive")
-    base_dir = get_exe_dir()
-    with (base_dir / "user_input.dat").open("r", encoding="utf-8") as handle:
+    with user_input_path.open("r", encoding="utf-8") as handle:
         lines = [line.strip() for line in handle]
     if len(lines) < 3:
         raise ValueError("user_input.dat needs at least 3 lines: paths.ini, base_model_version, new_model_version")
@@ -894,8 +885,10 @@ def main():
         f"skipped={len(failures)} path={new_version_dir / 'models_manifest.json'}",
         flush=True,
     )
-    _send_finished_udp()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(
+        run_executable(main, "train_incremental", get_exe_dir())
+    )
