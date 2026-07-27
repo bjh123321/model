@@ -369,6 +369,26 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_sim_dataset_path(
+    base_version_dir: Path, program_dir: Path
+) -> Path:
+    parent_snapshot = Path(base_version_dir) / "sim_dataset_snapshot"
+    if parent_snapshot.is_dir():
+        return parent_snapshot
+
+    legacy_external = Path(program_dir) / "sim_dataset"
+    if legacy_external.is_dir():
+        return legacy_external
+
+    raise FileNotFoundError(
+        "Multifidelity correction requires a simulation dataset. "
+        "Neither the parent model snapshot nor the legacy external dataset exists: "
+        "parent_snapshot={}, legacy_external={}".format(
+            parent_snapshot, legacy_external
+        )
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     base_dir = get_exe_dir()
     user_input_path, runtime_args = split_user_input_arg(argv, base_dir)
@@ -399,11 +419,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.debug_overfit_n = 0
     args.debug_overfit_offset = 0
 
-    sim_dataset_path = base_dir / "sim_dataset"
-    if not sim_dataset_path.is_dir():
-        raise FileNotFoundError(
-            f"Multifidelity correction requires sim dataset: {sim_dataset_path}"
-        )
+    sim_dataset_path = _resolve_sim_dataset_path(base_version_dir, base_dir)
+    print("[SIM-DATA] path={}".format(sim_dataset_path), flush=True)
     sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
     sim_parsed, sim_stats = parse_rows_to_struct(sim_rows)
 
