@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from surrogate_model.config import Config
 from surrogate_model.cli.train import (
     _configure_validation_for_height_selection,
     _filter_combinations,
@@ -14,6 +15,8 @@ from surrogate_model.utils.excitation_channel_models import CHANNEL_NAMES, EXCIT
 
 
 def main():
+    assert Config().use_val_split is False
+
     channel_names = {index: name for index, name in enumerate(CHANNEL_NAMES)}
     assert _resolve_id_selection(["FXD_DC"], EXCITATION_NAMES, "excitation") == {1}
     assert _resolve_id_selection(["fxd_fdc,1"], EXCITATION_NAMES, "excitation") == {0, 1}

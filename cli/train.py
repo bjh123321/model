@@ -897,6 +897,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         cfg.num_workers = 0
     if args.val_split_strategy is not None:
         cfg.val_split_strategy = args.val_split_strategy
+        cfg.use_val_split = bool(args.val_split_strategy)
     selected_heights = _resolve_height_selection(args.height)
     height_tolerance = float(cfg.val_height_tol)
     if selected_heights is not None:

@@ -33,7 +33,7 @@ class Config:
     prefetch: int = 4
 
     # Train/val split
-    use_val_split: bool = True
+    use_val_split: bool = False
     val_ratio: float = 0.2
     val_seed: int = 42
     val_split_strategy: str = "height_mach_points" # val_height_mach_points中高度、马赫数点作验证集
