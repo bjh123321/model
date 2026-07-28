@@ -20,8 +20,15 @@ from surrogate_model.test.residue_pred import build_BA_from_residues
 from surrogate_model.test.pp_utils import build_exc_seg_list, calc_pp_for_freq
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
+from surrogate_model.utils.channel_schema import (
+    channel_detail_path_from_ini,
+    load_channel_schema,
+    load_saved_channel_schema,
+)
 from surrogate_model.utils.excitation_channel_models import (
+    EXCITATION_NAMES,
     FDR_COMPONENT_TARGETS,
+    configure_channel_names,
     inventory_index,
     load_model_inventory,
 )
@@ -136,6 +143,14 @@ channels = ["LW1", "LW2", "LW3", "LAI", "RW1", "RW2", "RW3", "RAI",
             "RHT1", "RHT4", "RHT2", "RHT3", "F1Z", "F1Y", "ZWL1Y", "ZWL1Z",
             "YWL1Y", "YWL1Z"
             ]
+channel_ids_by_excitation = {
+    0: tuple(range(8, 20)),
+    1: tuple(range(8, 20)),
+    2: tuple(range(20, 28)),
+    3: tuple(range(20, 28)),
+    4: tuple(range(0, 8)),
+    5: tuple(range(0, 8)),
+}
 
 def channels_for_exc_plot(exc_id: int) -> np.ndarray:
     """
@@ -144,13 +159,7 @@ def channels_for_exc_plot(exc_id: int) -> np.ndarray:
       2/3 -> PW  -> 20..27
       4/5 -> JFY -> 0..7
     """
-    if exc_id in (0, 1):
-        return np.arange(8, 20, dtype=np.int64)
-    if exc_id in (2, 3):
-        return np.arange(20, 28, dtype=np.int64)
-    if exc_id in (4, 5):
-        return np.arange(0, 8, dtype=np.int64)
-    return np.arange(0, 0, dtype=np.int64)
+    return np.asarray(channel_ids_by_excitation.get(int(exc_id), ()), dtype=np.int64)
 
 
 def format_H_tag(H_km: float) -> str:
@@ -553,11 +562,50 @@ def _run_infer_single_model_batched(
 
 
 class ExcitationChannelModelRegistry:
-    def __init__(self, version_dir: Path, device: torch.device):
+    def __init__(self, version_dir: Path, device: torch.device, channel_schema=None):
         self.version_dir = Path(version_dir)
         self.device = device
         self.inventory = load_model_inventory(self.version_dir)
         self.entries = inventory_index(self.inventory)
+        if channel_schema is not None:
+            remapped_entries = {}
+            definitions = channel_schema.definition_by_name
+            excitation_ids = {name: identifier for identifier, name in EXCITATION_NAMES.items()}
+            for item in self.entries.values():
+                name = str(item.get("channel_name", ""))
+                definition = definitions.get(name)
+                if definition is None:
+                    continue
+                if int(item["channel_id"]) != int(definition.channel_id):
+                    continue
+                if (
+                    definition.excitation_position is None
+                    and str(item.get("fidelity_mode", "multifidelity"))
+                    != "sim_only"
+                ):
+                    continue
+                source_excitation = str(
+                    item.get(
+                        "excitation_name",
+                        EXCITATION_NAMES.get(int(item["excitation_id"]), ""),
+                    )
+                )
+                source_position = source_excitation.split("_", 1)[0]
+                phase = source_excitation.rsplit("_", 1)[-1]
+                if definition.excitation_position is None:
+                    target_excitation_id = int(item["excitation_id"])
+                else:
+                    if source_position != definition.excitation_position:
+                        continue
+                    target_excitation_id = excitation_ids.get(
+                        "{}_{}".format(definition.excitation_position, phase)
+                    )
+                    if target_excitation_id is None:
+                        continue
+                remapped_entries[
+                    (int(target_excitation_id), int(definition.channel_id))
+                ] = item
+            self.entries = remapped_entries
         if not self.entries:
             raise RuntimeError(f"No usable excitation/channel models are listed in {self.version_dir}")
         self._cache = {}
@@ -1394,9 +1442,7 @@ def save_response_dat(
     # resp_error_dir = out_root / "ERROR_PR_XGD"
     # result_cg_dir = out_root.parents[2] / "RESULT_CG"
 
-    C_full = 34
-    if len(channels) != C_full:
-        raise ValueError(f"channels 长度应为 {C_full}，但当前为 {len(channels)}")
+    C_full = len(channels)
 
     N = u.shape[0]
 
@@ -1908,8 +1954,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "--model_path must point to an excitation/channel model-version directory, "
                 "not a single checkpoint file"
             )
-    data_header_dir = _path_from_config(cp, paths_ini_path, "DataHeader")
-    response_output_header = load_response_output_header(data_header_dir / "sc.dat")
+    channel_detail_path = channel_detail_path_from_ini(paths_ini_path)
+    saved_schema_path = version_dir / "channel_schema.json"
+    inventory_preview = load_model_inventory(version_dir)
+    model_channel_names = [
+        str(item.get("channel_name", ""))
+        for item in inventory_preview.get("models", [])
+        if str(item.get("channel_name", ""))
+    ]
+    if saved_schema_path.is_file():
+        model_channel_names.extend(
+            load_saved_channel_schema(saved_schema_path).channel_names
+        )
+    channel_schema = load_channel_schema(
+        channel_detail_path,
+        model_channel_names,
+    )
+    configure_channel_names(channel_schema.channel_names)
+    global channels
+    channels = list(channel_schema.channel_names)
+    response_output_header = list(channel_schema.output_headers)
 
     signaltype_dir = _path_from_config(cp, paths_ini_path, "SignalType")
     exc_table_xlsx = signaltype_dir / "signal_type.xlsx"
@@ -1952,7 +2016,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"==> Loading excitation/channel model inventory: {version_dir}")
     print(f"==> Prediction output: {args.predict_output}")
-    model = ExcitationChannelModelRegistry(version_dir, device)
+    model = ExcitationChannelModelRegistry(version_dir, device, channel_schema)
+    global channel_ids_by_excitation
+    channel_ids_by_excitation = {
+        excitation_id: tuple(
+            sorted(
+                channel_id
+                for candidate_excitation, channel_id in model.entries
+                if candidate_excitation == excitation_id
+            )
+        )
+        for excitation_id in EXCITATION_NAMES
+    }
     in_norm = None
     mode_freq_ranges = _load_channel_freq_ranges(csv_path) if args.use_freq_filter else None
     print(f"==> Frequency range filter enabled: {args.use_freq_filter}", flush=True)
@@ -2003,7 +2078,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # ---------- A) RESP：固定 (H,M,exc) 预测 34 通道响应 ----------
         # 1) 网络推理（34通道）
-        C_full = 34
+        C_full = len(channels)
         H_all = np.full((C_full,), entry.H_km, dtype=np.float32)
         M_all = np.full((C_full,), entry.M, dtype=np.float32)
         exc_all = np.full((C_full,), entry.exc_id, dtype=np.int64)
@@ -2036,7 +2111,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
 
         # ---------- B) HF/HG：固定 M 扫 H_axis（裁剪通道） ----------
-        chs_plot = channels_for_exc_plot(entry.exc_id)
+        chs_plot = np.asarray(
+            sorted(
+                channel_id
+                for excitation_id, channel_id in model.entries
+                if excitation_id == entry.exc_id
+            ),
+            dtype=np.int64,
+        )
         if chs_plot.size > 0:
             nH = len(H_axis)
             nC = len(chs_plot)

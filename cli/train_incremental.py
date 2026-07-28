@@ -35,13 +35,23 @@ from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
     build_dataset_snapshot,
-    build_input_dataset_snapshot,
     group_key_from_parsed,
     group_rows,
     load_json,
     merge_dataset_rows,
     resolve_parent_dataset,
     validate_new_version_directory,
+)
+from surrogate_model.utils.channel_schema import (
+    LEGACY_CHANNEL_NAMES,
+    channel_detail_path_from_ini,
+    channel_names_present,
+    load_channel_schema,
+    load_saved_channel_schema,
+    print_remap_reports,
+    remap_dataset_rows,
+    save_channel_schema,
+    source_channel_names_for_dataset,
 )
 from surrogate_model.utils.excitation_channel_models import (
     CHANNEL_NAMES,
@@ -50,7 +60,8 @@ from surrogate_model.utils.excitation_channel_models import (
     channel_name,
     combination_dir,
     combinations_in_rows,
-    copy_parent_model_directories,
+    configure_channel_names,
+    copy_parent_model_directories_remapped,
     excitation_name,
     inventory_index,
     load_model_inventory,
@@ -397,8 +408,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise ValueError("--parallel_workers must be positive")
     with user_input_path.open("r", encoding="utf-8") as handle:
         lines = [line.strip() for line in handle]
-    if len(lines) < 3:
-        raise ValueError("user_input.dat needs at least 3 lines: paths.ini, base_model_version, new_model_version")
+    if len(lines) < 4 or not all(lines[:4]):
+        raise ValueError(
+            "user_input.dat needs 4 lines: paths.ini, base model version, "
+            "new model version, selected_CG list path"
+        )
 
     paths_ini_path = Path(lines[0]).expanduser()
     cp = configparser.ConfigParser()
@@ -419,9 +433,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     args.debug_overfit_n = 0
     args.debug_overfit_offset = 0
 
+    parent_schema_path = base_version_dir / "channel_schema.json"
+    parent_channel_names = (
+        load_saved_channel_schema(parent_schema_path).channel_names
+        if parent_schema_path.is_file()
+        else tuple(LEGACY_CHANNEL_NAMES)
+    )
     sim_dataset_path = _resolve_sim_dataset_path(base_version_dir, base_dir)
     print("[SIM-DATA] path={}".format(sim_dataset_path), flush=True)
-    sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
+    raw_sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
+    sim_source_names = (
+        parent_channel_names
+        if sim_dataset_path == base_version_dir / "sim_dataset_snapshot"
+        else source_channel_names_for_dataset(sim_dataset_path)
+    )
+    channel_detail_path = channel_detail_path_from_ini(paths_ini_path)
+    schema = load_channel_schema(
+        channel_detail_path,
+        channel_names_present(raw_sim_rows, sim_source_names),
+    )
+    configure_channel_names(schema.channel_names)
+    sim_rows, sim_report = remap_dataset_rows(
+        raw_sim_rows,
+        schema,
+        sim_source_names,
+        include_sim_only_exceptions=True,
+        source_label=str(sim_dataset_path),
+    )
+    print_remap_reports([sim_report])
+    if not sim_rows:
+        raise RuntimeError(
+            "No simulation rows remain after applying the current channel detail workbook"
+        )
     sim_parsed, sim_stats = parse_rows_to_struct(sim_rows)
 
     cfg, _representative_parent_training = _restore_parent_configuration(
@@ -433,34 +476,43 @@ def main(argv: Optional[List[str]] = None) -> int:
             "FDR split training requires pole_target='freq_damping' and residue_target='polar'"
         )
 
-    def resolve_user_path(raw: str) -> Path:
+    def resolve_user_path(raw: str, relative_to: Optional[Path] = None) -> Path:
         candidate = Path(raw).expanduser()
-        return candidate if candidate.is_absolute() else (base_dir / candidate).resolve()
+        root = Path(relative_to) if relative_to is not None else base_dir
+        return candidate if candidate.is_absolute() else (root / candidate).resolve()
 
-    generated_dataset_tmp = None
-    direct_paths = [resolve_user_path(raw) for raw in lines[3:] if raw]
-    if direct_paths:
-        missing = [path for path in direct_paths if not path.is_file()]
-        if missing:
-            raise FileNotFoundError(f"Direct correction data files do not exist: {missing}")
-        correction_mode = "direct_dataset"
-        correction_paths = direct_paths
-    else:
-        correction_mode = "cg_oe"
-        generated_dataset_tmp = tempfile.TemporaryDirectory(
-            prefix="xgd_correction_dataset_"
-        )
-        generated_dataset_dir = Path(generated_dataset_tmp.name)
-        correction_paths = list(
-            batch_process_split(
-                data_dir,
-                generated_dataset_dir,
-                base_dir / "selected_CG_path.txt",
-                reserved_names_dir=(base_version_dir / "dataset_snapshot"),
-                modal_band_config_path=base_dir / "极点频段配置.xlsx",
+    selected_cg_path = resolve_user_path(lines[3], user_input_path.parent)
+    if not selected_cg_path.is_file():
+        raise FileNotFoundError(
+            "selected_CG list from user_input.dat line 4 does not exist: {}".format(
+                selected_cg_path
             )
         )
-    print(f"[CORRECTION] mode={correction_mode} files={len(correction_paths)}", flush=True)
+    generated_dataset_tmp = tempfile.TemporaryDirectory(
+        prefix="xgd_correction_dataset_"
+    )
+    generated_dataset_dir = Path(generated_dataset_tmp.name)
+    oe_channel_mapping = {
+        item.name: (item.channel_id, item.excitation_position)
+        for item in schema.channels
+        if not item.sim_only_exception
+    }
+    correction_paths = list(
+        batch_process_split(
+            data_dir,
+            generated_dataset_dir,
+            selected_cg_path,
+            reserved_names_dir=(base_version_dir / "dataset_snapshot"),
+            modal_band_config_path=base_dir / "极点频段配置.xlsx",
+            channel_mapping=oe_channel_mapping,
+        )
+    )
+    print(
+        "[CORRECTION] mode=cg_oe selected_list={} files={}".format(
+            selected_cg_path, len(correction_paths)
+        ),
+        flush=True,
+    )
 
     history_dataset = None
     if args.history_dataset:
@@ -469,7 +521,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         configured = str(getattr(cfg, "incremental_history_dataset_dir", "") or "").strip()
         history_dataset = resolve_user_path(configured) if configured else None
     parent_source, parent_manifest = resolve_parent_dataset(base_version_dir, history_dataset)
-    parent_rows = read_real_dataset(parent_source)
+    if parent_source.is_dir() and not any(parent_source.iterdir()):
+        raw_parent_rows = []
+    else:
+        raw_parent_rows = read_real_dataset(parent_source)
+    parent_rows, parent_report = remap_dataset_rows(
+        raw_parent_rows,
+        schema,
+        parent_channel_names,
+        include_sim_only_exceptions=False,
+        source_label=str(parent_source),
+    )
+    print_remap_reports([parent_report])
     correction_rows = []
     correction_group_owner: Dict[Tuple[int, int, int], Path] = {}
     for path in correction_paths:
@@ -497,20 +560,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     correction_keys = set(merge_info["correction_group_keys"])
-    if parent_manifest is not None:
-        parent_train = {tuple(key) for key in parent_manifest["splits"]["train_group_keys"]}
-        parent_validation = {tuple(key) for key in parent_manifest["splits"]["validation_group_keys"]}
-        train_keys = parent_train | correction_keys
-        removed_from_validation = parent_validation & correction_keys
-        validation_keys = parent_validation - correction_keys
-    else:
-        parent_parsed, _ = parse_rows_to_struct(parent_rows)
-        legacy_train, legacy_validation, _ = split_single_fidelity_rows(parent_parsed, cfg, 0, 0)
-        parent_train = {group_key_from_parsed(row) for row in legacy_train}
-        parent_validation = {group_key_from_parsed(row) for row in legacy_validation}
-        train_keys = parent_train | correction_keys
-        removed_from_validation = parent_validation & correction_keys
-        validation_keys = parent_validation - correction_keys
+    split_train, split_validation, _split_name = split_single_fidelity_rows(
+        parsed_rows, cfg, 0, 0
+    )
+    split_validation_keys = {
+        group_key_from_parsed(row) for row in split_validation
+    }
+    train_keys = {
+        group_key_from_parsed(row) for row in split_train
+    } | correction_keys
+    validation_keys = split_validation_keys - correction_keys
+    removed_from_validation = split_validation_keys & correction_keys
     all_keys = set(group_rows(merged_rows, source="merged dataset"))
     train_keys = (train_keys & all_keys) | correction_keys | (all_keys - train_keys - validation_keys)
     validation_keys &= all_keys
@@ -553,11 +613,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         list(key) for key in sorted(removed_from_validation)
     ]
     atomic_write_json(new_version_dir / "dataset_manifest.json", manifest)
-    sim_relative_files = build_input_dataset_snapshot(
-        sim_dataset_path,
+    sim_snapshot_files = build_dataset_snapshot(
+        sim_rows,
         new_version_dir / "sim_dataset_snapshot",
         allow_duplicate_keys=True,
     )
+    sim_relative_files = {
+        key: ["sim_dataset_snapshot/{}".format(path.name)]
+        for key, path in sim_snapshot_files.items()
+    }
     sim_keys = sorted({group_key_from_parsed(row) for row in sim_parsed})
     sim_manifest = build_dataset_manifest(
         rows=sim_rows,
@@ -570,16 +634,52 @@ def main(argv: Optional[List[str]] = None) -> int:
         allow_duplicate_keys=True,
     )
     atomic_write_json(new_version_dir / "sim_dataset_manifest.json", sim_manifest)
+    save_channel_schema(schema, new_version_dir)
 
     target_names = [name for names in FDR_COMPONENT_TARGETS.values() for name in names]
-    inherited_models = copy_parent_model_directories(
-        base_version_dir, new_version_dir, parent_inventory
+    current_channel_mapping = {
+        item.name: {
+            "channel_id": item.channel_id,
+            "excitation_position": item.excitation_position,
+        }
+        for item in schema.channels
+    }
+    inherited_models, remapped_rebuild_combinations = (
+        copy_parent_model_directories_remapped(
+            base_version_dir,
+            new_version_dir,
+            parent_inventory,
+            current_channel_mapping,
+        )
     )
     result_models = {
         (int(item["excitation_id"]), int(item["channel_id"])): item
         for item in inherited_models
     }
     failures = []
+    available_channel_ids = {
+        int(row.ch_id) for row in list(sim_parsed) + list(parsed_rows)
+    }
+    for definition in schema.channels:
+        if definition.channel_id in available_channel_ids:
+            continue
+        failure = {
+            "channel_id": definition.channel_id,
+            "channel_name": definition.name,
+            "error_type": "NoChannelData",
+            "error": (
+                "The channel is configured in ChnTableHeader.xlsx but has no "
+                "usable SIM or REAL rows; no model was created and prediction "
+                "will output zero."
+            ),
+        }
+        failures.append(failure)
+        print(
+            "[SKIP-CHANNEL] {}: {}".format(
+                definition.name, failure["error"]
+            ),
+            flush=True,
+        )
     correction_parsed, _ = parse_rows_to_struct(correction_rows)
     correction_combinations = combinations_in_rows(correction_parsed)
     selected_excitations = _resolve_id_selection(
@@ -596,17 +696,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         for component in FDR_COMPONENT_TARGETS
         if selected_components is None or component in selected_components
     )
+    available_combinations = set(combinations_in_rows(sim_parsed)) | set(
+        combinations_in_rows(parsed_rows)
+    )
+    required_rebuild = (
+        set(correction_combinations)
+        | set(remapped_rebuild_combinations)
+        | (available_combinations - set(result_models))
+    )
     affected_combinations = _filter_combinations(
-        correction_combinations, selected_excitations, selected_channels
+        sorted(required_rebuild), selected_excitations, selected_channels
     )
     if not affected_combinations:
         raise RuntimeError(
-            "The excitation/channel selectors matched no combinations in the correction "
-            "data listed on user_input.dat line 4 and later"
+            "The excitation/channel selectors matched no combinations in the selected_CG "
+            "data or current channel-schema changes"
         )
     print(
-        f"[SELECTION] correction_combinations={len(affected_combinations)}/"
-        f"{len(correction_combinations)} "
+        f"[SELECTION] rebuild_combinations={len(affected_combinations)}/"
+        f"{len(required_rebuild)} "
         f"excitations={sorted(selected_excitations) if selected_excitations is not None else 'all'} "
         f"channels={sorted(selected_channels) if selected_channels is not None else 'all'} "
         f"components={list(components_to_train)}",
@@ -635,13 +743,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             flush=True,
         )
         try:
-            parent_entry = parent_models.get(key)
-            if parent_entry is not None:
-                combo_cfg, _parent_training = _restore_parent_configuration(
-                    base_version_dir, {"models": [parent_entry]}
-                )
-            else:
-                combo_cfg, _parent_training = copy.deepcopy(cfg), None
+            parent_entry = result_models.get(key)
+            combo_cfg, _parent_training = copy.deepcopy(cfg), None
             _apply_cli_overrides(combo_cfg, args)
             combo_cfg.validation_metric_scope = "all"
             available_keys = {group_key_from_parsed(row) for row in combo_rows}
@@ -649,10 +752,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             combo_validation_keys = set(validation_keys) & available_keys
             if not combo_sim_rows:
                 raise RuntimeError("No simulation data is available for this combination")
-            if not combo_rows or not combo_train_keys:
-                raise RuntimeError("No merged training data is available for this combination")
+            fidelity_mode = "multifidelity" if combo_rows else "sim_only"
+            prediction_output = "high" if combo_rows else "low"
 
-            if combo_validation_keys:
+            if fidelity_mode == "sim_only":
+                combo_cfg.checkpoint_selection = "training"
+                combo_cfg.explicit_train_group_keys = []
+                combo_cfg.explicit_validation_group_keys = []
+                combo_cfg.require_validation = False
+                if hasattr(combo_cfg, "parent_train_loss_targets"):
+                    delattr(combo_cfg, "parent_train_loss_targets")
+                print(
+                    f"[CORRECTION] {label}: no REAL rows; training simulation-only model.",
+                    flush=True,
+                )
+            elif not combo_train_keys:
+                raise RuntimeError("No merged training data is available for this combination")
+            elif combo_validation_keys:
                 combo_cfg.explicit_train_group_keys = sorted(combo_train_keys)
                 combo_cfg.explicit_validation_group_keys = sorted(combo_validation_keys)
                 combo_cfg.require_validation = True
@@ -668,7 +784,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 if parent_entry is not None and parent_fidelity == "multifidelity":
                     parent_loss_targets = _parent_component_train_losses(
-                        base_version_dir, parent_entry
+                        new_version_dir, parent_entry
                     )
                     combo_cfg.parent_train_loss_targets = parent_loss_targets
                     combo_cfg.epochs_after_parent_loss = int(args.epochs_after_parent_loss)
@@ -700,8 +816,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "dataset_manifest_path": "../../../dataset_manifest.json",
                 "training_mode": "correction_full_retrain",
                 "sim_dataset_fingerprint": sim_manifest["dataset_fingerprint"],
-                "fidelity_mode": "multifidelity",
-                "prediction_output": "high",
+                "fidelity_mode": fidelity_mode,
+                "prediction_output": prediction_output,
                 "model_filename": "model.pth",
                 "parent_model_version": base_model_version,
                 "parent_dataset_fingerprint": None if parent_manifest is None else parent_manifest.get("dataset_fingerprint"),
@@ -722,13 +838,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "row_count": len(combo_rows),
                 "sim_row_count": len(combo_sim_rows),
                 "real_row_count": len(combo_rows),
+                "fidelity_mode": fidelity_mode,
+                "prediction_output": prediction_output,
                 "components": tuple(components_to_train),
                 "results": {},
                 "finalized": False,
             }
             for component in components_to_train:
                 print(
-                    f"[CORRECTION-QUEUE] full retrain {label}/{component} from merged data",
+                    f"[CORRECTION-QUEUE] full retrain {label}/{component} "
+                    f"mode={fidelity_mode}",
                     flush=True,
                 )
                 tasks.append(
@@ -828,7 +947,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     row_count=state["row_count"],
                     status="corrected",
                     source_model_version=base_model_version,
-                    fidelity_mode="multifidelity",
+                    fidelity_mode=state["fidelity_mode"],
+                    prediction_output=state["prediction_output"],
                     sim_row_count=state["sim_row_count"],
                     real_row_count=state["real_row_count"],
                 )

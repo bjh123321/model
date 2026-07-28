@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -58,55 +57,50 @@ def load_dataset_rows(path: Path) -> List[List[float]]:
 def merge_dataset_rows(
     parent_rows: Iterable[Sequence[float]], correction_rows: Iterable[Sequence[float]]
 ) -> Tuple[List[List[float]], dict]:
-    parent = group_rows(parent_rows, source="parent dataset")
-    correction = group_rows(correction_rows, source="correction dataset")
+    parent_list = [list(row) for row in parent_rows]
+    correction_list = [list(row) for row in correction_rows]
+    parent = (
+        group_rows(parent_list, source="parent dataset")
+        if parent_list
+        else {}
+    )
+    correction = group_rows(correction_list, source="correction dataset")
     replaced: List[Tuple[int, int, int]] = []
     added: List[Tuple[int, int, int]] = []
     changes: List[dict] = []
     merged = {key: [list(row) for row in rows] for key, rows in parent.items()}
-    expected_channels_by_excitation: Dict[int, Set[int]] = {}
-    for excitation_id in {key[2] for key in parent}:
-        channel_sets = [
-            frozenset(int(round(row[3])) for row in values)
-            for key, values in parent.items()
-            if key[2] == excitation_id
-        ]
-        if channel_sets:
-            expected_channels_by_excitation[excitation_id] = set(Counter(channel_sets).most_common(1)[0][0])
     for key, new_rows in correction.items():
         new_channels = {int(round(row[3])) for row in new_rows}
         if key in parent:
-            old_channels = {int(round(row[3])) for row in parent[key]}
-            if new_channels != old_channels:
-                raise ValueError(
-                    f"Correction group {list(key)} is incomplete: channels={sorted(new_channels)}, "
-                    f"expected complete parent channels={sorted(old_channels)}"
-                )
+            retained_rows = [
+                list(row)
+                for row in parent[key]
+                if int(round(row[3])) not in new_channels
+            ]
+            replacement_rows = retained_rows + [list(row) for row in new_rows]
+            replacement_rows.sort(key=lambda row: int(round(row[3])))
             replaced.append(key)
             changes.append(
                 {
                     "group_key": list(key),
                     "old_sha256": group_content_sha256(parent[key]),
-                    "new_sha256": group_content_sha256(new_rows),
+                    "new_sha256": group_content_sha256(replacement_rows),
+                    "corrected_channels": sorted(new_channels),
                     "reason": "selected operating-point correction",
                 }
             )
+            merged[key] = replacement_rows
         else:
-            expected_channels = expected_channels_by_excitation.get(key[2])
-            if expected_channels is not None and new_channels != expected_channels:
-                raise ValueError(
-                    f"Added correction group {list(key)} is incomplete: channels={sorted(new_channels)}, "
-                    f"expected excitation channel set={sorted(expected_channels)}"
-                )
             added.append(key)
             changes.append(
                 {
                     "group_key": list(key),
                     "new_sha256": group_content_sha256(new_rows),
+                    "corrected_channels": sorted(new_channels),
                     "reason": "selected operating-point addition",
                 }
             )
-        merged[key] = [list(row) for row in new_rows]
+            merged[key] = [list(row) for row in new_rows]
     flattened = [row for key in sorted(merged) for row in merged[key]]
     group_rows(flattened, source="merged dataset")
     return flattened, {
@@ -171,10 +165,25 @@ def _snapshot_filename(key: Tuple[int, int, int]) -> str:
 
 
 def build_dataset_snapshot(
-    rows: Iterable[Sequence[float]], snapshot_dir: Path
+    rows: Iterable[Sequence[float]],
+    snapshot_dir: Path,
+    *,
+    allow_empty: bool = False,
+    allow_duplicate_keys: bool = False,
 ) -> Dict[Tuple[int, int, int], Path]:
     snapshot_dir = Path(snapshot_dir)
-    grouped = group_rows(rows, source="snapshot source")
+    row_list = [list(row) for row in rows]
+    grouped = (
+        group_rows(
+            row_list,
+            source="snapshot source",
+            allow_duplicate_keys=allow_duplicate_keys,
+        )
+        if row_list
+        else {}
+    )
+    if not grouped and not allow_empty:
+        raise ValueError("snapshot source: dataset contains no usable rows")
     snapshot_dir.parent.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=f".{snapshot_dir.name}.", dir=str(snapshot_dir.parent)))
     try:
@@ -266,12 +275,20 @@ def build_dataset_manifest(
         Mapping[Tuple[int, int, int], Sequence[str]]
     ] = None,
     allow_duplicate_keys: bool = False,
+    allow_empty: bool = False,
 ) -> dict:
-    grouped = group_rows(
-        rows,
-        source="manifest dataset",
-        allow_duplicate_keys=allow_duplicate_keys,
+    row_list = [list(row) for row in rows]
+    grouped = (
+        group_rows(
+            row_list,
+            source="manifest dataset",
+            allow_duplicate_keys=allow_duplicate_keys,
+        )
+        if row_list
+        else {}
     )
+    if not grouped and not allow_empty:
+        raise ValueError("manifest dataset: dataset contains no usable rows")
     source_types = source_types or {}
     groups = []
     for key, values in sorted(grouped.items()):

@@ -6,7 +6,7 @@ import re
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -144,10 +144,20 @@ def get_input_signal(header: List[str], values: np.ndarray, input_name: str = IN
     return np.asarray(values[:, name_to_index[input_name]], dtype=float).ravel()
 
 
-def select_channel_indices(header: List[str], excite_pos: str) -> List[Tuple[int, str, int]]:
+def select_channel_indices(
+    header: List[str],
+    excite_pos: str,
+    channel_mapping: Optional[Mapping[str, Tuple[int, Optional[str]]]] = None,
+) -> List[Tuple[int, str, int]]:
+    name_to_index = {name: index for index, name in enumerate(header)}
+    if channel_mapping is not None:
+        return [
+            (int(channel_id), name, name_to_index[name])
+            for name, (channel_id, position) in channel_mapping.items()
+            if position == excite_pos and name in name_to_index
+        ]
     if excite_pos not in CHANNELS_BY_POS or excite_pos not in CHANNEL_ID_BASE:
         raise ValueError(f"Unsupported excitation position: {excite_pos}")
-    name_to_index = {name: index for index, name in enumerate(header)}
     base = CHANNEL_ID_BASE[excite_pos]
     selected = []
     for local_index, name in enumerate(CHANNELS_BY_POS[excite_pos]):
@@ -367,12 +377,14 @@ def read_selected_dat_files(root_dir: Path, selected_list_file: Path) -> List[Pa
 
 
 def _extract_rows_from_dat(
-    file_path: Path, modal_config: Dict[str, Dict[str, object]]
+    file_path: Path,
+    modal_config: Dict[str, Dict[str, object]],
+    channel_mapping: Optional[Mapping[str, Tuple[int, Optional[str]]]] = None,
 ) -> List[str]:
     meta = parse_excitation_from_filename(file_path)
     values, header = read_table_dat(file_path)
     input_signal = get_input_signal(header, values, INPUT_SIGNAL_NAME)
-    channels = select_channel_indices(header, meta.excite_pos)
+    channels = select_channel_indices(header, meta.excite_pos, channel_mapping)
     if not channels:
         print(f"[SKIP] no channel matched | {file_path}")
         return []
@@ -441,6 +453,7 @@ def batch_process_split(
     selected_list_file: Path,
     reserved_names_dir: Optional[Path] = None,
     modal_band_config_path: Optional[Path] = None,
+    channel_mapping: Optional[Mapping[str, Tuple[int, Optional[str]]]] = None,
 ) -> List[Path]:
     root_dir, output_dir = Path(root_dir), Path(output_dir)
     files = read_selected_dat_files(root_dir, Path(selected_list_file))
@@ -454,7 +467,7 @@ def batch_process_split(
     generated: List[Path] = []
     for file_path in files:
         try:
-            rows = _extract_rows_from_dat(file_path, modal_config)
+            rows = _extract_rows_from_dat(file_path, modal_config, channel_mapping)
             if not rows:
                 raise RuntimeError(f"No usable modal rows extracted from: {file_path}")
             output_path = _next_split_dataset_path(output_dir, _split_dataset_stem(file_path), reserved_names_dir)
@@ -475,6 +488,7 @@ def batch_process(
     out_file: Path,
     selected_list_file: Path,
     modal_band_config_path: Optional[Path] = None,
+    channel_mapping: Optional[Mapping[str, Tuple[int, Optional[str]]]] = None,
 ) -> None:
     root_dir, out_file = Path(root_dir), Path(out_file)
     files = read_selected_dat_files(root_dir, Path(selected_list_file))
@@ -488,7 +502,7 @@ def batch_process(
     with out_file.open("w", encoding="utf-8") as stream:
         for file_path in files:
             try:
-                rows = _extract_rows_from_dat(file_path, modal_config)
+                rows = _extract_rows_from_dat(file_path, modal_config, channel_mapping)
                 if rows:
                     stream.write("\n".join(rows) + "\n")
             except Exception as exc:

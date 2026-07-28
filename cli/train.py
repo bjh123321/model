@@ -26,9 +26,20 @@ from surrogate_model.utils.exe_runtime import run_executable, split_user_input_a
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
-    build_input_dataset_snapshot,
+    build_dataset_snapshot,
     group_key_from_parsed,
     load_json,
+)
+from surrogate_model.utils.channel_schema import (
+    channel_detail_path_from_ini,
+    channel_names_present,
+    load_and_remap_datasets,
+    load_channel_schema,
+    print_remap_reports,
+    read_dataset_list,
+    remap_dataset_rows,
+    save_channel_schema,
+    source_channel_names_for_dataset,
 )
 from surrogate_model.utils.excitation_channel_models import (
     CHANNEL_NAMES,
@@ -39,6 +50,7 @@ from surrogate_model.utils.excitation_channel_models import (
     combinations_in_rows,
     excitation_name,
     model_entry,
+    configure_channel_names,
     write_model_inventory,
 )
 
@@ -585,17 +597,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     user_input_path, runtime_args = split_user_input_arg(argv, base_dir)
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    if len(lines) < 2:
-        raise ValueError("user_input.dat needs at least 2 lines: paths.ini, model_version")
+    if len(lines) < 3 or not all(line.strip() for line in lines[:3]):
+        raise ValueError(
+            "user_input.dat needs 3 lines: paths.ini, model_version, real dataset list"
+        )
 
     paths_ini_path = Path(lines[0].strip()).expanduser()
     model_version = lines[1].strip()
+    dataset_list_path = Path(lines[2].strip()).expanduser()
+    if not dataset_list_path.is_absolute():
+        dataset_list_path = (user_input_path.parent / dataset_list_path).resolve()
     sim_dataset_path = base_dir / "sim_dataset"
-    real_dataset_path = base_dir / "real_dataset"
-    if not sim_dataset_path.is_dir() or not real_dataset_path.is_dir():
+    if not sim_dataset_path.is_dir():
         raise FileNotFoundError(
-            "Multifidelity training requires both dataset directories next to the CLI entry: "
-            f"sim={sim_dataset_path}, real={real_dataset_path}"
+            "Simulation dataset directory is missing next to the CLI entry: "
+            f"sim={sim_dataset_path}"
         )
     model_dir = _default_model_dir(base_dir, paths_ini_path)
 
@@ -762,8 +778,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     _enable_fast_cuda(args)
 
-    sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
-    real_rows = read_real_dataset(real_dataset_path)
+    raw_sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
+    sim_source_names = source_channel_names_for_dataset(sim_dataset_path)
+    channel_detail_path = channel_detail_path_from_ini(paths_ini_path)
+    schema = load_channel_schema(
+        channel_detail_path,
+        channel_names_present(raw_sim_rows, sim_source_names),
+    )
+    configure_channel_names(schema.channel_names)
+    sim_rows, sim_report = remap_dataset_rows(
+        raw_sim_rows,
+        schema,
+        sim_source_names,
+        include_sim_only_exceptions=True,
+        source_label=str(sim_dataset_path),
+    )
+    print_remap_reports([sim_report])
+    real_dataset_paths = read_dataset_list(dataset_list_path)
+    real_rows, real_reports = load_and_remap_datasets(
+        real_dataset_paths,
+        schema,
+        include_sim_only_exceptions=False,
+        allow_duplicate_keys=False,
+    )
+    print_remap_reports(real_reports)
+    if not real_dataset_paths:
+        print(
+            "[REAL-DATA] training dataset list is empty; all available combinations "
+            "will use simulation-only training.",
+            flush=True,
+        )
+    if not sim_rows:
+        raise RuntimeError(
+            "No simulation rows remain after applying the current channel detail workbook"
+        )
     sim_parsed, sim_stats = parse_rows_to_struct(sim_rows)
     real_parsed, real_stats = parse_rows_to_struct(real_rows)
 
@@ -891,9 +939,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     train_group_keys = sorted({group_key_from_parsed(row) for row in preview_train})
     validation_group_keys = sorted({group_key_from_parsed(row) for row in preview_val})
     if not ddp_enabled or rank == 0:
-        relative_files_by_group = build_input_dataset_snapshot(
-            real_dataset_path, model_root / "dataset_snapshot"
+        real_snapshot_files = build_dataset_snapshot(
+            real_rows,
+            model_root / "dataset_snapshot",
+            allow_empty=True,
         )
+        relative_files_by_group = {
+            key: ["dataset_snapshot/{}".format(path.name)]
+            for key, path in real_snapshot_files.items()
+        }
         manifest = build_dataset_manifest(
             rows=real_rows,
             model_version=model_version,
@@ -902,13 +956,18 @@ def main(argv: Optional[List[str]] = None) -> int:
             validation_group_keys=validation_group_keys,
             split_strategy=split_strategy,
             relative_files_by_group=relative_files_by_group,
+            allow_empty=True,
         )
         atomic_write_json(model_root / "dataset_manifest.json", manifest)
-        sim_relative_files = build_input_dataset_snapshot(
-            sim_dataset_path,
+        sim_snapshot_files = build_dataset_snapshot(
+            sim_rows,
             model_root / "sim_dataset_snapshot",
             allow_duplicate_keys=True,
         )
+        sim_relative_files = {
+            key: ["sim_dataset_snapshot/{}".format(path.name)]
+            for key, path in sim_snapshot_files.items()
+        }
         sim_keys = sorted({group_key_from_parsed(row) for row in sim_parsed})
         sim_manifest = build_dataset_manifest(
             rows=sim_rows,
@@ -921,6 +980,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             allow_duplicate_keys=True,
         )
         atomic_write_json(model_root / "sim_dataset_manifest.json", sim_manifest)
+        save_channel_schema(schema, model_root)
     if ddp_enabled:
         dist.barrier()
     if ddp_enabled and rank != 0:
@@ -933,6 +993,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     target_names = [name for names in FDR_COMPONENT_TARGETS.values() for name in names]
     trained_models = {}
     failures = []
+    available_channel_ids = {
+        int(row.ch_id) for row in list(sim_parsed) + list(real_parsed)
+    }
+    for definition in schema.channels:
+        if definition.channel_id in available_channel_ids:
+            continue
+        failure = {
+            "channel_id": definition.channel_id,
+            "channel_name": definition.name,
+            "error_type": "NoChannelData",
+            "error": (
+                "The channel is configured in ChnTableHeader.xlsx but has no "
+                "usable SIM or REAL rows; no model was created and prediction "
+                "will output zero."
+            ),
+        }
+        failures.append(failure)
+        print(
+            "[SKIP-CHANNEL] {}: {}".format(
+                definition.name, failure["error"]
+            ),
+            flush=True,
+        )
     tasks = []
     component_states = {}
     combination_info = {}

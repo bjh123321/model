@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,13 +27,22 @@ EXCITATION_NAMES = {
     5: "JFY_DC",
 }
 
-CHANNEL_NAMES = (
+CHANNEL_NAMES = [
     "LW1", "LW2", "LW3", "LAI", "RW1", "RW2", "RW3", "RAI",
     "LVT1", "LVT2", "LVT3", "LVT4", "LRY", "LRY1", "RVT1", "RVT2",
     "RVT3", "RVT4", "RRY", "RRY1", "LHT1", "LHT4", "LHT2", "LHT3",
     "RHT1", "RHT4", "RHT2", "RHT3", "F1Z", "F1Y", "ZWL1Y", "ZWL1Z",
     "YWL1Y", "YWL1Z",
-)
+]
+
+
+def configure_channel_names(channel_names: Iterable[str]) -> None:
+    names = [str(name) for name in channel_names]
+    if not names:
+        raise ValueError("At least one configured channel name is required")
+    if len(names) != len(set(names)):
+        raise ValueError("Configured channel names must be unique")
+    CHANNEL_NAMES[:] = names
 
 
 def excitation_name(excitation_id: int) -> str:
@@ -208,3 +218,91 @@ def copy_parent_model_directories(
         copied_item["source_model_version"] = str(parent_inventory.get("model_version", ""))
         copied.append(copied_item)
     return copied
+
+
+def copy_parent_model_directories_remapped(
+    parent_version_dir: Path,
+    new_version_dir: Path,
+    parent_inventory: Mapping,
+    current_channels: Mapping[str, Mapping],
+) -> Tuple[List[dict], List[Tuple[int, int]]]:
+    """Copy compatible parent models while translating channel IDs and directories.
+
+    Models whose configured excitation position changed are intentionally not copied;
+    their returned target combinations must be rebuilt from the remapped snapshots.
+    """
+    copied = []
+    rebuild = []
+    occupied = set()
+    for item in parent_inventory.get("models", []):
+        old_excitation_id = int(item["excitation_id"])
+        channel_name_value = str(item.get("channel_name") or channel_name(item["channel_id"]))
+        target = current_channels.get(channel_name_value)
+        if target is None:
+            continue
+        target_channel_id = int(target["channel_id"])
+        target_position = target.get("excitation_position")
+        old_excitation_value = str(
+            item.get("excitation_name") or excitation_name(old_excitation_id)
+        )
+        phase = old_excitation_value.rsplit("_", 1)[-1]
+        old_position = old_excitation_value.split("_", 1)[0]
+        if target_position:
+            target_name = "{}_{}".format(target_position, phase)
+            target_excitation_id = next(
+                (
+                    identifier
+                    for identifier, name in EXCITATION_NAMES.items()
+                    if name == target_name
+                ),
+                None,
+            )
+            if target_excitation_id is None:
+                continue
+        else:
+            target_excitation_id = old_excitation_id
+        target_key = (int(target_excitation_id), target_channel_id)
+        if (
+            (target_position and old_position != str(target_position))
+            or target_channel_id != int(item["channel_id"])
+            or (
+                target_position is None
+                and str(item.get("fidelity_mode", "multifidelity"))
+                != "sim_only"
+            )
+        ):
+            rebuild.append(target_key)
+            continue
+        if target_key in occupied:
+            raise ValueError(
+                "Multiple parent models map to excitation/channel {}".format(target_key)
+            )
+        occupied.add(target_key)
+
+        old_relative = str(item["relative_dir"])
+        new_relative = combination_relative_dir(*target_key)
+        source = Path(parent_version_dir) / old_relative
+        destination = Path(new_version_dir) / new_relative
+        if not source.is_dir():
+            raise FileNotFoundError(
+                "Parent channel-model directory is missing: {}".format(source)
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, destination)
+
+        copied_item = copy.deepcopy(dict(item))
+        copied_item["excitation_id"] = target_key[0]
+        copied_item["excitation_name"] = excitation_name(target_key[0])
+        copied_item["channel_id"] = target_key[1]
+        copied_item["channel_name"] = channel_name_value
+        copied_item["relative_dir"] = new_relative
+        for component_entry in copied_item.get("components", {}).values():
+            for key, value in list(component_entry.items()):
+                if isinstance(value, str) and value.startswith(old_relative + "/"):
+                    component_entry[key] = new_relative + value[len(old_relative):]
+        copied_item["status"] = "inherited"
+        copied_item["source_model_version"] = str(
+            parent_inventory.get("model_version", "")
+        )
+        copied.append(copied_item)
+    return copied, sorted(set(rebuild))
