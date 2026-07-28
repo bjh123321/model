@@ -65,3 +65,5 @@ logs/
 checkpoints/
 results/
 runs/
+
+.codex_tmp/
