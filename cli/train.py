@@ -417,6 +417,14 @@ def _enable_fast_cuda(args) -> torch.device:
     return device
 
 
+def _load_torch_artifact(path):
+    """Load trusted local artifacts on both old and new PyTorch releases."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def _resume_component_ready(
     output_dir: Path,
     excitation_id: int,
@@ -445,10 +453,7 @@ def _resume_component_ready(
         missing = [name for name in required if not (component_dir / name).is_file()]
         if missing:
             return False, f"missing {', '.join(missing)}"
-        try:
-            checkpoint = torch.load(component_dir / "model.pth", map_location="cpu", weights_only=True)
-        except TypeError:
-            checkpoint = torch.load(component_dir / "model.pth", map_location="cpu")
+        checkpoint = _load_torch_artifact(component_dir / "model.pth")
         if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
             return False, "checkpoint has no model_state_dict"
         if checkpoint.get("model_type") != "TargetMultifidelityMFDNN":
@@ -472,18 +477,16 @@ def _resume_component_ready(
                 ["Normalizer_Input_Real.pth", "Normalizer_Output_Real.pth"]
             )
         for filename in normalizer_filenames:
-            normalizer = torch.load(component_dir / filename, map_location="cpu", weights_only=True)
+            normalizer = _load_torch_artifact(component_dir / filename)
             if not isinstance(normalizer, dict) or "mean" not in normalizer or "std" not in normalizer:
                 return False, f"invalid {filename}"
-        output_normalizer = torch.load(
+        output_normalizer = _load_torch_artifact(
             component_dir
             / (
                 "Normalizer_Output_Real.pth"
                 if checkpoint_fidelity_mode == "multifidelity"
                 else "Normalizer_Output_Sim.pth"
-            ),
-            map_location="cpu",
-            weights_only=True,
+            )
         )
         transforms = dict(output_normalizer.get("target_transforms", {}) or {})
         if any(str(transforms.get(name, {}).get("kind", "identity")) == "identity" for name in target_names if name in {"freq", "magnitude"}):
