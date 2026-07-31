@@ -43,6 +43,7 @@ def main():
     assert excitations == {2}
     assert channels == {20, 23}
     assert args.parallel_workers == 2
+    assert args.num_workers is None
     assert _filter_combinations(
         [(1, 8), (2, 20), (2, 23), (3, 20)], excitations, channels
     ) == [(2, 20), (2, 23)]

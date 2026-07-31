@@ -1046,6 +1046,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
+    try:
+        mp.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass
     raise SystemExit(
         run_executable(main, "train_incremental", get_exe_dir())
     )
