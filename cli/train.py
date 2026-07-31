@@ -594,6 +594,25 @@ def _train_component_worker(task: dict) -> dict:
             torch.cuda.empty_cache()
 
 
+def _terminate_completed_windows_workers(
+    executor, platform_name: Optional[str] = None
+) -> int:
+    """Stop idle Windows workers after every submitted future has completed."""
+    active_platform = sys.platform if platform_name is None else platform_name
+    if active_platform != "win32":
+        return 0
+
+    processes = tuple(
+        dict(getattr(executor, "_processes", {}) or {}).values()
+    )
+    terminated = 0
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            terminated += 1
+    return terminated
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     run_started_at = time.perf_counter()
     base_dir = get_exe_dir()
@@ -967,6 +986,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             sim_rows,
             model_root / "sim_dataset_snapshot",
             allow_duplicate_keys=True,
+            dataset_prefix="FZ",
         )
         sim_relative_files = {
             key: ["sim_dataset_snapshot/{}".format(path.name)]
@@ -1429,6 +1449,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         "traceback": traceback.format_exc(),
                     }
                 handle_task_result(result)
+            terminated_workers = _terminate_completed_windows_workers(executor)
+            if terminated_workers:
+                print(
+                    "[PARALLEL] all task results received; stopped {} idle "
+                    "Windows worker process(es).".format(terminated_workers),
+                    flush=True,
+                )
 
     if (not ddp_enabled) or rank == 0:
         write_progress_inventory()

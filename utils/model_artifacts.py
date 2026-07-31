@@ -158,10 +158,19 @@ def load_json(path: Path) -> dict:
         return json.load(handle)
 
 
-def _snapshot_filename(key: Tuple[int, int, int]) -> str:
+def _snapshot_filename(
+    key: Tuple[int, int, int], dataset_prefix: str = "SF"
+) -> str:
     h_code, m_code, excitation_id = key
     name = EXCITATION_NAMES.get(excitation_id, f"EXC_{excitation_id}")
-    return f"SF_XGD_{name}_H{h_code:04d}_M{m_code:03d}.txt"
+    prefix = str(dataset_prefix).strip().upper()
+    if prefix not in {"SF", "FZ"}:
+        raise ValueError(
+            "dataset_prefix must be 'SF' or 'FZ', got {!r}".format(
+                dataset_prefix
+            )
+        )
+    return f"{prefix}_XGD_{name}_H{h_code:04d}_M{m_code:03d}.txt"
 
 
 def build_dataset_snapshot(
@@ -170,6 +179,7 @@ def build_dataset_snapshot(
     *,
     allow_empty: bool = False,
     allow_duplicate_keys: bool = False,
+    dataset_prefix: str = "SF",
 ) -> Dict[Tuple[int, int, int], Path]:
     snapshot_dir = Path(snapshot_dir)
     row_list = [list(row) for row in rows]
@@ -189,7 +199,9 @@ def build_dataset_snapshot(
     try:
         result: Dict[Tuple[int, int, int], Path] = {}
         for key, values in sorted(grouped.items()):
-            destination = temp_dir / _snapshot_filename(key)
+            destination = temp_dir / _snapshot_filename(
+                key, dataset_prefix=dataset_prefix
+            )
             destination.write_bytes(_stable_rows_bytes(values))
             result[key] = destination
         if snapshot_dir.exists():

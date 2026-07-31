@@ -11,6 +11,7 @@ import sys
 import tempfile
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -26,6 +27,7 @@ from surrogate_model.cli.train import (
     _filter_combinations,
     _resolve_component_selection,
     _resolve_id_selection,
+    _terminate_completed_windows_workers,
     _train_component_worker,
 )
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
@@ -108,6 +110,7 @@ def _run_incremental_component_tasks(
 
     context = mp.get_context("spawn")
     future_tasks = {}
+    retry_tasks = []
     with ProcessPoolExecutor(
         max_workers=min(worker_count, len(tasks)),
         mp_context=context,
@@ -118,6 +121,8 @@ def _run_incremental_component_tasks(
             task = future_tasks[future]
             try:
                 yield future.result()
+            except BrokenProcessPool:
+                retry_tasks.append(task)
             except Exception as exc:
                 yield {
                     "ok": False,
@@ -128,6 +133,21 @@ def _run_incremental_component_tasks(
                     "error": str(exc),
                     "traceback": traceback.format_exc(),
                 }
+        terminated_workers = _terminate_completed_windows_workers(executor)
+        if terminated_workers:
+            print(
+                "[PARALLEL] all task results received; stopped {} idle "
+                "Windows worker process(es).".format(terminated_workers),
+                flush=True,
+            )
+    if retry_tasks:
+        print(
+            "[PARALLEL-RECOVERY] process pool stopped unexpectedly; retrying "
+            "{} component task(s) sequentially.".format(len(retry_tasks)),
+            flush=True,
+        )
+        for task in retry_tasks:
+            yield worker(task)
 
 
 def _replace_selected_component_directories(
@@ -510,10 +530,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(
         "[CORRECTION] mode=cg_oe selected_list={} files={}".format(
             selected_cg_path, len(correction_paths)
-        ),
-        flush=True,
-    )
-
+                ),
+                flush=True,
+            )
     history_dataset = None
     if args.history_dataset:
         history_dataset = resolve_user_path(args.history_dataset)
@@ -617,6 +636,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         sim_rows,
         new_version_dir / "sim_dataset_snapshot",
         allow_duplicate_keys=True,
+        dataset_prefix="FZ",
     )
     sim_relative_files = {
         key: ["sim_dataset_snapshot/{}".format(path.name)]
