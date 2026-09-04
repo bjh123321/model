@@ -83,14 +83,27 @@ def _parse_float(value: object) -> float:
     return float(text)
 
 
-def _required_signal_type_headers() -> Dict[str, str]:
+def _signal_type_header_keywords() -> Dict[str, str]:
     return {
         "kind": "信号编号",
         "amp": "幅值",
-        "f0": "开始频率",
-        "f1": "结束频率",
-        "dur": "激励时间",
+        "f0": "起始频率",
+        "f1": "截止频率",
+        "dur": "持续时间",
     }
+
+
+def _match_signal_type_headers(headers: List[str]) -> Dict[str, str]:
+    keywords = _signal_type_header_keywords()
+    matched: Dict[str, str] = {}
+    for field, keyword in keywords.items():
+        for header in headers:
+            if (field == "kind" and header == keyword) or (
+                field != "kind" and header.startswith(keyword)
+            ):
+                matched[field] = header
+                break
+    return matched
 
 
 def _load_signal_type_rows_with_pandas(xlsx_path: Path) -> List[Tuple[str, float, float, float, float]]:
@@ -99,26 +112,26 @@ def _load_signal_type_rows_with_pandas(xlsx_path: Path) -> List[Tuple[str, float
     except Exception:
         return []
 
-    required_headers = _required_signal_type_headers()
     try:
         df = pd.read_excel(xlsx_path, sheet_name=0, dtype=object)
     except Exception:
         return []
 
     df.columns = [str(col).strip() for col in df.columns]
-    if any(name not in df.columns for name in required_headers.values()):
+    headers = _match_signal_type_headers(list(df.columns))
+    if len(headers) != len(_signal_type_header_keywords()):
         return []
 
     rows: List[Tuple[str, float, float, float, float]] = []
     for _, row in df.iterrows():
-        kind = str(row[required_headers["kind"]]).strip()
+        kind = str(row[headers["kind"]]).strip()
         if not kind or kind.lower() == "nan" or kind == "Unnamed: 0":
             continue
         try:
-            amp = _parse_float(row[required_headers["amp"]])
-            f0 = _parse_float(row[required_headers["f0"]])
-            f1 = _parse_float(row[required_headers["f1"]])
-            dur = _parse_float(row[required_headers["dur"]])
+            amp = _parse_float(row[headers["amp"]])
+            f0 = _parse_float(row[headers["f0"]])
+            f1 = _parse_float(row[headers["f1"]])
+            dur = _parse_float(row[headers["dur"]])
         except ValueError:
             continue
         rows.append((kind, amp, f0, f1, dur))
@@ -132,7 +145,7 @@ def load_signal_type_rows(xlsx_path: Path) -> List[Tuple[str, float, float, floa
         return rows
 
     rows: List[Tuple[str, float, float, float, float]] = []
-    required_headers = _required_signal_type_headers()
+    required_headers = _signal_type_header_keywords()
 
     with zipfile.ZipFile(str(xlsx_path), "r") as zf:
         shared_strings = _load_shared_strings(zf)
@@ -147,16 +160,21 @@ def load_signal_type_rows(xlsx_path: Path) -> List[Tuple[str, float, float, floa
     for cell in row_nodes[0].findall("{%s}c" % _MAIN_NS):
         header_values[_col_to_index(cell.attrib.get("r", ""))] = _cell_value(cell, shared_strings).strip()
     header_index = {name: idx for idx, name in header_values.items() if name}
+    headers = _match_signal_type_headers(list(header_index))
 
-    missing = [name for name in required_headers.values() if name not in header_index]
+    missing = [
+        keyword
+        for field, keyword in required_headers.items()
+        if field not in headers
+    ]
     if missing:
         raise KeyError(f"{xlsx_path} missing signal type headers: {', '.join(missing)}")
 
-    kind_col = header_index[required_headers["kind"]]
-    amp_col = header_index[required_headers["amp"]]
-    f0_col = header_index[required_headers["f0"]]
-    f1_col = header_index[required_headers["f1"]]
-    dur_col = header_index[required_headers["dur"]]
+    kind_col = header_index[headers["kind"]]
+    amp_col = header_index[headers["amp"]]
+    f0_col = header_index[headers["f0"]]
+    f1_col = header_index[headers["f1"]]
+    dur_col = header_index[headers["dur"]]
 
     skipped_examples = []
     for row in row_nodes[1:]:
