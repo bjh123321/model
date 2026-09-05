@@ -33,6 +33,7 @@ from surrogate_model.cli.train import (
 from surrogate_model.train.dataloaders import split_single_fidelity_rows
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
+from surrogate_model.data.sim_dataset import generation_user_input, prepare_sim_dataset
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -400,24 +401,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_sim_dataset_path(
-    base_version_dir: Path, program_dir: Path
-) -> Path:
-    parent_snapshot = Path(base_version_dir) / "sim_dataset_snapshot"
-    if parent_snapshot.is_dir():
-        return parent_snapshot
-
-    legacy_external = Path(program_dir) / "sim_dataset"
-    if legacy_external.is_dir():
-        return legacy_external
-
-    raise FileNotFoundError(
-        "Multifidelity correction requires a simulation dataset. "
-        "Neither the parent model snapshot nor the legacy external dataset exists: "
-        "parent_snapshot={}, legacy_external={}".format(
-            parent_snapshot, legacy_external
-        )
-    )
+def _resolve_sim_dataset_path(paths_ini_path: Path) -> Path:
+    return prepare_sim_dataset(generation_user_input(paths_ini_path))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -459,14 +444,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if parent_schema_path.is_file()
         else tuple(LEGACY_CHANNEL_NAMES)
     )
-    sim_dataset_path = _resolve_sim_dataset_path(base_version_dir, base_dir)
+    sim_dataset_path = _resolve_sim_dataset_path(paths_ini_path)
     print("[SIM-DATA] path={}".format(sim_dataset_path), flush=True)
     raw_sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
-    sim_source_names = (
-        parent_channel_names
-        if sim_dataset_path == base_version_dir / "sim_dataset_snapshot"
-        else source_channel_names_for_dataset(sim_dataset_path)
-    )
+    sim_source_names = source_channel_names_for_dataset(sim_dataset_path)
     channel_detail_path = channel_detail_path_from_ini(paths_ini_path)
     schema = load_channel_schema(
         channel_detail_path,

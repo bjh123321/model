@@ -23,6 +23,7 @@ from surrogate_model.train.dataloaders import split_single_fidelity_rows
 from surrogate_model.train.full_training_runner import run_component_training
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
+from surrogate_model.data.sim_dataset import prepare_sim_dataset
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -619,9 +620,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     user_input_path, runtime_args = split_user_input_arg(argv, base_dir)
     with open(user_input_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
-    if len(lines) < 3 or not all(line.strip() for line in lines[:3]):
+    if len(lines) < 4 or not all(line.strip() for line in lines[:4]):
         raise ValueError(
-            "user_input.dat needs 3 lines: paths.ini, model_version, real dataset list"
+            "user_input.dat needs 4 lines: paths.ini, model_version, real dataset list, simulation source directory"
         )
 
     paths_ini_path = Path(lines[0].strip()).expanduser()
@@ -629,12 +630,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     dataset_list_path = Path(lines[2].strip()).expanduser()
     if not dataset_list_path.is_absolute():
         dataset_list_path = (user_input_path.parent / dataset_list_path).resolve()
-    sim_dataset_path = base_dir / "sim_dataset"
-    if not sim_dataset_path.is_dir():
-        raise FileNotFoundError(
-            "Simulation dataset directory is missing next to the CLI entry: "
-            f"sim={sim_dataset_path}"
-        )
     model_dir = _default_model_dir(base_dir, paths_ini_path)
 
     parser = argparse.ArgumentParser()
@@ -800,6 +795,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     _enable_fast_cuda(args)
 
+    sim_dataset_path = prepare_sim_dataset(user_input_path, base_dir)
     raw_sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
     sim_source_names = source_channel_names_for_dataset(sim_dataset_path)
     channel_detail_path = channel_detail_path_from_ini(paths_ini_path)

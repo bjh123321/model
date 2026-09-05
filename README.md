@@ -153,17 +153,34 @@ then retrains only the excitation/channel combinations present in the correction
 files, using all merged historical rows for each affected combination.  A failed
 correction retains the inherited parent model and records the failure.
 
-For direct correction mode, `user_input.dat` line 2 is the parent model version,
-line 3 is the new model version, and every non-empty line from line 4 onward is an
-added/replacement data file. These files determine the candidate excitation/channel
-networks. `--excitation`, `--channel`, and `--component` further restrict that set:
+For model generation, `GENERATION/user_input.dat` has four lines: the global
+INI path, model version, real-dataset list, and the absolute simulation source
+directory. The source must be under `[SensorMap]/path_sensormap` from that INI.
+`SAMPLE_FOR_XGD` uses `GENERATION/sim_dataset`; a source such as
+`SAMPLE_FOR_XGD_20260905` uses `GENERATION/sim_dataset_20260905`.
+Complete datasets are reused. Missing, empty, or incomplete datasets are generated
+in a temporary directory and published only after every source file succeeds.
 
-When line 4 and later are empty, correction reads `selected_CG_path.txt` and
-`极点频段配置.xlsx` beside `train_incremental.py` (or beside the packaged
-executable), runs the App-aligned OE extractor with `prom=0`, and creates the
-correction split files in a temporary directory. The temporary files are removed
-after merging. The only persistent copy is the merged data in the new version's
-`dataset_snapshot/`.
+Simulation files such as `FZ_FXD_DC_H0300_M029.dat` contain time followed by any
+number of response columns. Only the first 25,600 samples (50 seconds at 512 Hz)
+are used. OE uses a constructed 0.3-amplitude sine sweep starting at zero, sweeping
+linearly from 0 to 50 Hz in 50 seconds, with F order 30 and B order 8. One pole is
+matched in each of 10–20, 20–40, and 40–50 Hz, within 2 Hz of the detected peak.
+An unmatched band remains a missing slot. Output files use the existing
+`FZ_XGD_<excitation>_Hhhhh_Mmmm.txt` format.
+
+Simulation channel IDs follow response-column order from zero. Names follow the
+current channel workbook's rows whose `相关激励位置` contains FXD, PW, or JFY.
+Additional response columns retain sequential IDs and receive `SIM_EXTRA_<id>`
+names. Generated datasets save their channel mapping and a completeness manifest.
+
+Correction keeps its existing four-line task file: global INI, parent version,
+new version, and selected-CG file list. It obtains the current simulation selection
+from `[EXE_XGD]/path_exe_xgd` plus `GENERATION/user_input.dat`, and prepares/reuses
+that dataset using the same rules as generation. Parent simulation snapshots do
+not override this current selection. CG extraction still uses
+`极点频段配置.xlsx` beside the correction script/executable; the simulation
+parameters above do not change that workbook or CG extraction.
 
 ```bash
 python -m surrogate_model.cli.train_incremental --component damping
@@ -200,3 +217,4 @@ Bounds are inclusive, so values equal to either configured bound are retained. U
 python -m surrogate_model.test.Predict_user --prediction_damping_min 2 --prediction_damping_max 60
 python -m surrogate_model.test.Predict_user --prediction_damping_min none
 ```
+

@@ -171,6 +171,13 @@ def load_channel_schema(
         for name, position in excel_rows
         if position is None and name in sim_names
     ]
+    # Extra simulation columns have no workbook row but must survive remapping.
+    exceptions.extend(
+        (name, None)
+        for name in sorted(sim_names, key=lambda value: int(value.rsplit("_", 1)[-1])
+                           if re.fullmatch(r"SIM_EXTRA_\d+", value) else -1)
+        if name not in seen_names and re.fullmatch(r"SIM_EXTRA_\d+", name)
+    )
     definitions = []
     for channel_id, (name, position) in enumerate(normal + exceptions):
         definitions.append(
