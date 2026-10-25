@@ -158,6 +158,16 @@ INI path, model version, real-dataset list, and the simulation source **folder
 name** (for example, `SAMPLE_FOR_XGD` or `SAMPLE_FOR_XGD_20261025`), without a
 path. The source path is `[SensorMap]/path_sensormap` from that INI joined with
 the fourth-line folder name.
+
+The generation data root is always `[EXE_XGD]/path_exe_xgd` from that INI plus
+`GENERATION`, independently of the current directory, script/executable location,
+or task-file location. The real-data selection list contains one filename per
+line (for example, `SF_XGD_FXD_DC_H0300_M068.txt`); relative entries are resolved
+under that fixed root's `real_dataset` directory. The third line still selects
+the list file, with a relative list path resolved beside `user_input.dat`.
+Simulation dataset directories are also resolved under the fixed generation
+root. Use `--user_input <task-file>` when the task file is stored elsewhere.
+
 `SAMPLE_FOR_XGD` uses `GENERATION/sim_dataset`; `SAMPLE_FOR_XGD_20261025` uses
 `GENERATION/sim_dataset_20261025`. Existing dataset directories are used as-is:
 source/output filenames, hashes, channel layouts, and generation manifests are

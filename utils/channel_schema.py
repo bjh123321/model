@@ -321,8 +321,12 @@ def remap_dataset_rows(
     return remapped, stats
 
 
-def read_dataset_list(list_path: Path) -> List[Path]:
+def read_dataset_list(
+    list_path: Path, *, dataset_root: Optional[Path] = None
+) -> List[Path]:
+    """Resolve relative entries against dataset_root, or the list directory by default."""
     list_path = Path(list_path).expanduser()
+    root = list_path.parent if dataset_root is None else Path(dataset_root).expanduser()
     if not list_path.is_file():
         raise FileNotFoundError("Training dataset list does not exist: {}".format(list_path))
     paths = []
@@ -337,7 +341,7 @@ def read_dataset_list(list_path: Path) -> List[Path]:
             continue
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
-            candidate = (list_path.parent / candidate).resolve()
+            candidate = (root / candidate).resolve()
         if not candidate.exists():
             raise FileNotFoundError(
                 "{}:{} dataset path does not exist: {}".format(

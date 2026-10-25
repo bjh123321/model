@@ -78,6 +78,26 @@ class ChannelSchemaTests(unittest.TestCase):
             listing.write_text("\n# no datasets\n", encoding="utf-8")
             self.assertEqual(read_dataset_list(listing), [])
 
+    def test_fixed_dataset_root_does_not_fall_back_to_list_directory(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dataset_root = root / "real_dataset"
+            dataset_root.mkdir()
+            listing = root / "selected.txt"
+            listing.write_text("data.txt\n", encoding="utf-8")
+            decoy = root / "data.txt"
+            decoy.write_text("wrong dataset\n", encoding="utf-8")
+
+            with self.assertRaises(FileNotFoundError):
+                read_dataset_list(listing, dataset_root=dataset_root)
+
+            selected = dataset_root / "data.txt"
+            selected.write_text("correct dataset\n", encoding="utf-8")
+            self.assertEqual(
+                read_dataset_list(listing, dataset_root=dataset_root),
+                [selected.resolve()],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

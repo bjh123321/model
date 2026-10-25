@@ -23,7 +23,7 @@ from surrogate_model.train.dataloaders import split_single_fidelity_rows
 from surrogate_model.train.full_training_runner import run_component_training
 from surrogate_model.utils.argparse_compat import BooleanOptionalAction
 from surrogate_model.utils.exe_runtime import run_executable, split_user_input_arg
-from surrogate_model.data.sim_dataset import prepare_sim_dataset
+from surrogate_model.data.sim_dataset import generation_user_input, prepare_sim_dataset
 from surrogate_model.utils.model_artifacts import (
     atomic_write_json,
     build_dataset_manifest,
@@ -626,6 +626,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
 
     paths_ini_path = Path(lines[0].strip()).expanduser()
+    if not paths_ini_path.is_absolute():
+        paths_ini_path = (user_input_path.parent / paths_ini_path).resolve()
+    generation_dir = generation_user_input(paths_ini_path).parent
     model_version = lines[1].strip()
     dataset_list_path = Path(lines[2].strip()).expanduser()
     if not dataset_list_path.is_absolute():
@@ -795,7 +798,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     _enable_fast_cuda(args)
 
-    sim_dataset_path = prepare_sim_dataset(user_input_path, base_dir)
+    sim_dataset_path = prepare_sim_dataset(user_input_path, generation_dir)
     raw_sim_rows = read_real_dataset(sim_dataset_path, allow_duplicate_keys=True)
     sim_source_names = source_channel_names_for_dataset(sim_dataset_path)
     channel_detail_path = channel_detail_path_from_ini(paths_ini_path)
@@ -812,7 +815,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         source_label=str(sim_dataset_path),
     )
     print_remap_reports([sim_report])
-    real_dataset_paths = read_dataset_list(dataset_list_path)
+    real_dataset_paths = read_dataset_list(
+        dataset_list_path, dataset_root=generation_dir / "real_dataset"
+    )
     real_rows, real_reports = load_and_remap_datasets(
         real_dataset_paths,
         schema,
