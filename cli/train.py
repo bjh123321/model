@@ -622,7 +622,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         lines = f.readlines()
     if len(lines) < 4 or not all(line.strip() for line in lines[:4]):
         raise ValueError(
-            "user_input.dat needs 4 lines: paths.ini, model_version, real dataset list, simulation source directory"
+            "user_input.dat needs 4 lines: paths.ini, model_version, real dataset list, simulation source folder name"
         )
 
     paths_ini_path = Path(lines[0].strip()).expanduser()

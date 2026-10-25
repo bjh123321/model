@@ -27,7 +27,7 @@ class SimulationDatasetTests(unittest.TestCase):
         ini = root / "global.ini"
         ini.write_text("[SensorMap]\npath_sensormap={}\n[EXE_XGD]\npath_exe_xgd={}\n[CurChannelDetailFile]\npath_curchanneldetailfile={}\n".format(source.parent, generation.parent, workbook), encoding="utf-8")
         task = generation / "user_input.dat"
-        task.write_text("{}\nmodel\nreal_list.txt\n{}\n".format(ini, source), encoding="utf-8")
+        task.write_text("{}\nmodel\nreal_list.txt\n{}\n".format(ini, source.name), encoding="utf-8")
         raw = source / "FZ_FXD_DC_H0300_M029.dat"
         row = " ".join(["0"] + [str(i + 1) for i in range(count)]) + "\n"
         raw.write_text(row * sim.SAMPLES + "invalid ignored tail\n", encoding="utf-8")
@@ -80,55 +80,108 @@ class SimulationDatasetTests(unittest.TestCase):
             self.assertEqual(sim.simulation_schema(workbook, 1).channel_names, ("B",))
             self.assertEqual(sim.generation_user_input(ini), task)
 
-    def test_cache_reuse_damage_and_failure_recovery(self):
+    def test_existing_dataset_is_reused_without_source_or_manifest_checks(self):
         with tempfile.TemporaryDirectory() as temp:
-            task, raw, _, _ = self.setup_files(Path(temp))
+            task, raw, workbook, _ = self.setup_files(Path(temp))
             with patch.object(sim, "extract_sim_rows", side_effect=self.fake_rows) as extract:
                 dataset = sim.prepare_sim_dataset(task)
                 self.assertEqual(dataset.name, "sim_dataset_20260905")
                 self.assertEqual(extract.call_count, 1)
+            # Changes to the outputs, manifest, source list, or workbook must
+            # never cause automatic re-extraction of an existing directory.
+            output = dataset / sim.output_name(raw)
+            output.write_text("", encoding="utf-8")
+            (dataset / sim.MANIFEST).write_text("broken", encoding="utf-8")
+            raw.unlink()
+            (raw.parent / "another.dat").write_text("not raw samples", encoding="utf-8")
+            workbook.unlink()
+            with patch.object(sim, "read_sim_response", side_effect=AssertionError("read raw")), \
+                    patch.object(sim, "extract_sim_rows", side_effect=AssertionError("run OE")), \
+                    patch.object(sim, "read_real_dataset", side_effect=AssertionError("validate dataset")):
                 self.assertEqual(sim.prepare_sim_dataset(task), dataset)
-                self.assertEqual(extract.call_count, 1)
-                output = dataset / sim.output_name(raw)
-                output.write_text("", encoding="utf-8")
-                sim.prepare_sim_dataset(task)
-                self.assertEqual(extract.call_count, 2)
-                saved = output.read_bytes()
-                (dataset / sim.MANIFEST).write_text("broken", encoding="utf-8")
-                extract.side_effect = RuntimeError("OE failed")
-                with self.assertRaisesRegex(RuntimeError, "OE failed"):
-                    sim.prepare_sim_dataset(task)
-                self.assertEqual(output.read_bytes(), saved)
-                self.assertFalse(list(dataset.parent.glob(".sim_build_*")))
+            self.assertEqual(output.read_text(encoding="utf-8"), "")
+            self.assertEqual((dataset / sim.MANIFEST).read_text(encoding="utf-8"), "broken")
 
-    def test_empty_rebuilt_and_complete_legacy_reused(self):
+    def test_empty_and_legacy_directories_are_used_as_is(self):
         with tempfile.TemporaryDirectory() as temp:
-            task, raw, _, _ = self.setup_files(Path(temp), suffix="")
+            task, _, _, _ = self.setup_files(Path(temp), suffix="")
             dataset = task.parent / "sim_dataset"
             dataset.mkdir()
-            with patch.object(sim, "extract_sim_rows", side_effect=self.fake_rows) as extract:
-                sim.prepare_sim_dataset(task)
-                self.assertEqual(extract.call_count, 1)
-                (dataset / sim.MANIFEST).unlink()
-                sim.prepare_sim_dataset(task)
-                self.assertEqual(extract.call_count, 1)
+            with patch.object(sim, "extract_sim_rows", side_effect=AssertionError("run OE")):
+                self.assertEqual(sim.prepare_sim_dataset(task), dataset)
+                self.assertEqual(list(dataset.iterdir()), [])
+                legacy = dataset / "FZ_XGD_PW_FDC_H1100_M130.txt"
+                legacy.write_text("existing parameter data", encoding="utf-8")
+                self.assertEqual(sim.prepare_sim_dataset(task), dataset)
+                self.assertEqual(legacy.read_text(encoding="utf-8"), "existing parameter data")
+                self.assertFalse((dataset / sim.MANIFEST).exists())
 
-    def test_workbook_reorder_refreshes_mapping(self):
+    def test_workbook_reorder_does_not_refresh_existing_dataset(self):
         with tempfile.TemporaryDirectory() as temp:
             task, _, workbook, _ = self.setup_files(Path(temp))
             with patch.object(sim, "extract_sim_rows", side_effect=self.fake_rows) as extract:
-                sim.prepare_sim_dataset(task)
+                dataset = sim.prepare_sim_dataset(task)
+                saved_schema = (dataset / "channel_schema.json").read_bytes()
                 book = Workbook()
                 book.active.append(["表头（机载）", "相关激励位置"])
                 book.active.append(["A", "JFY"])
                 book.active.append(["B", "PW"])
                 book.save(str(workbook))
+                self.assertEqual(sim.prepare_sim_dataset(task), dataset)
+                self.assertEqual(extract.call_count, 1)
+                self.assertEqual((dataset / "channel_schema.json").read_bytes(), saved_schema)
+
+    def test_folder_name_is_resolved_against_configured_sensormap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task, raw, workbook, ini = self.setup_files(root, suffix="_20261025")
+            # Both the INI filename and SensorMap root may be relative.
+            ini.write_text(
+                "[SensorMap]\npath_sensormap=sensor\n"
+                "[CurChannelDetailFile]\npath_curchanneldetailfile={}\n".format(workbook),
+                encoding="utf-8")
+            task.write_text("../../global.ini\nmodel\nreal_list.txt\nSAMPLE_FOR_XGD_20261025\n",
+                            encoding="utf-8")
+            with patch.object(sim, "extract_sim_rows", side_effect=self.fake_rows) as extract:
                 dataset = sim.prepare_sim_dataset(task)
-                self.assertEqual(extract.call_count, 2)
-                from surrogate_model.utils.channel_schema import load_saved_channel_schema
-                schema = load_saved_channel_schema(dataset)
-                self.assertEqual(schema.channel_names, ("A", "B", "SIM_EXTRA_2"))
-                self.assertEqual(schema.channels[0].excitation_position, "JFY")
+                self.assertEqual(dataset, task.parent / "sim_dataset_20261025")
+                self.assertEqual(extract.call_args[0][0], raw.resolve())
+                self.assertTrue((dataset / sim.output_name(raw)).is_file())
+
+    def test_existing_dataset_uses_runtime_output_directory_without_raw_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task, raw, workbook, _ = self.setup_files(root, suffix="_20261025")
+            raw.unlink()
+            raw.parent.rmdir()
+            workbook.unlink()
+            runtime_dir = root / "runtime"
+            dataset = runtime_dir / "sim_dataset_20261025"
+            dataset.mkdir(parents=True)
+            with patch.object(sim, "extract_sim_rows", side_effect=AssertionError("run OE")):
+                self.assertEqual(sim.prepare_sim_dataset(task, runtime_dir), dataset)
+            self.assertFalse((task.parent / "sim_dataset_20261025").exists())
+
+    def test_fourth_line_rejects_paths_and_unexpected_folder_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            task, raw, _, ini = self.setup_files(Path(temp))
+            for selection in (str(raw.parent), "../SAMPLE_FOR_XGD",
+                              "nested/SAMPLE_FOR_XGD", "nested\\\\SAMPLE_FOR_XGD",
+                              "SAMPLE_FOR_XGD_foo/bar", "other"):
+                with self.subTest(selection=selection):
+                    task.write_text("{}\nmodel\nreal_list.txt\n{}\n".format(ini, selection),
+                                    encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "folder name"):
+                        sim.prepare_sim_dataset(task)
+
+    def test_missing_dataset_generation_failure_does_not_publish_partial_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            task, _, _, _ = self.setup_files(Path(temp))
+            with patch.object(sim, "extract_sim_rows", side_effect=RuntimeError("OE failed")):
+                with self.assertRaisesRegex(RuntimeError, "OE failed"):
+                    sim.prepare_sim_dataset(task)
+            self.assertFalse((task.parent / "sim_dataset_20260905").exists())
+            self.assertFalse(list(task.parent.glob(".sim_build_*")))
 
     def test_band_tolerance_and_missing_slot(self):
         freq = np.array([15., 34., 45.])

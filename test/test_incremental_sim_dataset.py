@@ -18,6 +18,23 @@ class IncrementalSimDatasetTests(unittest.TestCase):
                 self.assertEqual(_resolve_sim_dataset_path(ini), selected)
                 prepare.assert_called_once_with(exe / "GENERATION" / "user_input.dat")
 
+    def test_existing_dated_dataset_is_selected_without_raw_comparison(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ini = root / "paths.ini"
+            ini.write_text(
+                "[EXE_XGD]\npath_exe_xgd=exe\n"
+                "[SensorMap]\npath_sensormap=sensor\n", encoding="utf-8")
+            generation = root / "exe" / "GENERATION"
+            selected = generation / "sim_dataset_20261025"
+            selected.mkdir(parents=True)
+            (generation / "user_input.dat").write_text(
+                "{}\nmodel\nreal_list.txt\nSAMPLE_FOR_XGD_20261025\n".format(ini),
+                encoding="utf-8")
+            with patch("surrogate_model.data.sim_dataset.extract_sim_rows",
+                       side_effect=AssertionError("run OE")):
+                self.assertEqual(_resolve_sim_dataset_path(ini), selected)
+
     def test_no_legacy_fallback_without_generation_configuration(self):
         with tempfile.TemporaryDirectory() as temp:
             ini = Path(temp) / "paths.ini"

@@ -154,12 +154,17 @@ files, using all merged historical rows for each affected combination.  A failed
 correction retains the inherited parent model and records the failure.
 
 For model generation, `GENERATION/user_input.dat` has four lines: the global
-INI path, model version, real-dataset list, and the absolute simulation source
-directory. The source must be under `[SensorMap]/path_sensormap` from that INI.
-`SAMPLE_FOR_XGD` uses `GENERATION/sim_dataset`; a source such as
-`SAMPLE_FOR_XGD_20260905` uses `GENERATION/sim_dataset_20260905`.
-Complete datasets are reused. Missing, empty, or incomplete datasets are generated
-in a temporary directory and published only after every source file succeeds.
+INI path, model version, real-dataset list, and the simulation source **folder
+name** (for example, `SAMPLE_FOR_XGD` or `SAMPLE_FOR_XGD_20261025`), without a
+path. The source path is `[SensorMap]/path_sensormap` from that INI joined with
+the fourth-line folder name.
+`SAMPLE_FOR_XGD` uses `GENERATION/sim_dataset`; `SAMPLE_FOR_XGD_20261025` uses
+`GENERATION/sim_dataset_20261025`. Existing dataset directories are used as-is:
+source/output filenames, hashes, channel layouts, and generation manifests are
+not compared, and mismatches do not trigger OE extraction. Empty or malformed
+datasets fail during normal loading rather than being rebuilt automatically.
+Only a missing dataset directory triggers OE generation from the selected source,
+in a temporary directory published after every source file succeeds.
 
 Simulation files such as `FZ_FXD_DC_H0300_M029.dat` contain time followed by any
 number of response columns. Only the first 25,600 samples (50 seconds at 512 Hz)
@@ -176,7 +181,7 @@ names. Generated datasets save their channel mapping and a completeness manifest
 
 Correction keeps its existing four-line task file: global INI, parent version,
 new version, and selected-CG file list. It obtains the current simulation selection
-from `[EXE_XGD]/path_exe_xgd` plus `GENERATION/user_input.dat`, and prepares/reuses
+from `[EXE_XGD]/path_exe_xgd` plus `GENERATION/user_input.dat`, and selects/reuses
 that dataset using the same rules as generation. Parent simulation snapshots do
 not override this current selection. CG extraction still uses
 `极点频段配置.xlsx` beside the correction script/executable; the simulation

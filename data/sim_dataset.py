@@ -14,7 +14,7 @@ import numpy as np
 
 from surrogate_model.data.OE import amplitude_spectrum, marker_slots_from_bands, match_modes_to_marker_frequencies
 from surrogate_model.data.OE_BATCH_PROCESS import PEAK_PARAMS, oe_extract_modes, parse_excitation_from_filename, format_row
-from surrogate_model.data.io import SPLIT_DATASET_NAME_RE, read_real_dataset
+from surrogate_model.data.io import read_real_dataset
 from surrogate_model.utils.channel_schema import ChannelDefinition, ChannelSchema, channel_detail_path_from_ini, load_channel_schema, save_channel_schema
 
 FS = 512
@@ -128,45 +128,36 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _complete(dataset: Path, expected, schema: ChannelSchema) -> bool:
-    try:
-        manifest = json.loads((dataset / MANIFEST).read_text(encoding="utf-8"))
-        if manifest["expected"] != expected or manifest["channels"] != schema.to_dict():
-            return False
-        actual = {path.name for path in dataset.iterdir()
-                  if path.is_file() and SPLIT_DATASET_NAME_RE.match(path.name)}
-        if actual != set(expected):
-            return False
-        hashes = manifest["sha256"]
-        if set(hashes) != set(expected) | {"channel_schema.json"}:
-            return False
-        if any(_digest(dataset / name) != digest for name, digest in hashes.items()):
-            return False
-        read_real_dataset(dataset)
-        return True
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-
-
 def prepare_sim_dataset(user_input_path: Path, output_dir: Path = None) -> Path:
     user_input_path = Path(user_input_path)
     lines = user_input_path.read_text(encoding="utf-8-sig").splitlines()
     if len(lines) < 4 or not lines[0].strip() or not lines[3].strip():
-        raise ValueError("GENERATION/user_input.dat requires a simulation directory on line 4")
+        raise ValueError("GENERATION/user_input.dat requires a simulation folder name on line 4")
     ini_path = Path(lines[0].strip()).expanduser()
     if not ini_path.is_absolute():
         ini_path = user_input_path.parent / ini_path
-    source = Path(lines[3].strip()).expanduser()
-    if not source.is_absolute():
-        raise ValueError("GENERATION/user_input.dat line 4 must be an absolute path")
-    source = source.resolve()
+    source_name = lines[3].strip()
+    if not re.fullmatch(r"SAMPLE_FOR_XGD(?:_[^/\\:]+)?", source_name, flags=re.IGNORECASE):
+        raise ValueError(
+            "GENERATION/user_input.dat line 4 must be a folder name such as "
+            "SAMPLE_FOR_XGD or SAMPLE_FOR_XGD_20261025, not a path"
+        )
     sensor_root = ini_directory(ini_path, "SensorMap")
+    source = (sensor_root / source_name).resolve()
     try:
         source.relative_to(sensor_root)
     except ValueError:
         raise ValueError("Simulation source must be inside configured SensorMap: {}".format(sensor_root))
-    if not re.fullmatch(r"SAMPLE_FOR_XGD(?:_.+)?", source.name, flags=re.IGNORECASE):
-        raise ValueError("Unexpected simulation source directory: {}".format(source))
+    destination = Path(output_dir or user_input_path.parent) / (
+        "sim_dataset" + source_name[len("SAMPLE_FOR_XGD"):]
+    )
+    # A selected existing dataset is authoritative; never compare it with raw
+    # responses or rebuild it because filenames, hashes, or channels differ.
+    if destination.is_dir():
+        print("[SIM-DATA] reuse={}".format(destination), flush=True)
+        return destination
+    if destination.exists():
+        raise NotADirectoryError("Simulation dataset is not a directory: {}".format(destination))
     files = sorted(source.glob("*.dat"))
     if not files:
         raise FileNotFoundError("No simulation .dat files in {}".format(source))
@@ -177,27 +168,6 @@ def prepare_sim_dataset(user_input_path: Path, output_dir: Path = None) -> Path:
     # Reading the first file determines column identities without running OE.
     count = read_sim_response(files[0]).shape[1]
     schema = simulation_schema(workbook, count)
-    destination = Path(output_dir or user_input_path.parent) / ("sim_dataset" + source.name[len("SAMPLE_FOR_XGD"):])
-    if _complete(destination, expected, schema):
-        print("[SIM-DATA] reuse={}".format(destination), flush=True)
-        return destination
-    # Validate legacy caches too; do not rerun complete pre-manifest datasets.
-    if destination.is_dir() and not (destination / MANIFEST).exists():
-        try:
-            actual = sorted(p.name for p in destination.iterdir()
-                            if p.is_file() and SPLIT_DATASET_NAME_RE.match(p.name))
-            complete = actual == sorted(expected)
-            for name in expected:
-                file_rows = read_real_dataset(destination / name)
-                complete = complete and sorted(int(row[3]) for row in file_rows) == list(range(count))
-                complete = complete and all(len(row) >= 8 and (len(row) - 4) % 4 == 0
-                                            for row in file_rows)
-            if complete:
-                save_channel_schema(schema, destination)
-                _write_manifest(destination, expected, schema)
-                return destination
-        except (OSError, ValueError):
-            pass
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".sim_build_", dir=str(destination.parent)))
     backup = None
