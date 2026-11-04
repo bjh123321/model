@@ -33,9 +33,23 @@ python -m surrogate_model.test.Predict_user
 
 ## Excitation/channel FDR model layout
 
-This branch trains four independent networks for each excitation/channel combination
+This branch keeps four component bundles for each excitation/channel combination
 that is present in the input dataset: frequency, damping, residue magnitude,
-and residue phase (`sin_theta` plus `cos_theta`). The model-version directory is
+and residue phase (`sin_theta` plus `cos_theta`). Each bundle now contains three
+independent slot networks: 12 parameter/slot units per excitation/channel. Each
+unit has its own low MLP, high-fidelity affine map and nonlinear correction MLP.
+Correction inputs only include that unit's low prediction. The existing frozen
+excitation/channel embeddings remain fixed conditioning features. Slot positions,
+masks, normalization and public three-slot outputs are unchanged; phase keeps
+two coupled outputs per slot (15 numerical outputs across the four bundles).
+
+The four component training jobs, optimizers, early stopping and checkpoints
+remain grouped by component. This is parameter independence, not twelve separate
+training schedules. New checkpoints record `independent_slots`; old checkpoints
+without this field still load with the original joint architecture. Resume with
+profile 10 retrains old joint components instead of silently reusing them.
+
+The model-version directory is
 organized as:
 
 ```text

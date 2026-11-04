@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 class Config:
     # Fixed-SF model shape
     K_max: int = 3
+    independent_slots: bool = True
     embed_excitation_num: int = 6
     embed_channel_num: int = 34
     embed_excitation_dim: int = 4
@@ -75,12 +76,12 @@ class Config:
     # interpolate the sparse H/M samples; damping smoothness is handled by a
     # separate soft penalty below instead of shrinking every component network.
     fdr_physical_parameterization: bool = True
-    fdr_training_profile_version: int = 8
+    fdr_training_profile_version: int = 10
     fdr_component_training_profile_version: Dict[str, int] = field(default_factory=lambda: {
-        "frequency": 8,
-        "damping": 9,
-        "residue_magnitude": 8,
-        "residue_phase": 8,
+        "frequency": 10,
+        "damping": 10,
+        "residue_magnitude": 10,
+        "residue_phase": 10,
     })
     fdr_low_hidden: List[int] = field(default_factory=lambda: [64, 128, 64])
     fdr_dropout_prob: float = 0.0

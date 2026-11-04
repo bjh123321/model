@@ -21,6 +21,7 @@ def _model_config(cfg) -> dict:
         "target_component": str(getattr(cfg, "target_component", "")),
         "model_target_names": list(getattr(cfg, "model_target_names", [])),
         "K_max": int(cfg.K_max),
+        "independent_slots": bool(getattr(cfg, "independent_slots", False)),
         "low_hidden": list(cfg.low_hidden),
         "adapt_hidden": list(getattr(cfg, "adapt_hidden", [32, 32])),
         "dropout_prob": float(cfg.dropout_prob),
@@ -369,6 +370,7 @@ def run_component_training(
     component_dir.mkdir(parents=True, exist_ok=True)
 
     component_cfg = copy.deepcopy(cfg)
+    component_cfg.independent_slots = True
     component_cfg.use_lora = False
     component_cfg.model_type = "TargetMultifidelityMFDNN"
     component_cfg.target_component = component

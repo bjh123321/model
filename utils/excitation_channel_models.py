@@ -104,6 +104,7 @@ def model_entry(
             else f"{component_dir}/Normalizer_Output_Real.pth"
         )
         components[component] = {
+            "slot_units": [1, 2, 3],
             "target_names": list(target_names),
             "checkpoint": f"{component_dir}/model.pth",
             "normalizer_input": selected_input,
@@ -133,6 +134,8 @@ def model_entry(
         "channel_name": channel_name(channel_id),
         "relative_dir": relative_dir,
         "components": components,
+        "network_count": 12,
+        "slot_networks_per_component": 3,
         "row_count": int(row_count),
         "status": str(status),
         "fidelity_mode": fidelity_mode,
@@ -167,7 +170,9 @@ def write_model_inventory(
         "parent_model_version": parent_model_version,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_count": len(models),
-        "network_count": len(models) * len(FDR_COMPONENT_TARGETS),
+        "network_count": sum(
+            int(item.get("network_count", len(FDR_COMPONENT_TARGETS))) for item in models
+        ),
         "failure_count": len(failures),
         "models": models,
     }

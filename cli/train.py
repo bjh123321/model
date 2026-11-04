@@ -459,6 +459,9 @@ def _resume_component_ready(
             return False, "checkpoint has no model_state_dict"
         if checkpoint.get("model_type") != "TargetMultifidelityMFDNN":
             return False, "checkpoint is not TargetMultifidelityMFDNN"
+        if required_profile_version is not None and int(required_profile_version) >= 10:
+            if not checkpoint.get("independent_slots", False):
+                return False, "checkpoint needs independent slot networks"
         checkpoint_fidelity_mode = str(checkpoint.get("fidelity_mode", ""))
         if (
             (expected_fidelity_mode == "multifidelity" or checkpoint_fidelity_mode == "multifidelity")

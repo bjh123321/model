@@ -87,6 +87,10 @@ def test_damping_multifidelity_training_smoke():
         assert math.isfinite(best)
         assert len(train_history) == 2
         checkpoint = torch.load(out_dir / "model.pth", map_location="cpu", weights_only=True)
+        assert checkpoint["independent_slots"] is True
+        from surrogate_model.models.checkpoint_utils import build_model_from_checkpoint
+        restored = build_model_from_checkpoint(checkpoint)
+        assert len(restored.low.slots) == 3
         assert {
             path.name for path in out_dir.glob("Normalizer_*.pth")
         } == {

@@ -133,9 +133,9 @@ def test_fdr_defaults_restore_capacity_without_dropout():
     assert cfg.fdr_component_epochs_stage1["frequency"] == 500
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["frequency"] == 0.05
     assert cfg.fdr_component_checkpoint_train_loss_ceiling["damping"] is None
-    assert cfg.fdr_training_profile_version == 8
-    assert cfg.fdr_component_training_profile_version["damping"] == 9
-    assert cfg.fdr_component_training_profile_version["frequency"] == 8
+    assert cfg.fdr_training_profile_version == 10
+    assert cfg.fdr_component_training_profile_version["damping"] == 10
+    assert cfg.fdr_component_training_profile_version["frequency"] == 10
     assert cfg.multifidelity_sim_loss_weight == 0.2
     assert cfg.multifidelity_real_loss_weight == 1.0
     assert cfg.checkpoint_selection == "training"

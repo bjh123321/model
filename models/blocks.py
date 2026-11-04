@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
@@ -279,6 +281,50 @@ class TargetAdaptationHead(nn.Module):
         return self.mlp(x).view(-1, self.cfg.K_max, self.target_count)
 
 
+class SlotwiseTargetHead(nn.Module):
+    """Three independent low networks, assembled in the original slot order."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        one = copy.deepcopy(cfg)
+        one.K_max = 1
+        self.slots = nn.ModuleList([TargetHead(one) for _ in range(cfg.K_max)])
+
+    def forward(self, Hn, Mn, exc_emb, ch_emb):
+        outputs = [head(Hn, Mn, exc_emb, ch_emb) for head in self.slots]
+        return {name: torch.cat([out[name] for out in outputs], dim=1)
+                for name in outputs[0]}
+
+
+class SlotwiseLinearHead(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.slots = nn.ModuleList([
+            TargetLinearHighFidelityHead(len(cfg.model_target_names))
+            for _ in range(cfg.K_max)
+        ])
+
+    def forward(self, values):
+        return torch.cat([head(values[:, i:i + 1, :])
+                          for i, head in enumerate(self.slots)], dim=1)
+
+
+class SlotwiseAdaptationHead(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        one = copy.deepcopy(cfg)
+        one.K_max = 1
+        self.slots = nn.ModuleList([
+            TargetAdaptationHead(one) for _ in range(cfg.K_max)
+        ])
+
+    def forward(self, Hn, Mn, exc_emb, ch_emb, low_values):
+        return torch.cat([
+            head(Hn, Mn, exc_emb, ch_emb, low_values[:, i:i + 1, :])
+            for i, head in enumerate(self.slots)
+        ], dim=1)
+
+
 class TargetMultifidelityMFDNN(nn.Module):
     """Independent FDR component with a sim low head and real correction head."""
 
@@ -292,9 +338,14 @@ class TargetMultifidelityMFDNN(nn.Module):
             raise ValueError("model_target_names must not be empty")
         self.emb_exc = nn.Embedding(cfg.embed_excitation_num, cfg.embed_excitation_dim)
         self.emb_ch = nn.Embedding(cfg.embed_channel_num, cfg.embed_channel_dim)
-        self.low = TargetHead(cfg)
-        self.lin = TargetLinearHighFidelityHead(len(self.target_names))
-        self.adaptation = TargetAdaptationHead(cfg)
+        if bool(getattr(cfg, "independent_slots", False)):
+            self.low = SlotwiseTargetHead(cfg)
+            self.lin = SlotwiseLinearHead(cfg)
+            self.adaptation = SlotwiseAdaptationHead(cfg)
+        else:
+            self.low = TargetHead(cfg)
+            self.lin = TargetLinearHighFidelityHead(len(self.target_names))
+            self.adaptation = TargetAdaptationHead(cfg)
 
     def _as_tensor(self, values: Dict[str, torch.Tensor]) -> torch.Tensor:
         return torch.stack([values[name] for name in self.target_names], dim=-1)
@@ -353,9 +404,10 @@ def count_parameters(model: nn.Module) -> Tuple[int, int]:
 
 def count_parameter_groups(model: nn.Module) -> Dict[str, int]:
     low = model.low
+    heads = list(low.slots) if isinstance(low, SlotwiseTargetHead) else [low]
     groups = {
-        "main_mlp_parameters": sum(p.numel() for p in low.mlp.parameters()),
-        "mod_parameters": sum(p.numel() for p in low.mod.parameters()) if low.mod is not None else 0,
+        "main_mlp_parameters": sum(p.numel() for head in heads for p in head.mlp.parameters()),
+        "mod_parameters": sum(p.numel() for head in heads if head.mod is not None for p in head.mod.parameters()),
         "embedding_parameters": sum(p.numel() for p in model.emb_exc.parameters()) + sum(p.numel() for p in model.emb_ch.parameters()),
         "total_parameters": sum(p.numel() for p in model.parameters()),
     }

@@ -92,7 +92,7 @@ def _restore_lora_structure(cfg: Config, checkpoint: Mapping, state: Mapping) ->
 
 
 def _state_modulation_kind(state: Mapping) -> bool:
-    legacy = any(key.startswith("low.mod.") for key in state)
+    legacy = any(key.startswith("low.mod.") or (key.startswith("low.slots.") and ".mod." in key) for key in state)
     conditional_parts = {
         "hm_mod": any(key.startswith("low.hm_mod.") for key in state),
         "exc_gate": any(key.startswith("low.exc_gate.") for key in state),
@@ -126,6 +126,10 @@ def restore_model_config_from_checkpoint(
 ) -> Config:
     state = checkpoint_state_dict(checkpoint)
     cfg = Config()
+    slot_state = any(key.startswith("low.slots.") for key in state)
+    cfg.independent_slots = bool(checkpoint.get("independent_slots", slot_state))
+    if cfg.independent_slots != slot_state:
+        raise RuntimeError("independent_slots metadata conflicts with checkpoint weights")
     for field in STRUCTURE_FIELDS:
         if field in checkpoint:
             setattr(cfg, field, checkpoint[field])

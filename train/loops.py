@@ -438,6 +438,7 @@ def _save_deploy_artifacts(args, out_dir: Path, model_core, in_norm, out_norm, e
         "target_transforms": dict(out_norm.target_transforms or {}),
         "slot_support": dict(out_norm.support or {}),
         "K_max": int(model_core.cfg.K_max),
+        "independent_slots": hasattr(model_core.low, "slots"),
         "low_hidden": list(getattr(model_core.cfg, "low_hidden", [])),
         "adapt_hidden": list(getattr(model_core.cfg, "adapt_hidden", [])),
         "dropout_prob": float(getattr(model_core.cfg, "dropout_prob", 0.0)),
